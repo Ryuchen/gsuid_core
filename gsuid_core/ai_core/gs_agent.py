@@ -1527,7 +1527,7 @@ class GsCoreAIAgent(RunOnceMixin):
                 伴随的规划/内心 OS 默认不发送。例外：主人格尚未出站过的一句接任务应仍发送
                 一次（不按 12 字；结构垃圾仍压）。无工具的最终回复照常发送。
             turn_graph: 入口构建的 TurnGraph（可选）；缺省时在装配层现场构建。
-            cheap_gate: CheapGate 成本档（可选）；驱动 light 零工具 / 群聊瘦保底。
+            cheap_gate: CheapGate 成本档（可选）；驱动群聊瘦保底。
             outbound_stream: True=可见文本按 delta 出站；False=等完整 TextPart。
                 与 pydantic-ai ``node.stream()``（TTFT/TPS）正交。
             stats_chat_type: Token 用量分类；空则用 ``create_by``。HTTP 入口传 Http_Chat。
@@ -1537,14 +1537,12 @@ class GsCoreAIAgent(RunOnceMixin):
         """
         self._outbound_stream = outbound_stream
         self._stats_chat_type = stats_chat_type if stats_chat_type else ""
-        # A: 同 Session 抢答——仅「真人 vs 真人」才 cancel；
-        # 框架回灌与真人互不 supersede（排队等锁），避免交付被闲聊顶掉 / 回灌打断用户。
+        # 同 Session 后到消息排队等锁，不再 cancel 进行中的工具轮。
         if self.create_by in _INTERACTIVE_CREATE_BY and self._run_lock.locked():
             if is_framework_injection or self._running_framework:
                 logger.info(i18n_t("log.agent.supersede_skip_framework_queue"))
             else:
-                self._cancel_generation.set()
-                logger.info(i18n_t("log.agent.supersede_cancel_current"))
+                logger.info(i18n_t("log.agent.supersede_queue_wait"))
 
         async with self._run_lock:
             logger.info(i18n_t("log.agent.acquired_lock"))

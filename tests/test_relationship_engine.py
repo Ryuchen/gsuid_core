@@ -1,7 +1,7 @@
 """关系温度：zone 边界 / 信号扫描 / 预算裁剪 / 吸收态回归锁。
 
 成功标准（可验收，不靠体感）：
-1. 连续 50 句寒暄 / LIGHT 闲聊，分数变化 ∈ {0, +1}；
+1. 连续 50 句寒暄，分数变化 ∈ {0, +1}；
 2. 同一用户日增益 ≤ ``favor_daily_gain_cap``；
 3. 含侮辱的一轮 ``last_reason=neg.insult`` 且分数下降；
 4. **CheapGate 静音 + 侮辱 → 仍扣分**（防「掉到 cold 就免罚」吸收态）。
@@ -140,8 +140,8 @@ def test_quiet_zone_marks_only_cold_and_hostile() -> None:
 # ── signals：宁窄勿宽 ──
 
 
-def _scan(text: str, *, intent: str = "闲聊", effective: bool = True, is_light: bool = False):
-    return scan_signals(text, intent=intent, effective=effective, is_light=is_light, is_master=False)
+def _scan(text: str, *, intent: str = "闲聊", effective: bool = True):
+    return scan_signals(text, intent=intent, effective=effective, is_master=False)
 
 
 def test_greeting_is_never_meaningful() -> None:
@@ -155,8 +155,6 @@ def test_greeting_is_never_meaningful() -> None:
 def test_short_chitchat_is_not_meaningful() -> None:
     assert not _scan("哈哈哈").meaningful
     assert not _scan("嗯嗯").meaningful
-    # LIGHT 档即使长也不算（群聊轻量回）
-    assert not _scan("今天天气真的好得不行我想出去走走", is_light=True).meaningful
 
 
 def test_long_chitchat_and_task_intents_are_meaningful() -> None:
@@ -201,12 +199,12 @@ def test_guard_flags_become_a_negative_signal() -> None:
     assert flags.fake_tool_result and flags.any_hit
     assert "fake_tool_result" in flags.reasons()
 
-    sig = scan_signals("正常一句话", intent="闲聊", effective=True, is_light=False, is_master=False, guard=flags)
+    sig = scan_signals("正常一句话", intent="闲聊", effective=True, is_master=False, guard=flags)
     assert NegSignal.JAILBREAK in sig.negatives
 
     clean = GuardFlags()
     assert not clean.any_hit
-    sig2 = scan_signals("正常一句话", intent="闲聊", effective=True, is_light=False, is_master=False, guard=clean)
+    sig2 = scan_signals("正常一句话", intent="闲聊", effective=True, is_master=False, guard=clean)
     assert not sig2.negatives
 
 
@@ -275,7 +273,7 @@ def test_session_window_throttles_ordinary_gain() -> None:
 
 
 def test_silence_and_error_rounds_skip_positive_gain() -> None:
-    kw = {"intent": "问答", "is_light": False, "is_master": False}
+    kw = {"intent": "问答", "is_master": False}
     sig = scan_signals("帮我看看这个报错怎么修", effective=True, **kw)
     delta, reason, _ = plan_delta(
         sig,
@@ -435,16 +433,16 @@ def test_hostile_quote_still_enters_loop() -> None:
         primary_speaker="u1",
         has_reply=True,
     )
-    assert decide_cheap_gate(tg, rel=hostile, intent="闲聊") is CheapGate.LIGHT
+    assert decide_cheap_gate(tg, rel=hostile, intent="闲聊") is CheapGate.FULL
 
 
-def test_hostile_chitchat_at_enters_light() -> None:
-    """惹毛了的闲聊 @ 仍进环（light），不在 CheapGate 直接掐死。"""
+def test_hostile_chitchat_at_enters_loop() -> None:
+    """惹毛了的闲聊 @ 仍进环，不在 CheapGate 直接掐死。"""
     from gsuid_core.ai_core.interaction_scaffold import CheapGate, decide_cheap_gate
 
     hostile = view_from_score(-80, False)
     tg = _graph(message_text="早柚 你真烦", is_tome=True)
-    assert decide_cheap_gate(tg, rel=hostile, intent="闲聊") is CheapGate.LIGHT
+    assert decide_cheap_gate(tg, rel=hostile, intent="闲聊") is CheapGate.FULL
 
 
 def test_hostile_with_active_task_is_not_silenced() -> None:

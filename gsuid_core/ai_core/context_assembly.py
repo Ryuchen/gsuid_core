@@ -259,7 +259,7 @@ def suffix_allowed_blocks(ctx: "AgentHookContext") -> frozenset[str] | None:
     if tg is None or not tg.is_group:
         return None
     addressed = bool(tg.call_to_self or tg.ellipsis_followup or tg.task_management)
-    if ctx.cheap_gate == "light" or not addressed:
+    if not addressed:
         return frozenset()
     return _ADDRESSED_FULL_BLOCKS
 

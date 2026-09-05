@@ -111,14 +111,14 @@ GSUID_LOCAL_TEST_MODE=1 GSUID_LOCAL_TEST_TOKEN=... PYTHONUTF8=1 \
     ▼
 ⑥ 意图分类 + CheapGate 初判                   [mode_classifier]
     │  hostile/cold **未点名** → SILENCE（结算 reached_model=False）
-    │  @ / 引用 bot 不因低好感硬静；被 @ 且闲聊 → LIGHT
+    │  @ / 引用 bot 不因低好感硬静；点名一律 FULL
     ▼
 ⑦ 软触发沉默门（**仅** soft_triggered）        [reactive_gate]
     │  硬 @ / 引用 bot 不走此门
     ▼
 ⑧ 装配 user 侧上下文                          [payload / memory / history / assembly]
     │  quoted_tome → QUOTE_TOME_MARKER（不要写成「直接找你」）
-    │  zone 口吻进口吻锚；LIGHT/未点名 suffix 清空产品块
+    │  zone 口吻进口吻锚；未点名 suffix 清空产品块
     │  群历史仅 FULL 且点名/跟进/任务；CheapGate 终判（活跃任务可抬回 FULL）
     ▼
 ⑨ Agent.run：工具五层 + LLM 迭代               [gs_agent + agent_run]
@@ -201,7 +201,7 @@ C-3 寻址门的零工具硬约束。脚手架套件只负责把结构结论**�
 | Classifier | `mode_classifier` / `classifier_service` | 闲聊/工具/问答 |
 | SoftGate | `heartbeat.decision.run_reactive_gate` | 软触发沉默门（**仅** `soft_triggered`） |
 | TurnGraph | `interaction_scaffold.build_turn_graph` | 本轮结构：`call_to_self` / `quoted_tome` / 开口门 |
-| CheapGate | `interaction_scaffold.decide_cheap_gate` | silence / light / full；quiet_zone 未点名才硬静 |
+| CheapGate | `interaction_scaffold.decide_cheap_gate` | silence / full；quiet_zone 未点名才硬静 |
 | RelView | `relationship.RelationshipView` | zone + line + voice；H02 写入，CheapGate / 装配共用 |
 | DualRoute | `memory.retrieval.dual_route` | 双路记忆检索（读） |
 | CtxAsm | `context_assembly` | user 侧动态上下文顺序 |
@@ -480,7 +480,7 @@ sequenceDiagram
     alt SILENCE（quiet_zone 未点名 / lurk / 重复正文）
         HandleAI->>HandleAI: settle_turn(reached_model=False)
         HandleAI-->>HandleAI: return SILENCE
-    else LIGHT / FULL
+    else FULL
         Note over Cheap: @/引用 bot 即使 hostile 也进环
     end
 
@@ -538,7 +538,7 @@ sequenceDiagram
     alt cheap=FULL 且 (call_to_self / 省略跟进 / 任务管理)
         HandleAI->>HistoryA: get_history 去掉本轮（仅群聊）
         HandleAI->>HistoryA: 当前用户优先 + format_history_for_agent
-    else LIGHT 或未点名
+    else 未点名
         Note over HistoryA: 不灌【历史对话】块（省 token）
     end
 
@@ -547,7 +547,7 @@ sequenceDiagram
     CtxAsm->>Rel: 关系行（per-user，禁进共享 system）
     CtxAsm->>Rel: voice_anchor += zone 口吻（未打分不注入）
     CtxAsm->>PlanCtx: 长任务文案 → has_actionable
-    Note over CtxAsm: 顺序：情绪→关系→口吻→身份锚→历史<br/>→记忆(高置信)→任务→闲聊风格<br/>→事务优先级(工具/问答)→report标题<br/>→最后软触发NOTE<br/>LIGHT/未点名：suffix 清空产品块<br/>QUOTE_TOME_HINT 走 prepare hints，不受 suffix 清
+    Note over CtxAsm: 顺序：情绪→关系→口吻→身份锚→历史<br/>→记忆(高置信)→任务→闲聊风格<br/>→事务优先级(工具/问答)→report标题<br/>→最后软触发NOTE<br/>未点名：suffix 清空产品块<br/>QUOTE_TOME_HINT 走 prepare hints，不受 suffix 清
     CtxAsm-->>HandleAI: full_context, has_actionable
     Note over HandleAI: CheapGate 终判（has_actionable 可抬回 FULL）
 
@@ -685,12 +685,12 @@ sequenceDiagram
                 Exec->>Relay: 人格转译
                 Relay->>BotSend: 推群（事后兜底）
             end
-        and 主人格同步等：Chat 5s / TEST 90s
-            SubTool->>SubTool: poll 状态
-            alt 按时完成
+        and 主人格：Chat 立刻放锁 / TEST 90s
+            SubTool->>SubTool: 生产 wait_sec=0，完成后回灌
+            alt 已完成
                 SubTool-->>GsAgent: 结论 + 可追溯句柄
-            else 超时
-                SubTool-->>GsAgent: 后台执行中（对用户：SILENCE 或一句角色短句；禁止过程叙事）
+            else 后台
+                SubTool-->>GsAgent: 后台执行中（对用户：SILENCE；禁止过程叙事）
                 Note over SubTool: 完成后框架注入瘦交付帧入史<br/>_build_event 回填 WS_BOT_ID，禁止任意适配器兜底
             end
         end
@@ -819,7 +819,7 @@ flowchart TD
     CG2 -->|silence| Z
     CG2 --> J[Agent.run]
     J --> K{工具/文本}
-    K -->|create_subagent| L[ad-hoc / Kanban Chat 5s / TEST 90s]
+    K -->|create_subagent| L[ad-hoc / Kanban Chat 立刻回灌 / TEST 90s]
     L -->|事实包 res_| J
     L -->|render 图 res_| J
     K -->|Text by_bot| G0{pre_send_gate}
@@ -1166,7 +1166,7 @@ registry.get_ai_session(session_id)
 
 > 源码：`interaction_scaffold.decide_cheap_gate`。调用点在内核，**不是**可关套件。
 
-成本档：`SILENCE` 不进 loop；`LIGHT` 短回、闲聊零/极瘦工具；`FULL` 完整装配。
+成本档：`SILENCE` 不进 loop；`FULL` 完整装配。
 
 ```text
 私聊                              → FULL
@@ -1176,9 +1176,7 @@ group_lurk_mode 且未点名/无任务   → SILENCE（主人除外）
 rel.is_quiet_zone（hostile/cold）
   且非主人、未 is_tome、未 call_to_self
   且无省略/续聊/任务              → SILENCE
-call_to_self + intent=闲聊
-  且无任务证据                    → LIGHT
-其余（含未 @ 的群消息）           → FULL，模型/C-3 决定是否 <SILENCE>
+其余（含被 @ 闲聊、未 @ 的群消息） → FULL，模型/C-3 决定是否 <SILENCE>
 ```
 
 **低好感不硬掐 @/引用**（2026-08-26）：hostile/cold 的人 **被 @ 或引用 bot** 仍进环。
@@ -1190,7 +1188,7 @@ zone 口吻写在 user 侧 `voice_anchor`（`relationship.zones._ZONE_VOICE`）�
 
 1. **分类后**：还没有 `has_actionable`，quiet_zone 未点名可早退并
    `settle_turn(reached_model=False)`（只放行负信号，防吸收态）。
-2. **装配后**：planning 套件可能把 `has_actionable` 抬真 → 从 LIGHT/SILENCE 抬回 FULL。
+2. **装配后**：planning 套件可能把 `has_actionable` 抬真 → 从 SILENCE 抬回 FULL。
 
 `group_lurk_mode` 默认关。打开后，未点名的群氛围消息一律 CheapGate 静音（主人和任务跟进除外）。
 
@@ -1267,7 +1265,7 @@ fire_hooks(RETRIEVE_CONTEXT, ctx)        # 内核唯一动作
 
 **不是每轮都灌。** `handle_ai` 只在 `cheap is FULL` **且**
 `call_to_self or ellipsis_followup or task_management` 时调用
-`build_group_history_block`。LIGHT / 未点名旁观不塞【历史对话】。
+`build_group_history_block`。未点名旁观不塞【历史对话】。
 
 ```text
 # 私聊：不注入 IM 历史（pydantic_ai session.history 已覆盖，避免破坏缓存前缀）
@@ -1321,11 +1319,10 @@ rag_context = "【历史对话】\n" + format_history_for_agent(...)
 
 **精确时间**在 `turn_pipeline.stamp_current_time` / user 正文侧（`[当前时间：…]`），不进 system。
 
-**群聊 suffix 过滤**（`context_assembly.suffix_allowed_blocks`）：LIGHT 或未点名 →
+**群聊 suffix 过滤**（`context_assembly.suffix_allowed_blocks`）：未点名 →
 产品块表清空（情绪/关系/记忆/历史都不进 user suffix）。`QUOTE_TOME_HINT` /
-`LIGHT_MODE_HINT` / `FOLLOWUP_HINT` 走 `prepare` 的 `scaffold_hints_from_graph`，
-**不受** suffix 清空。zone 口吻在 LIGHT 轮因此不出现——引用闲聊靠 QUOTE_TOME_HINT
-让模型判断 `<SILENCE>`。
+`FOLLOWUP_HINT` 走 `prepare` 的 `scaffold_hints_from_graph`，
+**不受** suffix 清空。
 
 hostile/cold 的 zone 口吻（仅 `scored=True` 时注入）：
 
@@ -1410,18 +1407,17 @@ gs_agent.GsCoreAIAgent.run
 # bot.queue 可并发 create_task（受 semaphore）；同 Session 靠 _run_lock 串行
 
 若 create_by ∈ 交互 且 _run_lock 已被占用:
-    _cancel_generation.set()     # 请求取消当前 generation（抢答）
-    log: 同 Session 新消息到达，请求取消当前生成
+    不 cancel；排队等锁（框架回灌同样排队）
+    log: 同 Session 新消息到达，排队等当前轮结束
 
 async with self._run_lock:
-  self._cancel_generation = Event()   # 本 generation 新事件，互不污染
+  self._cancel_generation = Event()   # HTTP 客户端断开仍可 set
   若 Chat 且排队过久 > STALE_CHAT_REQUEST_TTL → 丢弃，return ""
   refresh_model_if_changed()
   _execute_run(...)   # 内调 _execute_run_once（agent_run/orchestrator）
 ```
 
-**合并语义**：A 在节点间隙看到 cancel → 中止、**不写 history**；B 拿到锁后用 HistoryManager 中已有的 A+B 用户句装配完整上下文再生成。
-（若 A 已 by_bot 发出部分文本，用户可能看到半截 + B 完整回复——取消点在模型节点间隙，无法收回已发送段。）
+**合并语义**：后到真人消息排队，不打断进行中的工具轮。排队过久超过 STALE 则丢弃过期回复。HTTP 客户端主动取消仍走 `_cancel_generation`。
 
 日志：`获取到执行锁` / `generation_cancelled_supersede` / `generation_aborted_no_history` / `队列等待 … 超 TTL`。
 
@@ -1436,7 +1432,7 @@ logger.info ====== Agent 运行开始 ======
 交互脚手架：消费入口 TurnGraph（缺则现场 build，带 has_reply）
   C-1/C-2/C-3 + quoted_tome → QUOTE_TOME_HINT
   PIN：日程/回想工具 schema 恒在，check_func 拒执行（不拆 schema）
-  群聊瘦保底 / LIGHT 迭代上限 / 可见性 hint
+  群聊瘦保底 / 可见性 hint
 session_logger.log_run_start()
 session_logger.log_user_input(final_user_message)
 ```
@@ -1454,7 +1450,7 @@ session_logger.log_user_input(final_user_message)
 | L2 状态 | 本群/本会话有持久实体，且群聊已点名/省略跟进（私聊始终） | `get_state_driven_family_tools` 补对应族、剥 exclusive；旁观不加。核内**非状态驱动**域首轮族闭合（跳过定时任务/Kanban/产物/record）。`send_*` extras 不进静态附加池。群聊 extras 不 L4 整族展开 |
 | L3 驻留 | 不写 core | 跨轮靠 `find_tools` 成功后 **append-only**（`session_tool_ceiling` 硬顶，超顶拒新名） |
 | 语境 | 有 group | 群画像 tags → 附加池；**exclusive 永不进主会话**（无 shield） |
-| L4/L5 向量 | 非 in_flight 短轮 | 近文 + 本轮检索；新名字只 append，禁止删除/排序/热槽替换。点名/跟进不因 LIGHT 跳过（瘦核不含 web_search） |
+| L4/L5 向量 | 非 in_flight 短轮 | 近文 + 本轮检索；新名字只 append，禁止删除/排序/热槽替换。点名/跟进不跳过（瘦核不含 web_search） |
 | 委派 | 交互主人格 | exclusive 集合来自节点注册表；roster 在 **system** |
 | 渐进 | 每轮可挂 | `find_tools` 先节点后向量；RetrievableToolset 防 exclusive 回灌。发现/委派/回想不按点名硬拒（交给模型）。日程 create/mutate **PIN 恒可见**，管理形由 `check_func` 拒执行（拒绝文案 ≠ effectual write） |
 | 出图 | **主路径** | **`create_subagent(agent_profile="render_agent")`** 自由 HTML → 图句柄；主人格 `send_message_by_ai(image_id=)` |
@@ -1575,8 +1571,8 @@ agent.iter(message_history=self.history + 本轮 user)   # loop.py
 
 **在途委派（2026-08-14）**：`create_subagent` 回执改印 `dlg_<root_task_id>` 句柄（原印
 `root.id[:8]`，而 `list_persisted_outputs` 是 SQL 等值 → 模型怎么查都是空）。`dlg_` 已接进
-`handle_resolver`，`read_handle` 与 `check_delegation(id, wait_sec=)` 均可消费；内联等待
-与轮询共用 `control.delegation.await_delegation`，5s 只是默认参数。产物按 **root** 取
+`handle_resolver`，`read_handle` 与 `check_delegation(id, wait_sec=)` 均可消费；生产 Chat
+立刻 deferred（`wait_sec=0`），TEST 内联等到 90s。产物按 **root** 取
 （`list_for_root`：多节点树的产物挂在 child 上）。执行体完成先 `mailbox.post_to_session`，
 再由短窗 flush 用 `drain_one(session, "delivery", root)` 精确消费——会话级 drain 会抽走
 兄弟 root 的投递。
@@ -1910,11 +1906,11 @@ hook 总线在整个启动窗口内空转：那段时间里所有请求**零工�
 |------|------|--------------|----------------|
 | 无 `agent_profile` | 通用 Plan-and-Solve 子 Agent | 否 | 是（等 `run` 返回） |
 | profile ∈ 默认 ad-hoc 集合，或显式 `transient=True` | `run_capability_agent` 临时工作区 | 否 | 是（同步跑完 + incomplete 可催 1 次） |
-| 其余 profile | 建叶子根 → `kick_root` → `await_delegation` | **是** | Chat **5s**；`create_by=TEST`（评测 HTTP）**90s**。超时后后台继续，完成后框架注入交付包 |
+| 其余 profile | 建叶子根 → `kick_root` → 立刻 deferred | **是** | Chat **不等**（`wait_sec=0`）；`create_by=TEST` **90s**。完成后框架注入交付包 |
 
 默认 ad-hoc：`research_agent` / `internal_reporter` / `memory_curator` / `scheduler_assistant`。
 `render_agent` / `stock_report_agent` / code / plugin_dev 等需要产物与审批的通常走看板。
-常量：`_KANBAN_INLINE_WAIT_TIMEOUT_SEC = 5.0`（须低于会话 STALE，防占锁拖垮群聊）。
+常量：生产 Chat `wait_sec=0`；评测 `_KANBAN_TEST_WAIT_TIMEOUT_SEC = 90`。
 评测进程 `create_by="TEST"` 等不到 mailbox 回灌，故内联等到 90s；**不要**把 90s 抄进生产 Chat。
 
 ### 16.2 能力代理工具回填与 web 降权
@@ -1965,7 +1961,7 @@ hook 总线在整个启动窗口内空转：那段时间里所有请求**零工�
    检索文本 = **name+docstring+covers+aliases**（`ToolBase.retrieval_text`）。
 5. **find_tools 分流**：真无命中 / exclusive 剥离 / visible 隐藏 → 语义节点 + `owning_nodes_of_tools` 指路委派；
    **禁止**「据现有能力作答」。节点语义路由见 `agent_node/semantic_routing.py`；roster 附 covers。
-6. **抢答（A）**：同 Session 新 run 在锁被占时 set cancel；旧 generation 节点间隙 abort 且不写 history；**有在途委派则留交接语**。
+6. **排队（A）**：同 Session 新 run 在锁被占时排队，不 cancel 当前工具轮；排队过久超 STALE 则丢弃。HTTP 客户端断开仍可 cancel。
 7. **机器腔（B）**：tool return tech dump 屏蔽；输出 `machine_dump` 经 `pre_send_gate` → FALLBACK。
 8. **统一输出闸（C）**：`pre_send_gate` 顺序 **尖括号 → OOC → 心想**；勿在 loop 平行第二套顺序。
 9. **呈现 vs 合规**：`send_chat_result` 只做通道变换；打回/熔断只在 gate。
@@ -1985,7 +1981,7 @@ hook 总线在整个启动窗口内空转：那段时间里所有请求**零工�
 20. **心想闸**：通道形态（长「心想」段）REWRITE，2 次后剥段落放行；不靠业务关键词。
 21. **引用 bot = is_tome，进环判断**：`quoted_tome` 只换 QUOTE_TOME_MARKER + HINT，
     不走软门、不因 hostile 硬静。跟别人说话或故意惹 → 模型 `<SILENCE>`。
-22. **CheapGate quiet_zone**：hostile/cold **未点名**才早退；被 @ 闲聊走 LIGHT。
+22. **CheapGate quiet_zone**：hostile/cold **未点名**才早退；被 @ 闲聊走 FULL。
     zone 口吻进 `voice_anchor`（未打分不注入）。`group_lurk_mode` 默认关。
 23. **假完成认生效写**：`effectual_mutate` 仅 add/modify/cancel/pause/resume 且非 PIN 拒绝。
 24. **出口消毒**：`strip_framework_user_leaks`；UsageLimit / 出图在途超轮 → `<SILENCE>`。
@@ -2012,7 +2008,7 @@ hook 总线在整个启动窗口内空转：那段时间里所有请求**零工�
 | reactive_gate | 仅 soft | 引用 bot / 硬 @ 不走 |
 | RelationshipView | 是 | H02；zone voice 进口吻锚 |
 | ai_router / Session | 是 | |
-| context_assembly | 是 | LIGHT/未点名 suffix 清空产品块 |
+| context_assembly | 是 | 未点名 suffix 清空产品块 |
 | agent_run 工具装配 | 是 | `tools.py`；层随状态/向量/驻留变；**不**因闲聊硬砍；exclusive 剥离；PIN 恒可见 |
 | LLM provider | 是 | 除非开口门 / CheapGate / 软门早退 |
 | 插件工具 / MCP | 条件 | 模型点名才执行 |

@@ -195,11 +195,9 @@ def _get_subagent_semaphore() -> asyncio.Semaphore:
     return _subagent_semaphore
 
 
-# create_subagent(agent_profile=...) 转 Kanban：短等快速完成，否则 deferred 回灌。
-# 短等上限须低于会话 _run_lock 排队 STALE，避免长任务占锁导致群聊应答率塌陷。
-_KANBAN_INLINE_WAIT_TIMEOUT_SEC = 5.0
-# 轮询间隔已收敛到 control.delegation.await_delegation；此处保留常量仅为兼容引用
-_KANBAN_INLINE_POLL_INTERVAL_SEC = 0.5
+# create_subagent(agent_profile=...) 转 Kanban：生产立刻 deferred 回灌，不占会话锁。
+# TEST/评测仍同步等待，因评测 HTTP 等不到回灌。
+_KANBAN_TEST_WAIT_TIMEOUT_SEC = 90.0
 
 # 纯 lookup 默认同步 ad-hoc（transient），不建看板卡。
 # 外部检索默认 Kanban：超时可回灌，取消不会把事实包扔掉。
@@ -592,19 +590,16 @@ async def _dispatch_via_kanban(
     agent_profile: str,
 ) -> str:
     """把 create_subagent(agent_profile=...) 转为创建 Kanban **单任务**（叶子根）
-    并同步等待执行完成。
+    并启动执行。生产路径立刻 deferred 回灌，不占主会话锁；TEST 仍同步等待。
 
     每条主人格通过画像派出的任务都走这条路：
     1. ``kanban.create_kanban_tree(root_agent_profile=pid)`` 建一棵**只有根任务**
        的叶子树——根任务自身带 ``agent_profile``，被调度器当作单一可执行节点直接
        派出。**不再**创建冗余的"根 + 1 子任务"双节点结构；
     2. ``kick_root`` 立刻派活；
-    3. 轮询数据库等根任务进终态（completed / failed / waiting_approval 等）；
+    3. 生产：``mark_deferred_main_delivery`` 后立即返回，完成后
+       ``_wake_main_agent_for_delivery``；TEST 同步等到终态。
     4. 抓根任务最新产出 artifact 句柄 + relay 文本，拼成回执给主人格。
-
-    超时（``_KANBAN_INLINE_WAIT_TIMEOUT_SEC``）后**不强制中止**——任务会继续在
-    Kanban 调度器里跑，主人格收到提示"任务仍在跑，到 webconsole 看进度"，并被告知
-    该 Kanban 任务 id 以便后续 `artifact_get_recent` 追问。
     """
     ev = ctx.deps.ev
     if ev is None:
@@ -694,25 +689,22 @@ async def _dispatch_via_kanban(
             p2=repr(task[:60]),
         )
     )
-    # 登记为"主人格转述"：交互式派发下，执行体（kanban_executor）**不自动推群**，
+    # 登记为"主人格转述"：交互式派发下，执行体（kanban_executor）**不自动推群**。
+    # 立刻 deferred：后到群消息不再 cancel 本轮，完成后走回灌。
     mark_interactive_relay_root(root.id)
+    mark_deferred_main_delivery(root.id)
     asyncio.create_task(kick_root(root.id))
 
-    # 同步等待根任务进终态：与 check_delegation 共用 await_delegation，
-    # 「内联等 5s」因此只是同一入口的默认参数，不再是独立轮询路径。
     extra = ctx.deps.extra if ctx.deps is not None else {}
     parent_cb = extra["parent_create_by"] if "parent_create_by" in extra else ""
-    # TEST/评测 HTTP 等不到回灌；生产仍 5s 以免占 _run_lock。
-    wait_sec = 90.0 if parent_cb == "TEST" else _KANBAN_INLINE_WAIT_TIMEOUT_SEC
-    waited = wait_sec
-    deleg = await await_delegation(delegation_handle(root.id), wait_sec=wait_sec)
+    wait_sec = _KANBAN_TEST_WAIT_TIMEOUT_SEC if parent_cb == "TEST" else 0.0
+    handle = delegation_handle(root.id)
+    deleg = await await_delegation(handle, wait_sec=wait_sec)
     if deleg is None:
         return f"⚠️ Kanban 任务记录消失（task_id={root.id}）；可能被并发删除，请到 webconsole 看任务列表。"
     final: Optional[AIAgentTask] = await AIAgentTask.get_by_id(root.id) if deleg.is_terminal else None
 
     if final is None:
-        # 超时：deferred 回灌；严禁主人格对群报「还在跑/任务编号/等会儿」
-        mark_deferred_main_delivery(root.id)
         fresh_after = await AIAgentTask.get_by_id(root.id)
         if fresh_after is not None and fresh_after.status in (
             "completed",
@@ -728,11 +720,9 @@ async def _dispatch_via_kanban(
                     "请只输出 <SILENCE>，勿向用户说话、勿重复 create_subagent。"
                 )
         else:
-            # 给模型**能被工具消费**的单一句柄（INV-5）：旧版只印 8 字符前缀，
-            # 而 list_persisted_outputs 是 SQL 等值查询 → 模型怎么查都是空。
             return (
-                f"⏳ 子任务后台执行中（已同步等 {int(waited)}s，将自动回灌）。"
-                f"task#{root.ordinal} / {pid} / 句柄 {delegation_handle(root.id)}\n"
+                f"⏳ 子任务后台执行中（将自动回灌）。"
+                f"task#{root.ordinal} / {pid} / 句柄 {handle}\n"
                 "本 tool_return 不是终局结论。"
                 "对用户默认 <SILENCE>"
                 "（禁止过程动词、任务编号、句柄、编排词、叙述第二个执行者）。"

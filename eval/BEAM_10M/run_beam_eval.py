@@ -412,20 +412,27 @@ async def cmd_ingest_plan(
                 f"/{(n + chunk_size - 1) // chunk_size} turns={len(chunk)} last={last}",
                 flush=True,
             )
-            last_resp = await call_batch_observe(
-                client=client,
-                base_url=base_url,
-                user_id=user_id,
-                turns=chunk,
-                scope_type="user_global",
-                flush=flush if last else False,
-                trigger_rebuild=trigger_rebuild and last,
-                timeout=timeout,
-            )
-            print(
-                f"[Ingest] chunk -> {last_resp.get('status')}: {last_resp.get('msg')} data={last_resp.get('data')}",
-                flush=True,
-            )
+            last_resp = {"status": 1, "msg": "not attempted", "data": None}
+            for attempt in range(1, 4):
+                last_resp = await call_batch_observe(
+                    client=client,
+                    base_url=base_url,
+                    user_id=user_id,
+                    turns=chunk,
+                    scope_type="user_global",
+                    flush=flush if last else False,
+                    trigger_rebuild=trigger_rebuild and last,
+                    timeout=timeout,
+                )
+                print(
+                    f"[Ingest] chunk -> {last_resp.get('status')}: {last_resp.get('msg')} "
+                    f"data={last_resp.get('data')} attempt={attempt}",
+                    flush=True,
+                )
+                if last_resp.get("status") == 0:
+                    break
+                if attempt < 3:
+                    await asyncio.sleep(15.0 * attempt)
             if last_resp.get("status") != 0:
                 break
 

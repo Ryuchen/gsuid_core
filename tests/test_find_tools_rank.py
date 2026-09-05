@@ -27,7 +27,12 @@ def test_need_match_unidirectional_and_cjk_window() -> None:
     assert need_matches_tool_text("网页搜索", "tool 网页搜索 docs", [])
     assert need_matches_tool_text("帮我网页搜索一下", "other", ["网页搜索"])
     assert not need_matches_tool_text("帮我分析很长的需求描述xyz", "分析", [])
-    assert need_matches_tool_text("北京这周的天气", "weather_handler", ["天气", "气象"])
+    assert need_matches_tool_text("帮我查北京天气", "other", ["北京天气"])
+    assert not need_matches_tool_text(
+        "查询鸣潮面板的详情面板图并生成面板图片",
+        "get_pool_countdown 卡池倒计时",
+        ["面板"],
+    )
     hay = "查询用户本人在鸣潮「全息矩阵」（矩阵叠兵 / 终焉矩阵）的挑战记录"
     assert need_matches_tool_text("查询鸣潮矩阵叠兵个人战绩记录和分数", hay, [])
     assert not need_matches_tool_text("查询鸣潮矩阵叠兵个人战绩记录和分数", "用户记忆与好感度", [])
@@ -117,7 +122,7 @@ def test_dedicated_tool_drops_generic_agents() -> None:
     assert plan.loadable_tool_names() == ["send_waves_matrix_info"]
     text = format_find_tools_plan(plan)
     assert "send_waves_matrix_info" in text
-    assert "【专用工具】" in text
+    assert "不要 create_subagent" in text
     assert "research_agent" not in text
     assert "有专用项时禁止选通用项" in text
 
@@ -154,6 +159,7 @@ def test_generic_only_when_no_dedicated() -> None:
 def test_orchestration_prompt_follows_tier_order() -> None:
     assert "专用能力>专用工具>通用能力>通用工具" in TOOL_ORCHESTRATION_CONSTRAINTS
     assert "有专用项禁止改用通用项" in TOOL_ORCHESTRATION_CONSTRAINTS
+    assert "有专用工具直接调勿改派" in TOOL_ORCHESTRATION_CONSTRAINTS
     assert "优先 subagent" not in TOOL_ORCHESTRATION_CONSTRAINTS
     assert "优先 create_subagent" not in TOOL_ORCHESTRATION_CONSTRAINTS
     assert "零调用禁止说做不到" in TOOL_ORCHESTRATION_CONSTRAINTS
@@ -164,6 +170,8 @@ def test_find_tools_source_no_agent_short_circuit() -> None:
     src = Path("gsuid_core/ai_core/buildin_tools/dynamic_tool_discovery.py").read_text(encoding="utf-8")
     assert "_delegation_directive" not in src
     assert "_capability_agent_lines" not in src
+    assert "_format_already_loaded" not in src
+    assert "当前列表已有对应能力族工具" not in src
     assert "build_find_tools_plan" in src
     assert "format_find_tools_plan" in src
 
@@ -237,6 +245,142 @@ def test_find_tools_matrix_need_loads_plugin_not_research() -> None:
     assert "memory_curator" not in out
     assert "有专用项时禁止选通用项" in out
     assert "send_waves_matrix_info" in ctx.deps.dynamic_tool_names
+
+
+def _countdown_tb() -> SimpleNamespace:
+    return SimpleNamespace(
+        name="get_pool_countdown",
+        category="by_trigger",
+        plugin="PluginA",
+        hide_from_main=False,
+        covers=["面板"],
+        description="卡池倒计时",
+        retrieval_text="get_pool_countdown 卡池倒计时",
+    )
+
+
+def _char_detail_tb() -> SimpleNamespace:
+    return SimpleNamespace(
+        name="get_user_wuwa_char_detail",
+        category="by_trigger",
+        plugin="PluginA",
+        hide_from_main=False,
+        covers=["详情面板"],
+        description="角色详情",
+        retrieval_text="get_user_wuwa_char_detail 角色详情面板图",
+    )
+
+
+def test_find_tools_still_searches_when_short_cover_already_offered() -> None:
+    from gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery import find_tools
+
+    countdown = _countdown_tb()
+    panel = _char_detail_tb()
+    tool = _FakeTool("get_user_wuwa_char_detail")
+    search_calls: list[int] = []
+
+    async def fake_search(**_kwargs: object) -> list[_FakeTool]:
+        search_calls.append(1)
+        return [tool]
+
+    async def fake_matched(_need: str, *, limit: int = 5) -> list[str]:
+        return ["research_agent"]
+
+    def fake_find(name: str) -> SimpleNamespace | None:
+        if name == "get_pool_countdown":
+            return countdown
+        if name == "get_user_wuwa_char_detail":
+            return panel
+        return None
+
+    ctx = MagicMock()
+    ctx.deps = ToolContext(
+        extra={EXPOSED_TOOLS_EXTRA_KEY: ["get_pool_countdown", "find_tools"]},
+        blocked_tool_names=set(),
+    )
+
+    async def _run() -> str:
+        with (
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery.search_tools_by_domain",
+                fake_search,
+            ),
+            patch("gsuid_core.ai_core.register.find_tool_base", fake_find),
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery._matched_capability_node_ids",
+                fake_matched,
+            ),
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery.nodes_with_keyword_hit",
+                lambda _n: [],
+            ),
+        ):
+            return await find_tools(ctx, "查询角色面板的详情面板图并生成面板图片")
+
+    out = asyncio.run(_run())
+    assert search_calls == [1]
+    assert "get_user_wuwa_char_detail" in out
+    assert "当前列表已有对应能力族工具" not in out
+    assert "get_pool_countdown" not in out
+    assert "research_agent" not in out
+    assert "get_user_wuwa_char_detail" in ctx.deps.dynamic_tool_names
+
+
+def test_find_tools_merges_already_offered_true_hit() -> None:
+    from gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery import find_tools
+
+    panel = _char_detail_tb()
+    search_calls: list[int] = []
+
+    async def fake_search(**_kwargs: object) -> list[_FakeTool]:
+        search_calls.append(1)
+        return []
+
+    async def fake_visible(_ctx: object, names: object) -> list[str]:
+        return list(names) if isinstance(names, list) else []
+
+    async def fake_matched(_need: str, *, limit: int = 5) -> list[str]:
+        return ["research_agent"]
+
+    def fake_find(name: str) -> SimpleNamespace | None:
+        if name == "get_user_wuwa_char_detail":
+            return panel
+        return None
+
+    ctx = MagicMock()
+    ctx.deps = ToolContext(
+        extra={EXPOSED_TOOLS_EXTRA_KEY: ["get_user_wuwa_char_detail"]},
+        blocked_tool_names=set(),
+    )
+
+    async def _run() -> str:
+        with (
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery.search_tools_by_domain",
+                fake_search,
+            ),
+            patch("gsuid_core.ai_core.register.find_tool_base", fake_find),
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery.visible_offered_names",
+                fake_visible,
+            ),
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery._matched_capability_node_ids",
+                fake_matched,
+            ),
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery.nodes_with_keyword_hit",
+                lambda _n: [],
+            ),
+        ):
+            return await find_tools(ctx, "查询角色详情面板")
+
+    out = asyncio.run(_run())
+    assert search_calls == [1]
+    assert "get_user_wuwa_char_detail" in out
+    assert "未检索到" not in out
+    assert "【专用工具】" in out
+    assert "research_agent" not in out
 
 
 def test_find_tools_folds_exclusive_render_to_agent() -> None:

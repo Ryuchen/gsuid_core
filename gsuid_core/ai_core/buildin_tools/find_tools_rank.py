@@ -21,6 +21,7 @@ GENERIC_CAPABILITY_NODE_IDS: frozenset[str] = frozenset(
 _CORE_PLUGINS: frozenset[str] = frozenset({"", "core", "unknown"})
 _FOLD_CATEGORIES: frozenset[str] = frozenset({"media", "plugin_dev", "default", "meta"})
 _CJK_MIN_WINDOW = 4
+_COVER_IN_NEED_MIN = 3
 _MAX_DEDICATED_AGENTS = 3
 _MAX_DEDICATED_TOOLS = 6
 _MAX_GENERIC_AGENTS = 3
@@ -111,7 +112,7 @@ def _hay_has_cjk_window(need: str, hay: str, min_len: int = _CJK_MIN_WINDOW) -> 
 
 
 def need_matches_tool_text(need: str, retrieval_text: str, covers: list[str]) -> bool:
-    """单向命中：need∈retrieval、cover∈need、或 ≥4 字中文窗口。禁止 hay∈need。"""
+    """单向命中：need∈retrieval、cover∈need（cover≥3）、或 ≥4 字中文窗口。禁止 hay∈need。"""
     n = (need or "").strip().lower()
     hay = (retrieval_text or "").strip().lower()
     if not n:
@@ -120,7 +121,7 @@ def need_matches_tool_text(need: str, retrieval_text: str, covers: list[str]) ->
         return True
     for c in covers:
         cl = (c or "").strip().lower()
-        if cl and cl in n:
+        if len(cl) >= _COVER_IN_NEED_MIN and cl in n:
             return True
     if _hay_has_cjk_window(n, hay):
         return True
@@ -203,7 +204,7 @@ def format_find_tools_plan(plan: FindToolsPlan) -> str:
         for h in plan.dedicated_agents:
             parts.append(f"- `{h.name}`：{h.label}")
     if plan.dedicated_tools:
-        parts.append("【专用工具】下一步直接调用")
+        parts.append("【专用工具】下一步直接调用，有则不要 create_subagent")
         for h in plan.dedicated_tools:
             parts.append(f"- {h.name}：{h.label}")
     if plan.generic_agents:

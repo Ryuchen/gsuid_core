@@ -161,9 +161,9 @@ TOOL_ORCHESTRATION_CONSTRAINTS = """
 ## 工具决策
 1. 合规红线 → 角色化拒。纯寒暄短句，勿碰 self_info。
 2. 省略跟进（「那上海呢」「改成…」「取消那个」）= 继承上轮，必须调对应工具。
-3. 问过去/已有资料 → `search_cognition`；查不到就明说。填说话人身上的槽时 query 只写「该ID + 槽」，填完再搜外部。
-4. `find_tools` 回执按 专用能力>专用工具>通用能力>通用工具 排好；有专用项禁止改用通用项。
-   专用能力走 `create_subagent(agent_profile=node_id)`。禁主人格自渲 HTML。
+3. 说话人已有资料才 `search_cognition`（query=该ID+槽）；实时查数先列表工具或 `find_tools`。
+4. `find_tools` 回执按 专用能力>专用工具>通用能力>通用工具；有专用工具直接调勿改派。
+   无对口才 `create_subagent(agent_profile=node_id)`。禁自渲 HTML。有专用项禁止改用通用项。
 5. 句柄先读 inline_head，不够再 `read_handle`。改/删/停提醒先 list 再 mutate，禁止用 add_* 顶替。
 6. 列表没有对口工具先 `find_tools`，零调用禁止说做不到/没装。
    没调工具绝不说已设置/已取消/查到了。别人互聊且没找你 → 别调。

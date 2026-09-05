@@ -48,14 +48,40 @@ def test_skip_search_idle_both_channels() -> None:
         followup_detected=False,
         has_active_task=False,
         has_media=False,
-        is_light=False,
         intent="闲聊",
     )
-    assert should_skip_tool_search(is_group=False, call_to_self=True, **idle)
-    assert should_skip_tool_search(is_group=True, call_to_self=True, **idle)
+    assert should_skip_tool_search(is_group=False, call_to_self=True, **idle) is False
+    assert should_skip_tool_search(is_group=True, call_to_self=True, **idle) is False
     work = {**idle, "intent": "工具"}
     assert not should_skip_tool_search(is_group=False, call_to_self=True, **work)
     assert not should_skip_tool_search(is_group=True, call_to_self=True, **work)
+
+
+def test_group_idle_request_limit_addressed_not_capped() -> None:
+    from gsuid_core.ai_core.agent_run.tools import group_idle_request_limit
+
+    assert (
+        group_idle_request_limit(
+            20,
+            is_group=True,
+            followup_detected=False,
+            has_active_task=False,
+            idle_cap=2,
+            call_to_self=True,
+        )
+        == 20
+    )
+    assert (
+        group_idle_request_limit(
+            20,
+            is_group=True,
+            followup_detected=False,
+            has_active_task=False,
+            idle_cap=2,
+            call_to_self=False,
+        )
+        == 2
+    )
 
 
 def test_skip_search_group_bystander() -> None:
@@ -66,7 +92,6 @@ def test_skip_search_group_bystander() -> None:
         has_active_task=False,
         has_media=False,
         call_to_self=False,
-        is_light=False,
         intent="工具",
     )
 
@@ -79,7 +104,6 @@ def test_skip_search_followup_still_searches() -> None:
         has_active_task=False,
         has_media=False,
         call_to_self=True,
-        is_light=False,
         intent="闲聊",
     )
 
@@ -99,3 +123,11 @@ def test_kernel_family_close_skips_attach_article() -> None:
     assert "add_once_task" in names
     assert "attach_article" not in names
     assert "list_scheduled_tasks" not in names
+
+
+def test_interactive_run_queues_instead_of_cancel() -> None:
+    from pathlib import Path
+
+    src = Path("gsuid_core/ai_core/gs_agent.py").read_text(encoding="utf-8")
+    assert "supersede_queue_wait" in src
+    assert "supersede_cancel_current" not in src

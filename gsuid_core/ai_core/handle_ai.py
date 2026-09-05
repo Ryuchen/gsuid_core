@@ -445,7 +445,6 @@ async def _settle_and_fire_after_run(
         silenced=is_silence,
         error=is_error,
         reached_model=True,
-        is_light=cheap is CheapGate.LIGHT,
         is_master=rel.is_master,
         guard_flags=guard_flags,
     )

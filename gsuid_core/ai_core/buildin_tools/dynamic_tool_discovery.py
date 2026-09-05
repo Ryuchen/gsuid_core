@@ -144,9 +144,43 @@ async def _matched_capability_node_ids(need: str, *, limit: int = 5) -> list[str
     return ids
 
 
-def _format_already_loaded(names: Sequence[str]) -> str:
-    listing = "\n".join(f"- {name}" for name in names)
-    return f"✅ 当前列表已有对应能力族工具，直接调用，不要委派：\n{listing}"
+def _offered_dedicated_hits(
+    *,
+    names: Sequence[str],
+    need: str,
+    exclusive: set[str],
+) -> list[RankedHit]:
+    """已暴露专用工具里真正对口的，并入分档；短 cover 不会在这里误伤。"""
+    from gsuid_core.ai_core.register import find_tool_base
+
+    hits: list[RankedHit] = []
+    for name in names:
+        tb = find_tool_base(name)
+        if tb is None:
+            continue
+        covers = list(tb.covers)
+        retrieval = tb.retrieval_text
+        if not need_matches_tool_text(need, retrieval, covers):
+            continue
+        if (
+            classify_callable_tool(
+                name=tb.name,
+                category=tb.category,
+                plugin=tb.plugin,
+                hide_from_main=tb.hide_from_main,
+                exclusive=exclusive,
+            )
+            != "dedicated"
+        ):
+            continue
+        hits.append(
+            RankedHit(
+                name=tb.name,
+                label=tool_brief(covers=covers, description=tb.description),
+                score=3000.0,
+            )
+        )
+    return hits
 
 
 async def visible_offered_names(ctx: RunContext[ToolContext], names: Sequence[str]) -> list[str]:
@@ -204,6 +238,7 @@ async def find_tools(
 ) -> str:
     """列表没有的能力必须先调：用一句话描述所缺能力。未调用前禁止说做不到/没装。
 
+    每次都会检索，不因列表里已有工具而跳过。已暴露且真正对口的专用工具并入回执。
     一次返回专用能力 / 专用工具 / 通用能力 / 通用工具；有专用项时禁止改用通用项。
     专用工具下一步可直接调；专用能力用 create_subagent(agent_profile=node_id)。
 
@@ -224,36 +259,16 @@ async def find_tools(
         offered: list[str] = [n for n in offered_raw if isinstance(n, str)] if isinstance(offered_raw, list) else []
         offered_set = set(offered)
 
-        dedicated_offered: list[str] = []
-        for name in offered:
-            tb = find_tool_base(name)
-            covers = list(tb.covers) if tb is not None else []
-            retrieval = tb.retrieval_text if tb is not None else name
-            if not need_matches_tool_text(need, retrieval, covers):
-                continue
-            if tb is None:
-                continue
-            if (
-                classify_callable_tool(
-                    name=tb.name,
-                    category=tb.category,
-                    plugin=tb.plugin,
-                    hide_from_main=tb.hide_from_main,
-                    exclusive=exclusive,
-                )
-                == "dedicated"
-            ):
-                dedicated_offered.append(name)
-        dedicated_offered = await visible_offered_names(ctx, dedicated_offered)
-        if dedicated_offered:
-            stale_l = _record_find_tools_round(ctx.deps.extra, dedicated_offered)
-            msg_l = _format_already_loaded(dedicated_offered)
-            return f"{msg_l}\n{FIND_TOOLS_GAP_NOTE}" if stale_l else msg_l
+        # 已加载命中不短路：短 cover 会误把列表里的工具当对口，真正缺的就搜不到。
+        offered_hits = _offered_dedicated_hits(names=offered, need=need, exclusive=exclusive)
+        visible_offered = await visible_offered_names(ctx, [h.name for h in offered_hits])
+        visible_offered_set = set(visible_offered)
+        offered_hits = [h for h in offered_hits if h.name in visible_offered_set]
 
         family_tools = await search_tools_by_domain(
             query=need, domain_limit=3, per_domain_limit=6, exclude_names=offered_set
         )
-        dedicated_tools: list[RankedHit] = []
+        dedicated_tools: list[RankedHit] = list(offered_hits)
         generic_tools: list[RankedHit] = []
         fold_names: list[str] = []
         hidden_names: list[str] = []

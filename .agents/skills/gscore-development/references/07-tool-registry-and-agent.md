@@ -175,7 +175,8 @@ def get_registered_tools() -> Dict[str, Dict[str, ToolBase]]: ...  # 按分类
 2. **`find_tools` meta-tool**（`buildin_tools/dynamic_tool_discovery.py`，`category="meta"`）——
    模型发现缺工具时调用。**不声明 `capability_domain`**。
    **分档一次返回（专用能力 > 专用工具 > 通用能力 > 通用工具）**：
-   0. 已加载的 **专用** 工具 covers / retrieval 单向命中才回「已加载」；通用核工具命中不短路。
+   0. **始终检索**，禁止因「列表已有专用工具」提前 return。已暴露且 covers/retrieval
+      真正命中的专用工具并入分档回执（提醒直调），短 cover（不足 3 字）不算命中。
       **禁止**同域立刻 return（`n in hay or hay in n` 已删）；中文另用 ≥4 字窗口。
    1. 向量召族 + 节点匹配，代码分层后一组回执。exclusive 工具折叠成所属专用能力，不回灌主人格。
    2. 通用节点（research / memory_curator / internal_reporter / scheduler）不得压过插件专用工具。
@@ -252,7 +253,7 @@ step2  RetrievableToolset 读集合 → get_weather 本步"出现"并可调用
 模型（prompt 仍写「别人互聊就别调」）。调度新建/变更仍用 `sched_create_ok` /
 `sched_mutate_ok`（管理形藏新建，不要求 history 有 ToolCall）。装配层
 `snapshot_tool_allowed` 只按日程旗从本轮快照拿掉对应名。C-3 `@别人` 仍零工具。
-LIGHT / 误判闲聊**不得**让点名轮跳过向量检索（瘦核已不含 `web_search_tool`）。
+点名轮**不得**因误判闲聊跳过向量检索（瘦核已不含 `web_search_tool`）。
 
 ## 7.7 两段式 domain 检索（`search_tools_by_domain`）
 

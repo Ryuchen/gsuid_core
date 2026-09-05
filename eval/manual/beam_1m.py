@@ -476,25 +476,37 @@ async def cmd_campaign(
     if not await _wait_core(host, port, timeout=600.0):
         print("[campaign] core 未监听，退出")
         return 2
-    print("[campaign] conv=0 resume plans=6-10 no-clear", flush=True)
-    rc = await cmd_ingest(base_url, 0, timeout, force=True, plan_ids=[6, 7, 8, 9, 10], clear=False)
-    if rc:
-        return rc
-    rc = await cmd_smoke5(base_url, 0, timeout)
-    if rc:
-        print("[campaign] smoke5 未通过，停下。")
-        _write_10m_report()
-        return rc
-    rc = await cmd_domain(base_url, 0, timeout, cat)
-    if rc:
-        print("[campaign] domain 未通过，停下。")
-        _write_10m_report()
-        return rc
-    rc = await cmd_finish(base_url, 0, timeout)
-    if rc:
-        _write_10m_report()
-        return rc
+    prog = _progress()
+    if 0 not in (prog.get("ingest") or []):
+        print("[campaign] conv=0 resume plans=6-10 no-clear", flush=True)
+        rc = await cmd_ingest(base_url, 0, timeout, force=False, plan_ids=[6, 7, 8, 9, 10], clear=False)
+        if rc:
+            return rc
+        prog = _progress()
+    if 0 not in (prog.get("smoke5") or []):
+        rc = await cmd_smoke5(base_url, 0, timeout)
+        if rc:
+            print("[campaign] smoke5 未通过，停下。")
+            _write_10m_report()
+            return rc
+        prog = _progress()
+    if 0 not in (prog.get("domain") or []):
+        rc = await cmd_domain(base_url, 0, timeout, cat)
+        if rc:
+            print("[campaign] domain 未通过，停下。")
+            _write_10m_report()
+            return rc
+        prog = _progress()
+    if 0 not in (prog.get("finish") or []):
+        rc = await cmd_finish(base_url, 0, timeout)
+        if rc:
+            _write_10m_report()
+            return rc
     for conv in range(1, 10):
+        prog = _progress()
+        if conv in (prog.get("finish") or []):
+            print(f"[campaign] conv={conv} 已完成，跳过", flush=True)
+            continue
         print(f"\n========== conv {conv}/9 ==========", flush=True)
         rc = await cmd_conv(
             base_url,

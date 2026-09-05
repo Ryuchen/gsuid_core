@@ -145,7 +145,6 @@ class RunOnceState:
     followup_detected: bool = False
     tg: Any | None = None
     cheap: Any | None = None
-    is_light: bool = False
     has_media: bool = False
     group_slim: bool = False
 

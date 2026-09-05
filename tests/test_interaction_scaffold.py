@@ -97,12 +97,13 @@ def test_ellipsis_inherits_other_speaker_gates_slot() -> None:
     assert tg.address_gated is True
 
 
-def test_light_hint_requires_find_tools_before_giving_up() -> None:
-    from gsuid_core.ai_core.interaction_scaffold import LIGHT_MODE_HINT
+def test_live_lookup_and_task_request_patterns() -> None:
+    from gsuid_core.ai_core.interaction_scaffold import looks_like_live_lookup, looks_like_task_request
 
-    assert "find_tools" in LIGHT_MODE_HINT
-    assert "做不到" in LIGHT_MODE_HINT
-    assert "直接调已有工具" not in LIGHT_MODE_HINT
+    assert looks_like_live_lookup("小明(用户ID:1)：看看我椿面板")
+    assert looks_like_task_request("帮我设个提醒")
+    assert not looks_like_live_lookup("今天好困")
+    assert not looks_like_task_request("今天好困")
 
 
 def test_multi_speaker_message():
@@ -149,7 +150,6 @@ def test_turn_graph_and_cheap_gate(monkeypatch):
     assert decide_cheap_gate(tg_dm) is CheapGate.FULL
     assert MEMORY_QA_HINT in scaffold_hints_from_graph(tg_dm, cheap=CheapGate.FULL, intent="工具")
     assert SPEAKER_RECALL_HINT not in scaffold_hints_from_graph(tg_dm, cheap=CheapGate.FULL, intent="工具")
-    assert SPEAKER_RECALL_HINT not in scaffold_hints_from_graph(tg_dm, cheap=CheapGate.LIGHT, intent="工具")
     assert SPEAKER_RECALL_HINT not in scaffold_hints_from_graph(
         tg_dm, cheap=CheapGate.FULL, speaker_recall=False, intent="工具"
     )
@@ -220,6 +220,7 @@ def test_memory_qa_hint_not_speaker_slot():
 def test_turn_graph_group_gates(monkeypatch):
     from gsuid_core.ai_core.configs import ai_config as cfg_mod
     from gsuid_core.ai_core.interaction_scaffold import (
+        MEMORY_QA_HINT,
         QUOTE_TOME_HINT,
         SPEAKER_RECALL_HINT,
         CheapGate,
@@ -265,8 +266,25 @@ def test_turn_graph_group_gates(monkeypatch):
     assert tg_at.call_to_self
     assert decide_cheap_gate(tg_at, intent="工具") is CheapGate.FULL
     assert SPEAKER_RECALL_HINT in scaffold_hints_from_graph(tg_at, cheap=CheapGate.FULL, intent="工具")
-    # @ bot 闲聊 → light
-    assert decide_cheap_gate(tg_at, intent="闲聊") is CheapGate.LIGHT
+    # @ bot 闲聊但带办事结构 → full
+    assert decide_cheap_gate(tg_at, intent="闲聊") is CheapGate.FULL
+    tg_hi = build_turn_graph(
+        "小明(用户ID:9001)：@早柚 今天好困",
+        persona_name="早柚",
+        is_tome=False,
+        user_type="group",
+        primary_speaker="9001",
+    )
+    assert decide_cheap_gate(tg_hi, intent="闲聊") is CheapGate.FULL
+    tg_panel = build_turn_graph(
+        "小明(用户ID:9001)：@早柚 看看我椿面板",
+        persona_name="早柚",
+        is_tome=True,
+        user_type="group",
+        primary_speaker="9001",
+    )
+    assert decide_cheap_gate(tg_panel, intent="闲聊") is CheapGate.FULL
+    assert MEMORY_QA_HINT not in scaffold_hints_from_graph(tg_panel, cheap=CheapGate.FULL, intent="问答")
 
     # 同人 soft continue → full
     hist = [

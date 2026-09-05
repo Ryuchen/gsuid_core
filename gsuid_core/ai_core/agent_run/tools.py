@@ -52,7 +52,6 @@ from gsuid_core.ai_core.agent_run.remote_web_search import attach_remote_web_sea
 
 _PROGRESS_TOOL = "check_delegation"
 _PINNED_SESSION_TOOLS: tuple[str, ...] = ("find_tools", "create_subagent", "capability_map")
-_LIGHT_REQUEST_FLOOR = 4
 _SCHED_CREATE_NAMES: frozenset[str] = frozenset({"add_once_task", "add_interval_task"})
 _SCHED_MUTATE_NAMES: frozenset[str] = frozenset(
     {
@@ -93,14 +92,11 @@ def group_idle_request_limit(
     followup_detected: bool,
     has_active_task: bool,
     idle_cap: int,
-    is_light: bool = False,
     call_to_self: bool = False,
 ) -> int:
-    """旁观收紧 request_limit。点名履约不收；LIGHT 保底够 find_tools+一次动作。"""
+    """旁观收紧 request_limit。点名履约不收。"""
     if default_limit < 1 or idle_cap < 1:
         return default_limit
-    if is_light:
-        return min(default_limit, max(idle_cap, _LIGHT_REQUEST_FLOOR))
     if call_to_self:
         return default_limit
     if is_group and not followup_detected and not has_active_task:
@@ -130,17 +126,14 @@ def should_skip_tool_search(
     has_active_task: bool,
     has_media: bool,
     call_to_self: bool,
-    is_light: bool,
     intent: str = "",
 ) -> bool:
-    """向量预检索是否跳过。闲聊/旁观/LIGHT 不预检索；跟进/媒体/在途任务仍搜。"""
+    """向量预检索是否跳过。点名必搜；旁观/在途短轮才跳。"""
     if in_flight_short:
         return True
-    if followup_detected or has_active_task or has_media:
+    if followup_detected or has_active_task or has_media or call_to_self:
         return False
-    if is_light:
-        return True
-    if is_group and not call_to_self:
+    if is_group:
         return True
     return intent == "闲聊"
 
@@ -302,7 +295,6 @@ class ToolsPhase(RunOnceHost):
         """工具五层装配 + 去重 + 渐进式暴露。"""
         # 渐进式工具暴露是否在本轮生效（仅自动装配 + 非闲聊轮）。决定是否挂 RetrievableToolset。
         st.expose_dynamic = False
-        st.is_light = st.cheap is interaction_scaffold.CheapGate.LIGHT if st.cheap is not None else False
         # 媒体句柄（event 字段或正文 img_/图片ID 标注）——通道信号，非话题词
         _probe_for_media = ""
         if isinstance(st.user_message, str):
@@ -315,7 +307,6 @@ class ToolsPhase(RunOnceHost):
             image_list=st.ev.image_list if st.ev is not None else None,
             audio_id=st.ev.audio_id if st.ev is not None else None,
         )
-        # light 与 full 群聊均走瘦保底；light 不再清工具，只是少检索 + 短回 hint
         st.group_slim = bool(st.tg is not None and bool(st.tg.is_group) and self.create_by in _INTERACTIVE_CREATE_BY)
 
         # dynamic 能力族门：显式 True/False 优先；None 沿用旧门（agentic 且未传 st.tools）。
@@ -478,7 +469,7 @@ class ToolsPhase(RunOnceHost):
                     except Exception as e:
                         logger.debug(i18n_t("log.agent.load_contextual_pool", e=e))
 
-                # 第三层：向量检索。闲聊/旁观/LIGHT 可跳过；跟进与工具/问答必搜。
+                # 第三层：向量检索。点名必搜；旁观/在途短轮才跳。
                 _recall_limit = int(ai_config.get_config("tool_search_recall").data)
                 max_extra_tools: int = int(ai_config.get_config("tool_extra_pool_max").data)
                 _recall_threshold = float(ai_config.get_config("tool_recall_threshold").data)
@@ -489,7 +480,6 @@ class ToolsPhase(RunOnceHost):
                     has_active_task=st.has_active_task,
                     has_media=st.has_media,
                     call_to_self=_call_self,
-                    is_light=st.is_light,
                     intent=st.intent or "",
                 )
                 if (
@@ -500,8 +490,6 @@ class ToolsPhase(RunOnceHost):
                 ):
                     _recall_limit = max(2, _recall_limit // 2)
                     max_extra_tools = max(3, max_extra_tools // 2)
-                if st.is_light or st.in_flight_short:
-                    max_extra_tools = min(max_extra_tools, 6)
                 if st.in_flight_short:
                     max_extra_tools = min(max_extra_tools, 2)
                 if qy and not _skip_search:
@@ -536,7 +524,7 @@ class ToolsPhase(RunOnceHost):
                                 extra_tools.append(_tb.tool)
 
                 # 对用户发送 extras 不进静态附加池；只许本轮 find_tools 动态暴露
-                if st.group_slim or st.is_light or _interactive:
+                if st.group_slim or _interactive:
                     extra_tools = [t for t in extra_tools if not is_group_send_extra(t.name)]
 
                 if _interactive:

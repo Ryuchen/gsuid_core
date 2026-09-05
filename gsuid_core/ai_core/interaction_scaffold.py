@@ -4,7 +4,7 @@
 - C-2 会话级漂移预算：立规矩次数累积提醒。
 - C-3 寻址前置门：@别人且未点自己 → 零工具 / 可硬静音。
 - TurnGraph：本轮话语结构的一等公民（说话人/呼叫/跟进），门与装配只读它。
-- CheapGate：silence | light | full——群聊少付 full agent 税。
+- CheapGate：silence | full。群聊未点名可静音；点名一律完整装配。
 - 瘦工具：群聊 full 默认瘦保底，按 TurnGraph 证据加厚。
 
 判据均为结构/语言学范畴，不含评测载荷词。
@@ -60,6 +60,24 @@ def extract_message_body(text: str) -> str:
             t = t[: m.start()]
     t = _TIME_LINE_RE.sub("", t)
     return _strip_speaker_prefix(t)
+
+
+# 祈使/查询闭类（非业务域）。「看看我/查查」= 实时查数；帮我/设个/提醒 = 办事。
+_LIVE_LOOKUP_RE = re.compile(r"(看看我|看看这|帮我查|帮查|查一下|查下|查询|查查)")
+_DO_REQUEST_RE = re.compile(r"(帮我|给我|设个|设一下|提醒我)")
+
+
+def looks_like_live_lookup(text: str) -> bool:
+    """是否在查当前数据（面板/战绩等），不是翻已有记忆。"""
+    return bool(_LIVE_LOOKUP_RE.search(extract_message_body(text)))
+
+
+def looks_like_task_request(text: str) -> bool:
+    """点名句是否带办事/查询结构。"""
+    body = extract_message_body(text)
+    if not body:
+        return False
+    return bool(_LIVE_LOOKUP_RE.search(body) or _DO_REQUEST_RE.search(body))
 
 
 def recent_history_texts(history: List[ModelMessage], limit: int = 6) -> List[Tuple[str, str]]:
@@ -527,17 +545,12 @@ def ambient_followup_to_other(
 # ── TurnGraph / CheapGate ───────────────────────────────────────────
 
 SOFT_CONTINUE_MAXLEN = 40
-LIGHT_MODE_HINT = (
-    "\n\n（系统提示：本轮为群聊轻量回——短句角色化即可；查数/记事/看图/出图须调工具，"
-    "列表没有先 find_tools，禁止零调用就说做不到。）"
-)
 
 
 class CheapGate(str, Enum):
-    """进主 loop 前的成本档：silence 不进；light 短回零/极瘦工具；full 完整装配。"""
+    """进主 loop 前的成本档：silence 不进；full 完整装配。"""
 
     SILENCE = "silence"
-    LIGHT = "light"
     FULL = "full"
 
 
@@ -713,15 +726,15 @@ def decide_cheap_gate(
     intent: str = "",
     rel: Optional["RelationshipView"] = None,
 ) -> CheapGate:
-    """基于 TurnGraph（+可选意图 + 关系温度）决定成本档。
+    """基于 TurnGraph（+关系温度）决定成本档。
 
     - 私聊 → full
     - 开口门/寻址门强负（多人互聊、@别人、ambient 催别人）→ silence
     - **群聊 + 未 @ + zone ∈ {hostile, cold} → silence**。引用 bot 的 is_tome
       仍进环，由人格判断是否 <SILENCE>。呼名 / 活跃任务 / 省略跟进抬回。
-    - 被 @ 且分类为闲聊、无任务证据 → light（短回、零工具）
-    - 其余（含未 @ 的群消息）→ full，由模型/C-3 决定是否 <SILENCE>
+    - 其余（含被 @ 闲聊、未 @ 的群消息）→ full，由模型/C-3 决定是否 <SILENCE>
     """
+    # intent 仍由调用方传入；档位不再按闲聊分流
     if not tg.is_group:
         return CheapGate.FULL
     if tg.open_gate is GroupOpenGate.SILENCE:
@@ -757,14 +770,6 @@ def decide_cheap_gate(
         and not has_active_task
     ):
         return CheapGate.SILENCE
-    if (
-        tg.call_to_self
-        and intent == "闲聊"
-        and not tg.needs_task_tools
-        and not has_active_task
-        and not tg.ellipsis_followup
-    ):
-        return CheapGate.LIGHT
     return CheapGate.FULL
 
 
@@ -780,8 +785,6 @@ def scaffold_hints_from_graph(
     if tg.address_gated:
         hints.append(ADDRESS_GATE_HINT)
         return hints
-    if cheap is CheapGate.LIGHT:
-        hints.append(LIGHT_MODE_HINT)
     if tg.quoted_tome:
         hints.append(QUOTE_TOME_HINT)
     if tg.ellipsis_followup:
@@ -794,8 +797,10 @@ def scaffold_hints_from_graph(
     if tg.style_push_count >= 2:
         hints.append(DRIFT_REMINDER)
     if cheap is CheapGate.FULL and (not tg.is_group or tg.call_to_self) and speaker_recall:
-        # 私聊一律记忆接地（分类器常把「给建议」标成工具）。群聊工具仍填槽。
-        if intent == "工具" and tg.is_group:
+        # 实时查数不要催 search_cognition，否则会占满思考轮。
+        if looks_like_live_lookup(tg.message_text):
+            pass
+        elif intent == "工具" and tg.is_group:
             hints.append(SPEAKER_RECALL_HINT)
         else:
             hints.append(MEMORY_QA_HINT)

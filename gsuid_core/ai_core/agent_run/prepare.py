@@ -362,14 +362,12 @@ class PreparePhase(RunOnceHost):
 
                 _idle_raw = ai_config.get_config("group_idle_max_iterations").data
                 _idle_cap = int(_idle_raw) if isinstance(_idle_raw, int) else 2
-                _is_light = st.cheap is interaction_scaffold.CheapGate.LIGHT
                 _capped = group_idle_request_limit(
                     int(st.limits.request_limit or 0),
                     is_group=bool(st.tg.is_group),
                     followup_detected=st.followup_detected,
                     has_active_task=st.has_active_task,
                     idle_cap=_idle_cap,
-                    is_light=_is_light,
                     call_to_self=bool(st.tg.call_to_self),
                 )
                 if _capped != st.limits.request_limit:

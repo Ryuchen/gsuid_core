@@ -46,7 +46,7 @@ def _format_memory_catalog(mem: "MemoryContext", _query: str = "") -> str:
 
     lines = ["[记忆目录]"]
     shown = 0
-    cap = 12
+    cap = 6
 
     def _add(text: str) -> bool:
         nonlocal shown
@@ -54,7 +54,7 @@ def _format_memory_catalog(mem: "MemoryContext", _query: str = "") -> str:
         if not body:
             return True
         shown += 1
-        lines.append(f"{shown}. {body[:96]}")
+        lines.append(f"{shown}. {body[:64]}")
         return shown < cap
 
     matched_prefs: List[str] = []
@@ -115,13 +115,15 @@ def format_retrieved_memory(ctx: AgentHookContext, mem: "MemoryContext") -> str:
 
 
 def should_prefetch_memory(ctx: AgentHookContext) -> bool:
-    """闲聊/旁观不预灌。点名或任务跟进才允许目录卡。"""
+    """闲聊/旁观/实时查数不预灌。点名办事才给目录卡。"""
+    from gsuid_core.ai_core.interaction_scaffold import looks_like_live_lookup
+
+    if looks_like_live_lookup(ctx.query):
+        return False
     tg = ctx.turn_graph
     if tg is None or not tg.is_group:
         return True
     if not tg.call_to_self and not tg.needs_task_tools:
-        return False
-    if ctx.cheap_gate == "light":
         return False
     if (ctx.intent or "") == "闲聊" and not tg.needs_task_tools:
         return False

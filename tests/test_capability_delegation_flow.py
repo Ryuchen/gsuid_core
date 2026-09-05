@@ -176,7 +176,7 @@ def test_find_tools_match_is_unidirectional() -> None:
     assert _need_matches_tool_text("网页搜索", "tool 网页搜索 docs", [])
     assert _need_matches_tool_text("帮我网页搜索一下", "other", ["网页搜索"])
     assert not _need_matches_tool_text("帮我分析很长的需求描述xyz", "分析", [])
-    assert _need_matches_tool_text("北京这周的天气", "weather_handler", ["天气", "气象"])
+    assert _need_matches_tool_text("帮我查北京天气", "other", ["北京天气"])
     hay = "查询用户本人在鸣潮「全息矩阵」（矩阵叠兵 / 终焉矩阵）的挑战记录"
     assert _need_matches_tool_text("查询鸣潮矩阵叠兵个人战绩记录和分数", hay, [])
 

@@ -1,6 +1,6 @@
 """``gscore.planning_context``：长任务文案 + ``has_actionable`` 抬档。
 
-``has_actionable`` 会把 CheapGate 从 light / 低好感静音抬回 full（避免丢掉在途 Kanban），
+``has_actionable`` 会把 CheapGate 从低好感静音抬回 full（避免丢掉在途 Kanban），
 所以它是**套件写、内核读**的控制位。H03 只写旗（CheapGate 在 H05 前）；H06 再灌长任务文案。
 
 长任务编排的 bring-up 归 ``startup._INIT_STEPS``，本套件不带 ``init_step``（否则同一个

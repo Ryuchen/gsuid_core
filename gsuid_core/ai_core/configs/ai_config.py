@@ -243,7 +243,7 @@ AI_CONFIG: Dict[str, GSC] = {
     ),
     "group_idle_max_iterations": GsIntConfig(
         "群聊空闲轮最大思考轮数",
-        "LIGHT 或群聊无跟进且无在途任务时的 request_limit 上限, 防止零工具空转。修改后即时生效",
+        "群聊无跟进且无在途任务时的 request_limit 上限, 防止零工具空转。修改后即时生效",
         2,
         options=[2, 3, 4, 6, 9],
     ),
