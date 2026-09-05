@@ -97,6 +97,14 @@ def test_ellipsis_inherits_other_speaker_gates_slot() -> None:
     assert tg.address_gated is True
 
 
+def test_light_hint_requires_find_tools_before_giving_up() -> None:
+    from gsuid_core.ai_core.interaction_scaffold import LIGHT_MODE_HINT
+
+    assert "find_tools" in LIGHT_MODE_HINT
+    assert "做不到" in LIGHT_MODE_HINT
+    assert "直接调已有工具" not in LIGHT_MODE_HINT
+
+
 def test_multi_speaker_message():
     from gsuid_core.ai_core.interaction_scaffold import is_multi_speaker_message
 

@@ -528,7 +528,8 @@ def ambient_followup_to_other(
 
 SOFT_CONTINUE_MAXLEN = 40
 LIGHT_MODE_HINT = (
-    "\n\n（系统提示：本轮为群聊轻量回——短句角色化即可；若需查数/记事/看图/出图，直接调已有工具，禁止口头假装办完。）"
+    "\n\n（系统提示：本轮为群聊轻量回——短句角色化即可；查数/记事/看图/出图须调工具，"
+    "列表没有先 find_tools，禁止零调用就说做不到。）"
 )
 
 

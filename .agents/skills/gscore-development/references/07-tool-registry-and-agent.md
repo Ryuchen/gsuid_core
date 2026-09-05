@@ -174,12 +174,12 @@ def get_registered_tools() -> Dict[str, Dict[str, ToolBase]]: ...  # 按分类
    每轮新建，作用域天然是"单次 run"，轮末自然丢弃）。
 2. **`find_tools` meta-tool**（`buildin_tools/dynamic_tool_discovery.py`，`category="meta"`）——
    模型发现缺工具时调用。**不声明 `capability_domain`**。
-   **三段顺序（2026-08-26）**：
-   0. 已加载工具 **covers / retrieval_text 单向命中**（need∈retrieval 或 cover∈need）才回「已加载」；
-      **禁止**同域立刻 return 直接调用（`n in hay or hay in n` 已删）；
-   1. `match_capability_node` / `semantic_match_nodes` 命中 → 只回委派指令，不装 exclusive schema；
-   2. 向量召族；covers/retrieval 对不上当 miss；
-   3. 仅 blocked hits：所有者须也能被步骤 1 认上，否则中性缺口。回执不推销网页检索。
+   **分档一次返回（专用能力 > 专用工具 > 通用能力 > 通用工具）**：
+   0. 已加载的 **专用** 工具 covers / retrieval 单向命中才回「已加载」；通用核工具命中不短路。
+      **禁止**同域立刻 return（`n in hay or hay in n` 已删）；中文另用 ≥4 字窗口。
+   1. 向量召族 + 节点匹配，代码分层后一组回执。exclusive 工具折叠成所属专用能力，不回灌主人格。
+   2. 通用节点（research / memory_curator / internal_reporter / scheduler）不得压过插件专用工具。
+   3. 有专用项时丢掉通用档。系统提示只陈述分档，不写「优先 subagent」。
 3. **`RetrievableToolset(AbstractToolset)`**（`dynamic_toolset.py`）——`get_tools(ctx)` 每个 step
    读 `dynamic_tool_names`，逐名 `find_tool_base` + `prepare_tool_def` 解析成可调用工具；用
    `exclude_names`（本轮静态已装配工具名）去重避免跨 toolset 重名冲突。

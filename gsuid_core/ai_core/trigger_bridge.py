@@ -510,6 +510,9 @@ def _register_trigger_as_ai_tool(
     # 注册到 PydanticAI Tool
     tool_obj = Tool(_ai_tool_wrapper, takes_ctx=True)
     plugin_name = _get_plugin_name_from_module(func.__module__)
+    from gsuid_core.ai_core.buildin_tools.find_tools_rank import covers_from_trigger_keywords
+
+    merged_covers = covers_from_trigger_keywords(keyword, covers)
 
     tool_base = ToolBase(
         name=tool_func_name,
@@ -517,7 +520,7 @@ def _register_trigger_as_ai_tool(
         plugin=plugin_name,
         tool=tool_obj,
         category="by_trigger",
-        covers=covers,
+        covers=merged_covers,
         aliases=aliases,
     )
 
@@ -545,6 +548,6 @@ def _register_trigger_as_ai_tool(
         "trigger_type": trigger_type,
         "plugin_name": plugin_name,
         "primary_keyword": primary_keyword,
-        "covers": list(covers or []),
+        "covers": list(merged_covers),
         "aliases": list(aliases or []),
     }

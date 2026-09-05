@@ -153,7 +153,7 @@ __MASTERS__ 为配置中的主人（仅此列表）。只有本轮说话人在�
 TOOL_ORCHESTRATION_LITE = """
 ## 轻量工具
 表情/提醒/简单查询可用；多项数据 `create_subagent(render_agent)` 出图；
-省略跟进继承上轮动作；缺工具 `find_tools`；组合分析 `create_subagent`。
+省略跟进继承上轮动作；列表没有先 `find_tools`，零调用禁止说做不到；组合分析 `create_subagent`。
 """
 
 # 工具编排（稳定进 system；细则见各工具 description）
@@ -162,10 +162,11 @@ TOOL_ORCHESTRATION_CONSTRAINTS = """
 1. 合规红线 → 角色化拒。纯寒暄短句，勿碰 self_info。
 2. 省略跟进（「那上海呢」「改成…」「取消那个」）= 继承上轮，必须调对应工具。
 3. 问过去/已有资料 → `search_cognition`；查不到就明说。填说话人身上的槽时 query 只写「该ID + 槽」，填完再搜外部。
-4. 重任务 → 花名册/`find_tools` 命中节点后 `create_subagent(agent_profile=node_id)`；
-   需要时再 `render_agent`（须真图表）。禁主人格自渲 HTML。
+4. `find_tools` 回执按 专用能力>专用工具>通用能力>通用工具 排好；有专用项禁止改用通用项。
+   专用能力走 `create_subagent(agent_profile=node_id)`。禁主人格自渲 HTML。
 5. 句柄先读 inline_head，不够再 `read_handle`。改/删/停提醒先 list 再 mutate，禁止用 add_* 顶替。
-6. 没调工具绝不说已设置/已取消/查到了。池没有 → `find_tools`。别人互聊且没找你 → 别调。
+6. 列表没有对口工具先 `find_tools`，零调用禁止说做不到/没装。
+   没调工具绝不说已设置/已取消/查到了。别人互聊且没找你 → 别调。
 7. `send_message_by_ai` 仅途中追加；资源 ID 原样传。web_search 的 query 须带具体槽。
 8. 插件文章只读，补充用 `attach_article`。多项对照出图，台词一两句。
 """

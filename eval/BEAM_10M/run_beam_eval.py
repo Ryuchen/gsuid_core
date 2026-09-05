@@ -399,19 +399,40 @@ async def cmd_ingest_plan(
             item["timestamp"] = iso
         payload_turns.append(item)
 
+    # 整包 POST 会撞 300s 默认超时；200 条一块，末块才 flush/rebuild。
+    chunk_size = 200
+    last_resp: Dict[str, Any] = {"status": 1, "msg": "no chunks", "data": None}
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-        resp = await call_batch_observe(
-            client=client,
-            base_url=base_url,
-            user_id=user_id,
-            turns=payload_turns,
-            scope_type="user_global",
-            flush=flush,
-            trigger_rebuild=trigger_rebuild,
-        )
+        n = len(payload_turns)
+        for start in range(0, n, chunk_size):
+            chunk = payload_turns[start : start + chunk_size]
+            last = start + chunk_size >= n
+            print(
+                f"[Ingest] plan_id={plan_id} chunk {start // chunk_size + 1}"
+                f"/{(n + chunk_size - 1) // chunk_size} turns={len(chunk)} last={last}",
+                flush=True,
+            )
+            last_resp = await call_batch_observe(
+                client=client,
+                base_url=base_url,
+                user_id=user_id,
+                turns=chunk,
+                scope_type="user_global",
+                flush=flush if last else False,
+                trigger_rebuild=trigger_rebuild and last,
+                timeout=timeout,
+            )
+            print(
+                f"[Ingest] chunk -> {last_resp.get('status')}: {last_resp.get('msg')} data={last_resp.get('data')}",
+                flush=True,
+            )
+            if last_resp.get("status") != 0:
+                break
 
-    print(f"[Ingest] plan_id={plan_id} -> {resp.get('status')}: {resp.get('msg')} data={resp.get('data')}")
-    return {"plan_id": plan_id, "turns": len(turns), "response": resp}
+    print(
+        f"[Ingest] plan_id={plan_id} -> {last_resp.get('status')}: {last_resp.get('msg')} data={last_resp.get('data')}"
+    )
+    return {"plan_id": plan_id, "turns": len(turns), "response": last_resp}
 
 
 async def cmd_ingest_batch(
@@ -423,18 +444,23 @@ async def cmd_ingest_batch(
     trigger_rebuild: bool = False,
     timeout: float = 300.0,
 ) -> List[Dict[str, Any]]:
-    """按 plan 顺序累计摄入多个 plan，每个 plan 一次 batch_observe。"""
+    """按 plan 顺序累计摄入；每 plan 末块 flush，只在最后一个 plan 重建分层图。"""
     results: List[Dict[str, Any]] = []
-    for plan in plans:
+    n = len(plans)
+    for i, plan in enumerate(plans):
+        last = i + 1 == n
         r = await cmd_ingest_plan(
             base_url=base_url,
             user_id=user_id,
             plan=plan,
             flush=flush,
-            trigger_rebuild=trigger_rebuild,
+            trigger_rebuild=trigger_rebuild and last,
             timeout=timeout,
         )
         results.append(r)
+        resp = r["response"] if isinstance(r, dict) and "response" in r else {}
+        if not isinstance(resp, dict) or resp.get("status") != 0:
+            break
     return results
 
 
@@ -448,6 +474,9 @@ async def cmd_probe(
     enable_observer: bool = False,
     enable_system2: bool = True,
     resume: bool = True,
+    persona_name: Optional[str] = "评测助手",
+    enable_tools: Optional[bool] = True,
+    memory_eval: Optional[bool] = False,
 ) -> str:
     """遍历 20 道探针题，逐条调 ``chat_with_history`` 收集回答。
 
@@ -467,7 +496,11 @@ async def cmd_probe(
         except Exception as e:
             print(f"[Probe] 读取已有答卷失败: {e}")
 
-    print(f"[Probe] user_id={user_id}，共 {len(probes)} 题，已存在 {len(existing_ids)} 条")
+    print(
+        f"[Probe] user_id={user_id} persona={persona_name} "
+        f"enable_tools={enable_tools} memory_eval={memory_eval} "
+        f"共 {len(probes)} 题，已存在 {len(existing_ids)} 条"
+    )
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
         # 探活用 openapi.json：能同时验证「服务在线」与「local-test gate 已开」——
@@ -502,16 +535,21 @@ async def cmd_probe(
 
             print(f"\n[Probe] ({category} #{idx_in_cat}) {question[:80]}")
 
+            clock_at = parse_time_anchor(str(time_anchor)) if time_anchor else None
             resp = await call_chat_with_history(
                 client=client,
                 base_url=base_url,
                 user_id=user_id,
                 message=question,
                 history=[],
+                persona_name=persona_name,
                 enable_observer=enable_observer,
                 # 评测已在摄入收尾触发分层图重建，探针显式开 System-2 以利用它：
                 # 事件排序/摘要/跨会话等聚合题靠类目自顶向下遍历召回，纯 System-1 向量召回不足。
                 enable_system2=enable_system2,
+                enable_tools=enable_tools,
+                memory_eval=memory_eval,
+                clock_at=clock_at,
             )
 
             status_code = resp.get("status_code", -1)

@@ -88,12 +88,12 @@ def _lm_load(args: argparse.Namespace) -> List[Dict[str, Any]]:
     from eval.longmemeval.run_longmem_eval import resolve_eval_data_path
 
     data = load_eval_data(args.eval_data or resolve_eval_data_path())
-    s, e = args.start or 0, args.end or len(data)
-    items = data[s:e]
     qtype = args.question_type
     if qtype:
-        items = [q for q in items if q.get("question_type") == qtype]
-    return items
+        data = [q for q in data if isinstance(q, dict) and q.get("question_type") == qtype]
+    s = args.start if args.start is not None else 0
+    e = args.end if args.end is not None else len(data)
+    return data[s:e]
 
 
 async def _lm_probe(args: argparse.Namespace) -> None:
