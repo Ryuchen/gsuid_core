@@ -395,15 +395,16 @@ BEAM-10M / LongMemEval 这类"单题灌数百~上千 turn"的大语料，会撞�
 ### 🔴 策略分档：不是一律「命中即封禁」
 
 - **尖括号**：同 turn 最多 3 次 REWRITE → FUSE（静默 + scrub）；无「第二次放行」。
-- **OOC 工具路径**：「提醒一次 → 重说 → 放行」（never-release 除外）；误杀代价≈多一次生成。
-- **OOC 主路径**：defer → run 末轻量重写；`machine_dump` → FALLBACK 短句；
-  **`delivery_narration` → FUSE 静默**（2026-08-10，交付已完成，重说无意义）。
-- 勿改成「命中即永久硬替换且无重说」，会复现「早餐吃了个豆包」类事故。
+- **软出戏（主/工具同一套）**：命中 → 系统提醒（可能出戏，请自判）→ 模型下一句正文作准。
+  不强制剥模型名，不「同一句再发一次就放行」。无下一轮时 run 末自判发送。
+- **OOC 硬档**：`machine_dump` → FALLBACK 短句；**`delivery_narration` → FUSE**；
+  资金 / 机器腔 never-release 持续打回。
+- 勿改成「命中即永久硬替换且无提醒」，会复现「早餐吃了个豆包」类事故。
 
 | 路径 | 检测点 | 命中行为 |
 |------|--------|----------|
-| 主输出（`gs_agent` TextPart） | `pre_send_gate(channel="main")` | 尖括号 REWRITE/FUSE；OOC defer → `_ooc_rewrite_and_send`；machine_dump → FALLBACK；delivery_narration → FUSE |
-| 工具发送（`send_message_by_ai`） | `tool_gate_feedback`（历史别名 `gate_warn_once`） | OOC 首次警告、再命中非 never-release 放行（`GateBag.ooc_warned_turn_ids`）；尖括号与 never-release 持续打回 |
+| 主输出（`gs_agent` TextPart） | `pre_send_gate(channel="main")` | 尖括号 REWRITE/FUSE；软 OOC 注入系统提醒，提醒后放行下一句；无下一轮 → 自判发送；machine_dump → FALLBACK；delivery_narration → FUSE |
+| 工具发送（`send_message_by_ai`） | `tool_gate_feedback`（历史别名 `gate_warn_once`） | 软 OOC 系统提醒、不二次放行（改用正文）；尖括号与 never-release 持续打回 |
 | 无重说通道（proactive 等默认 `send_chat_result`） | 末端 `check_ooc` + 尖括号 sanitize | 替换 `PERSONA_FALLBACK_TEXT` / 删非法标签 |
 
 - **DELIVERED 终局态（2026-08-10）在 gate 之前**：`send_message_by_ai` 带台词成功交付 →

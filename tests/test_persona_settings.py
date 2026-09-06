@@ -150,6 +150,9 @@ def test_sanitized_error_texts_survive_persona_cleanup() -> None:
         assert "status_code" not in cleaned
     note = _strip_persona_markdown("BTC 跌破 60000，快跑\n⏰ 定时任务 sched_ab12")
     assert "sched_ab12" in note
+    aside = _strip_persona_markdown("（今天好困，不太想理他）\n那就先这样。")
+    assert "今天好困" in aside
+    assert "那就先这样" in aside
 
 
 def test_render_system_constraints_fills_title(monkeypatch) -> None:

@@ -625,7 +625,7 @@ sequenceDiagram
                 else REWRITE 且 angle_bracket
                     Note over GsAgent: 不发送；下一轮 ModelRequest 注入 feedback<br/>同 turn 累计 3 次 → FUSE
                 else REWRITE 且 ooc.defer
-                    Note over GsAgent: 记入 _ooc_blocked；run 末轻量重说
+                    Note over GsAgent: 记入 _ooc_blocked + 注入系统提醒；无下一轮则自判发送
                 else FALLBACK
                     GsAgent->>SendPath: send_chat_result(兜底句)
                 else ALLOW
@@ -1619,7 +1619,7 @@ agent.iter(message_history=self.history + 本轮 user)   # loop.py
 | 策略顺序 | 模块 | 命中决策 | 同 turn 行为 |
 |----------|------|----------|--------------|
 | 1 `angle_bracket` | `angle_bracket_guard` | 非法 `<>`（如 `<bubble/>` / **`<br>`**）→ **REWRITE**；同 ModelResponse 多段只计 1 次 attempt；累计 3 次 → **FUSE** | 主路径：下一轮 ModelRequest 注入 feedback（`merge_rewrite_feedbacks`）；工具：return 警告；熔断后本轮静默并 scrub 历史 |
-| 2 `ooc` | `output_firewall.check_ooc` | **machine_dump** 主路径 → **FALLBACK**「额…出错了，稍后再试」；**delivery_narration** 主路径 → **FUSE**（交付已完成，重说无意义，直接静默）；其它主路径 → **REWRITE+defer**（记入 `_ooc_blocked`，run 末轻量重说）；工具路径：提醒一次再命中非 never-release 可放行；资金/机器腔 never-release 持续打回 | 状态仅 `extra["output_gate"]` → **`GateBag`**（`angle_bracket` / `ooc` 的 `PolicyState` + `ooc_warned_turn_ids`） |
+| 2 `ooc` | `output_firewall.check_ooc` | **machine_dump** 主路径 → **FALLBACK**；**delivery_narration** 主路径 → **FUSE**；软出戏主/工具同一套：注入系统提醒让模型自判，提醒后只放行主路径下一句正文（不强制剥模型名、不二次发送放行）；无下一轮 → run 末自判发送；资金/机器腔 never-release 持续打回 | 状态仅 `extra["output_gate"]` → **`GateBag`**（`angle_bracket` / `ooc` 的 `PolicyState` + `ooc_warned_turn_ids` = 提醒已送达） |
 
 **决策枚举** `GateDecision`：`ALLOW` | `REWRITE` | `FALLBACK` | `FUSE`。
 
@@ -1668,7 +1668,7 @@ API 错误字面量 → 角色短句替换
 制品两通道兜底：内容形态结构化块 + 遗留 <report> body → 资料图
 （主契约：render_agent → render_html_to_image 登记 artifact，非 <report> 标签协议）
 非法 <> sanitize 兜底（漏网；``<br>``→换行；``<report>`` 标签删除）
-解析 <meme:情绪>；剥 markdown / *动作*
+解析 <meme:情绪>；剥 markdown / *动作*（保留整行/整段（…）心声，跟人设）
 若 ooc_check：台词 + report 体再 check_ooc → 替换/丢弃（无重说）
 长 markdown 整篇出图：配置 render_long_markdown_as_image（**默认 False**，2026-08-08）
   · 开启时仍只作呈现层兜底，避免主人格浅分析被渲成丑图

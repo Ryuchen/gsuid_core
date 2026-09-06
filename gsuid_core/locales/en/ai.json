@@ -414,7 +414,7 @@
   "log.ai.output_gate_angle_rewrite_still_dirty": "[output_gate/angle_bracket] rewrite still dirty attempt {attempt}/{max_retries} preview={preview}",
   "log.ai.output_gate_drop_text_after_fuse": "[output_gate] drop text after fuse policy={policy} preview={preview}",
   "log.ai.output_gate_injected_rewrite_feedback": "[output_gate] injected rewrite feedback into ModelRequestNode",
-  "log.ai.output_gate_ooc_allow_after_warn": "[output_gate/ooc] ALLOW after one warn category={category}",
+  "log.ai.output_gate_ooc_allow_after_warn": "[output_gate/ooc] ALLOW after reminder (judged) category={category}",
   "log.ai.output_gate_ooc_defer": "[output_gate/ooc] DEFER category={category} matched={matched}",
   "log.ai.output_gate_ooc_fallback_machine_dump": "[output_gate/ooc] FALLBACK machine_dump channel=main preview={preview}",
   "log.ai.output_gate_ooc_rewrite_first_warn": "[output_gate/ooc] REWRITE first warn category={category} matched={matched}",

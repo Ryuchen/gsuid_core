@@ -29,6 +29,9 @@ class CogKind(str, Enum):
     OUTBOUND = "outbound"
 
 
+# 工具回执里单条片段正文上限。专名要留下，邻条闲聊不要整段摊开。
+EPISODE_BODY_BUDGET = 240
+
 # 面向模型的中文标签（进 prompt 的那一份）
 KIND_LABEL: Dict[CogKind, str] = {
     CogKind.EPISODE: "片段",
@@ -111,8 +114,8 @@ class CognitiveHit:
 
     def render_line(self, index: int) -> str:
         """单行渲染。空结果只回一行，绝不再拼双段「未找到 + 无匹配 + 长说明」。"""
-        # 片段常无 title：旧逻辑只露 40 字，专名被截掉。
-        body_budget = 800 if self.kind is CogKind.EPISODE else 160
+        # 片段无 title：40 字会切掉专名，800 字会把邻条闲聊整段摊开。
+        body_budget = EPISODE_BODY_BUDGET if self.kind is CogKind.EPISODE else 160
         head_src = (self.title or self.summary).replace("\n", " ").strip()
         parts = [f"{index}. [{self.label}] {head_src[:body_budget]}"]
         extra = self.summary.replace("\n", " ").strip() if self.summary and self.title else ""

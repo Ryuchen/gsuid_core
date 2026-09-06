@@ -171,6 +171,50 @@ def test_weak_hits_are_folded_not_expanded() -> None:
     assert "另有 1 条弱相关" in block
 
 
+def test_episode_render_keeps_name_but_caps_body() -> None:
+    from gsuid_core.ai_core.cognition.types import EPISODE_BODY_BUDGET
+
+    long = "张三李四王五_" + ("闲聊流水" * 80) + "_TAIL_SHOULD_DROP"
+    hit = CognitiveHit(
+        kind=CogKind.EPISODE,
+        id="e1",
+        title="",
+        summary=long,
+        score=0.8,
+        high_confidence=True,
+    )
+    line = hit.render_line(1)
+    assert "张三李四王五" in line
+    assert "TAIL_SHOULD_DROP" not in line
+    assert EPISODE_BODY_BUDGET == 240
+    assert len(line) < 40 + EPISODE_BODY_BUDGET
+
+
+def test_episode_expand_cap_folds_overflow() -> None:
+    hits = [
+        CognitiveHit(
+            kind=CogKind.EPISODE,
+            id=f"e{i}",
+            title="",
+            summary=f"专名{i} 的会话",
+            score=0.8,
+            high_confidence=True,
+        )
+        for i in range(8)
+    ]
+    block = render_cognition_block("q", hits)
+    assert "专名0" in block and "专名5" in block
+    assert "专名6" not in block and "专名7" not in block
+    assert "另有 2 条弱相关" in block
+
+
+def test_episode_neighbor_score_falls_below_pref_floor() -> None:
+    from gsuid_core.ai_core.cognition.facade import _EPISODE_SEED_SCORE, _EPISODE_NEIGHBOR_SCORE
+
+    assert _EPISODE_NEIGHBOR_SCORE < 1.0 * 0.55
+    assert _EPISODE_SEED_SCORE >= 1.0 * 0.55
+
+
 def test_kinds_from_names_ignores_unknown() -> None:
     assert kinds_from_names({"knowledge", "fact"}) == frozenset({CogKind.KNOWLEDGE, CogKind.FACT})
     assert kinds_from_names({"nonsense"}) == frozenset()

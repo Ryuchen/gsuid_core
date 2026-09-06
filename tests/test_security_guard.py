@@ -54,21 +54,22 @@ def test_firewall_scrub_fallback():
     print("[OK] scrub_or_fallback 命中替换 / 未命中透传")
 
 
-def test_ooc_gate_warn_once_then_release():
+def test_ooc_gate_tool_keeps_warning_not_second_release():
     from gsuid_core.ai_core.output_gate import tool_gate_feedback
 
     extra = {"turn_id": "t1"}
-    # 同轮首次命中 → 返回重写警告；第二次仍命中 → None 放行
+    # 工具路径命中 = 系统提醒；同一句再发仍打回，不二次放行
+    first = tool_gate_feedback("我是 MiMo 模型", extra)
+    assert first is not None
+    assert "可能出戏" in first or "系统校验" in first
     assert tool_gate_feedback("我是 MiMo 模型", extra) is not None
-    assert tool_gate_feedback("我是 MiMo 模型", extra) is None
     extra2 = {"turn_id": "t2"}
     assert tool_gate_feedback("正常的一句话", extra2) is None
     assert tool_gate_feedback("我是 MiMo 模型", extra2) is not None
-    # 无 turn_id：每次都警告
     extra3: dict = {}
     assert tool_gate_feedback("我是 MiMo 模型", extra3) is not None
     assert tool_gate_feedback("我是 MiMo 模型", extra3) is not None
-    print("[OK] tool_gate_feedback 同轮警告一次后放行；无 turn_id 每次警告")
+    print("[OK] tool_gate_feedback 软出戏持续提醒，不二次放行")
 
 
 # ============================================================
@@ -184,7 +185,7 @@ if __name__ == "__main__":
     test_firewall_catches_ai_selfref_and_system_terms()
     test_firewall_passes_normal_and_plain_tier()
     test_firewall_scrub_fallback()
-    test_ooc_gate_warn_once_then_release()
+    test_ooc_gate_tool_keeps_warning_not_second_release()
     test_wrap_untrusted()
     test_lewd_phishing_lexicon_removed()
     test_prompt_contains_lewd_phishing_discipline()

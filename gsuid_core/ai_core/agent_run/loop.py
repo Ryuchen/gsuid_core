@@ -190,24 +190,6 @@ def task_ack_phrase(persona_name: str | None) -> str:
     return from_card if from_card else "收到。"
 
 
-_STAGE_REPLY_INNER: frozenset[str] = frozenset(
-    {"ok", "okay", "yes", "no", "好", "嗯", "哦", "喔", "哈", "行", "是", "对"}
-)
-
-
-def is_stage_direction(text: str) -> bool:
-    """成对括号包裹、无句子标点 → 舞台指示，不出站。短确认不算。"""
-    body = text.strip()
-    if len(body) < 2 or (body[0], body[-1]) not in (("（", "）"), ("(", ")")):
-        return False
-    inner = body[1:-1].strip()
-    if not inner or "<" in inner:
-        return False
-    if any(ch in inner for ch in "。！？!?；;"):
-        return False
-    return inner.casefold() not in _STAGE_REPLY_INNER
-
-
 class LoopPhase(RunOnceHost):
     async def _emit_stream_events(
         self,
@@ -471,12 +453,15 @@ class LoopPhase(RunOnceHost):
 
         # 输出闸门：上一轮 REWRITE feedback（多段已合并）注入下一轮请求
         if st.ab_pending_nudges:
+            _had_ooc = any(output_gate.is_ooc_judge_feedback(n) for n in st.ab_pending_nudges)
             _nudge_body = output_gate.merge_rewrite_feedbacks(st.ab_pending_nudges)
             node.request.parts = [
                 *node.request.parts,
                 UserPromptPart(content=_nudge_body),
             ]
             logger.warning(i18n_t("log.ai.output_gate_injected_rewrite_feedback"))
+            if _had_ooc:
+                output_gate.mark_ooc_reminded(_require_context(st).extra)
             st.ab_pending_nudges = []
         # 熔断提示只注入一次（与 thrash fuse 同形）
         if (output_gate.is_fused(_require_context(st).extra) or st.ab_abort) and not output_gate.fuse_already_injected(
@@ -923,6 +908,9 @@ class LoopPhase(RunOnceHost):
                 logger.debug(i18n_t("log.agent.llm_text", _text=_text))
                 self._session_logger.log_text_output(_text)
                 if is_silence_marker(_text):
+                    # 看过出戏提醒后选静默 = 自主判断不发，收尾旁路不得再送原文
+                    if output_gate.ooc_reminder_delivered(_require_context(st).extra):
+                        st.ooc_blocked.clear()
                     logger.info(i18n_t("log.agent.silent_skipping_text", _text=_text))
                     self._discard_stream_preview(st, _text)
                     continue
@@ -932,10 +920,6 @@ class LoopPhase(RunOnceHost):
                     if not _text:
                         self._discard_stream_preview(st)
                         continue
-                if is_stage_direction(_text):
-                    _resp_unsent.append(_text)
-                    self._discard_stream_preview(st, _text)
-                    continue
                 if _text in self._run_sent_texts:
                     logger.debug(i18n_t("log.agent.skipping_duplicate", p0=repr(_text[:40])))
                     self._discard_stream_preview(st, _text)
@@ -1035,7 +1019,7 @@ class LoopPhase(RunOnceHost):
                         self._discard_stream_preview(st, _text)
                         continue
                     if _gr.decision is output_gate.GateDecision.REWRITE:
-                        if _gr.defer_ooc and _gr.ooc_hit is not None:
+                        if _gr.policy == "ooc" and _gr.ooc_hit is not None:
                             logger.warning(
                                 i18n_t(
                                     "log.agent.firewall_main_output_hit_ooc",
@@ -1043,7 +1027,10 @@ class LoopPhase(RunOnceHost):
                                     p1=_gr.ooc_hit.matched,
                                 )
                             )
-                            st.ooc_blocked.append((_text, _gr.ooc_hit))
+                            if _gr.defer_ooc:
+                                st.ooc_blocked.append((_text, _gr.ooc_hit))
+                            if _gr.feedback:
+                                st.ab_pending_nudges.append(_gr.feedback)
                         else:
                             if _gr.policy == "angle_bracket":
                                 _ab_attempt_counted_this_response = True
@@ -1100,6 +1087,8 @@ class LoopPhase(RunOnceHost):
                     _at_uid = _extra["at_user_id"] if "at_user_id" in _extra else None
                     _at = str(_at_uid) if isinstance(_at_uid, str) and _at_uid else None
                     if await self._try_send_gated_in_iter(st, _text, at_user_id=_at):
+                        # 已有可见输出：收尾旁路不再把第一句出戏原文再发一遍
+                        st.ooc_blocked.clear()
                         if _slot == "send_accept":
                             _accept_slot_used = True
                         st.wait_comfort_sent = True

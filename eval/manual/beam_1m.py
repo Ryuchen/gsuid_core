@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import sys
 import json
@@ -40,9 +41,9 @@ from eval.BEAM_10M.run_beam_eval import (  # noqa: E402
     cmd_clear,
     cmd_judge,
     cmd_probe,
-    _resolve_plans,
-    cmd_ingest_batch,
-    load_beam_dataset,
+    load_beam_row,
+    load_beam_plan,
+    cmd_ingest_plan,
     iter_probing_questions,
 )
 
@@ -130,10 +131,7 @@ async def cmd_ping(base_url: str) -> int:
 
 def _load_row(conv: int, *, full: bool) -> dict[str, Any]:
     cols = None if full else ["probing_questions"]
-    rows = load_beam_dataset(columns=cols)
-    if conv < 0 or conv >= len(rows):
-        raise SystemExit(f"conv={conv} 越界，共 {len(rows)} 条")
-    return rows[conv]
+    return load_beam_row(conv, columns=cols)
 
 
 async def _wait_core(host: str, port: int, timeout: float = 300.0) -> bool:
@@ -250,21 +248,26 @@ async def cmd_ingest(
     if conv in prog.get("ingest", []) and not force:
         print(f"[ingest] conv={conv} 已标记完成，跳过（--force 可重灌）")
         return 0
-    row = _load_row(conv, full=True)
-    plans = _resolve_plans(row, plan_ids)
-    if not plans:
-        print(f"[ingest] conv={conv} 找不到 plan {plan_ids}")
-        return 2
     if clear:
         await cmd_clear(base_url, user_id, timeout=timeout)
-    results = await cmd_ingest_batch(
-        base_url=base_url,
-        user_id=user_id,
-        plans=plans,
-        flush=True,
-        trigger_rebuild=True,
-        timeout=timeout,
-    )
+    results: list[dict[str, Any]] = []
+    n = len(plan_ids)
+    for i, pid in enumerate(plan_ids):
+        one = load_beam_plan(conv, pid)
+        r = await cmd_ingest_plan(
+            base_url=base_url,
+            user_id=user_id,
+            plan=one,
+            flush=True,
+            trigger_rebuild=(i + 1 == n),
+            timeout=timeout,
+        )
+        results.append(r)
+        del one
+        gc.collect()
+        resp = r["response"] if isinstance(r, dict) and "response" in r else {}
+        if not isinstance(resp, dict) or resp.get("status") != 0:
+            break
     failed = [
         r
         for r in results

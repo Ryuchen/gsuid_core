@@ -392,10 +392,12 @@ grant / 自动提交审批），不依赖 LLM 自觉。详见
    - 检测启发式：形如 `</?Name…>`；`List<str>` 等 PascalCase 泛型 / 含 `@` 邮箱跳过，降假阳性。
 2. **`ooc`**（`output_firewall.check_ooc`）：
    - 主路径：`machine_dump` → `FALLBACK`「额…出错了，稍后再试」；**`delivery_narration`
-     → `FUSE`**（交付已完成，重说无意义，直接静默）；其它 → `REWRITE`+`defer_ooc`
-     （记入 `_ooc_blocked`，run 末 `_ooc_rewrite_and_send` 轻量重写一次）。
-   - 工具路径（`tool_gate_feedback` / 历史名 `gate_warn_once`）：提醒一次 → 再命中非
-     never-release 可放行；资金 / 机器腔 **never-release** 持续打回。
+     → `FUSE`**（交付已完成，重说无意义，直接静默）；资金红线持续 `REWRITE`。
+   - **软出戏**（`model_identity` / `ai_selfref` 等）：主/工具同一套——命中不强制剥模型名、
+     不二次发送放行。注入 `（系统校验：…可能出戏）` 让模型自判；提醒送达后只放行**主路径
+     下一句正文**。无下一轮请求时 run 末 `_ooc_rewrite_and_send` 按自判结果发送（可保持原文）。
+   - 工具路径（`tool_gate_feedback`）：软出戏持续打回，要求改用正文；资金 / 机器腔
+     **never-release** 持续打回。
    - OOC 类目：`model_identity` / `ai_selfref` / `system_term` / `fund_claim` /
      `machine_dump` / **`delivery_narration`**（2026-08-10，交付状态汇报系统日志腔，
      `speech_policy.looks_like_delivery_status_narration` 双信号结构检测）。
@@ -424,7 +426,7 @@ HTTP SSE 第一帧可见必须是 `event: text`（`: ping` 不是接任务应）
 
 **run 收尾**（`gs_agent._resolve_output_gate_after_run`）：`plan_angle_after_run` 规划熔断 scrub /
 `replace_map` 安全替换 history（禁止多脏→同一条干净）/ 补轻量重写；补写失败亦 `set_fused`。
-**尖括号熔断不阻断**本轮已 defer 的 OOC 重说（二者正交）。OOC / 尖括号共用
+**尖括号熔断不阻断**本轮已 defer 的 OOC 自判发送（二者正交）。OOC / 尖括号共用
 `_lightweight_text_rewrite`（无工具单轮 Agent）。
 
 **假完成闸**仍在 TextPart 路径、gate **之后**（结构判据：零工具却声称办完），不并入 `pre_send_gate`。

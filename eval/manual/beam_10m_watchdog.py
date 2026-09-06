@@ -135,8 +135,13 @@ def _log_age_s() -> float | None:
 def _ensure_core() -> None:
     if _tcp_up():
         return
-    _log("core down; starting")
-    _spawn(["uv", "run", "core", "--port", "8765"], _CORE_OUT, _CORE_ERR)
+    existing = _pids_matching("core --port 8765")
+    if existing is None:
+        _log("skip core spawn: process query failed")
+        return
+    if not existing:
+        _log("core down; starting --dev")
+        _spawn(["uv", "run", "core", "--port", "8765", "--dev"], _CORE_OUT, _CORE_ERR)
     deadline = time.time() + 600
     while time.time() < deadline:
         if _tcp_up():

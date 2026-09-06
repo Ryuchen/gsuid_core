@@ -63,6 +63,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import ast
 import sys
@@ -121,6 +122,26 @@ USER_ID_TEMPLATE = "beam_eval_{conv_id}"
 # ─────────────────────────────────────────────
 
 
+def _iter_parquet_paths(parquet_glob: str) -> List[str]:
+    import glob as _glob
+
+    raw = _glob.glob(parquet_glob) if any(c in parquet_glob for c in "*?[") else [parquet_glob]
+    return sorted(c for c in raw if c.endswith(".parquet") and os.path.isfile(c))
+
+
+def _normalize_probing_row(row: Dict[str, Any], conv: int) -> Dict[str, Any]:
+    pq_raw = row["probing_questions"] if "probing_questions" in row else None
+    if isinstance(pq_raw, str):
+        try:
+            row["probing_questions"] = ast.literal_eval(pq_raw)
+        except (ValueError, SyntaxError) as e:
+            print(f"[Loader] conv {conv} probing_questions 解析失败: {e}")
+            row["probing_questions"] = {}
+    elif pq_raw is None:
+        row["probing_questions"] = {}
+    return row
+
+
 def _read_parquet_rows(
     parquet_paths: List[str],
     columns: Optional[List[str]] = None,
@@ -153,37 +174,166 @@ def _read_parquet_rows(
     return raw_records
 
 
+def load_beam_row(
+    conv: int,
+    parquet_glob: str = DEFAULT_PARQUET_GLOB,
+    columns: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """只物化第 ``conv`` 条 conversation，不把整份 parquet 读进内存。"""
+    paths = _iter_parquet_paths(parquet_glob)
+    if not paths:
+        raise FileNotFoundError(f"未找到 BEAM-10M parquet 文件，请检查路径: {parquet_glob}")
+    if conv < 0:
+        raise SystemExit(f"conv={conv} 越界")
+
+    try:
+        import pyarrow.parquet as pq  # type: ignore
+    except ImportError:
+        rows = _read_parquet_rows(paths, columns)
+        if conv >= len(rows):
+            raise SystemExit(f"conv={conv} 越界，共 {len(rows)} 条")
+        print(f"[Loader] pandas 回退整表读取后取 conv={conv}/{len(rows)}")
+        return _normalize_probing_row(rows[conv], conv)
+
+    remaining = conv
+    total = 0
+    for p in paths:
+        pf = pq.ParquetFile(p)
+        n = int(pf.metadata.num_rows)
+        total += n
+        if remaining >= n:
+            remaining -= n
+            continue
+        for batch in pf.iter_batches(batch_size=64, columns=columns):
+            b = int(batch.num_rows)
+            if remaining >= b:
+                remaining -= b
+                continue
+            raw = batch.slice(remaining, 1).to_pylist()
+            if not raw:
+                break
+            row = {str(k): v for k, v in raw[0].items()}
+            print(f"[Loader] 流式读取 conv={conv} file={os.path.basename(p)}")
+            return _normalize_probing_row(row, conv)
+        remaining = -1
+        break
+    raise SystemExit(f"conv={conv} 越界，共 {total} 条")
+
+
+def _arrow_plan_from_batch(batch: object, user_idx: int) -> Dict[str, Any] | None:
+    """从 1 行 RecordBatch 只把 CLI plan N 的 chat 转成 Python。
+
+    ``chat`` 外层 list 有 10 个 struct，只有下标 N-1 的 ``plan-N`` 非空；
+    优先用 ``plans`` 列按 plan_id 抽，避免误拿空档。
+    """
+    import pyarrow.compute as pc  # type: ignore
+
+    data_id = user_idx - 1
+    names = list(batch.schema.names)  # type: ignore[attr-defined]
+    if "plans" in names:
+        values = batch.column("plans").flatten()  # type: ignore[attr-defined]
+        field_names = list(values.type.names)
+        if "plan_id" in field_names:
+            ids = values.field("plan_id")
+            pick: int | None = None
+            for i in range(len(values)):
+                raw = ids[i].as_py()
+                try:
+                    if int(raw) == data_id:
+                        pick = i
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if pick is None and 0 <= data_id < len(values):
+                pick = data_id
+            if pick is not None and "chat" in field_names:
+                chat_one = values.field("chat").slice(pick, 1).to_pylist()
+                raw_chat = chat_one[0] if chat_one else []
+                return normalize_plan({"plan_id": data_id, "chat": raw_chat})
+            if pick is not None:
+                rec = values.slice(pick, 1).to_pylist()[0]
+                if isinstance(rec, dict):
+                    return normalize_plan(rec)
+    if "chat" in names:
+        chat_col = batch.column("chat")  # type: ignore[attr-defined]
+        nlist = pc.list_value_length(chat_col)[0].as_py()
+        key = f"plan-{user_idx}"
+        if isinstance(nlist, int):
+            for slot in range(nlist):
+                head = pc.list_element(chat_col, slot)
+                struct_names = list(head.type.names)
+                if key not in struct_names:
+                    continue
+                py = head.field(key).to_pylist()
+                raw_chat = py[0] if py else None
+                if raw_chat:
+                    return normalize_plan({"plan_id": data_id, "chat": raw_chat})
+    return None
+
+
+def load_beam_plan(
+    conv: int,
+    user_idx: int,
+    parquet_glob: str = DEFAULT_PARQUET_GLOB,
+) -> Dict[str, Any]:
+    """只物化 CLI plan ``user_idx``（plan_id=user_idx-1）的 chat，不展开另外 9 档。"""
+    if user_idx < 1:
+        raise SystemExit(f"plan={user_idx} 越界，CLI 从 1 起")
+    paths = _iter_parquet_paths(parquet_glob)
+    if not paths:
+        raise FileNotFoundError(f"未找到 BEAM-10M parquet 文件，请检查路径: {parquet_glob}")
+    if conv < 0:
+        raise SystemExit(f"conv={conv} 越界")
+
+    try:
+        import pyarrow.parquet as pq  # type: ignore
+    except ImportError:
+        row = load_beam_row(conv, parquet_glob, columns=["chat", "plans"])
+        found = _resolve_plans(row, [user_idx])
+        del row
+        gc.collect()
+        if not found:
+            raise SystemExit(f"conv={conv} 找不到 plan {user_idx}")
+        print(f"[Loader] pandas 回退 conv={conv} plan={user_idx}")
+        return found[0]
+
+    remaining = conv
+    total = 0
+    for p in paths:
+        pf = pq.ParquetFile(p)
+        n = int(pf.metadata.num_rows)
+        total += n
+        if remaining >= n:
+            remaining -= n
+            continue
+        for batch in pf.iter_batches(batch_size=64, columns=["chat", "plans"]):
+            b = int(batch.num_rows)
+            if remaining >= b:
+                remaining -= b
+                continue
+            one = batch.slice(remaining, 1)
+            plan = _arrow_plan_from_batch(one, user_idx)
+            del one
+            del batch
+            gc.collect()
+            if plan is None:
+                raise SystemExit(f"conv={conv} 找不到 plan {user_idx}")
+            print(f"[Loader] 流式读取 conv={conv} plan={user_idx} file={os.path.basename(p)}")
+            return plan
+        remaining = -1
+        break
+    raise SystemExit(f"conv={conv} 越界，共 {total} 条")
+
+
 def load_beam_dataset(
     parquet_glob: str = DEFAULT_PARQUET_GLOB,
     columns: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """加载 BEAM-10M 数据集。
-
-    Args:
-        parquet_glob: 支持 glob 模式（如 ``eval/BEAM_10M/data/10M-*.parquet``）；
-                      也支持单文件路径。
-
-    Returns:
-        List[Dict]，每项是一条 conversation。
-    """
-    import glob as _glob
-
-    candidates = _glob.glob(parquet_glob) if any(c in parquet_glob for c in "*?[") else [parquet_glob]
-    candidates = [c for c in candidates if c.endswith(".parquet") and os.path.isfile(c)]
-    rows = _read_parquet_rows(sorted(candidates), columns=columns)
-
-    # 标准化：把 probing_questions 解析回 dict
+    """加载 BEAM-10M 全表。评测单 conv 请用 :func:`load_beam_row`。"""
+    candidates = _iter_parquet_paths(parquet_glob)
+    rows = _read_parquet_rows(candidates, columns=columns)
     for idx, row in enumerate(rows):
-        pq_raw = row.get("probing_questions")
-        if isinstance(pq_raw, str):
-            try:
-                row["probing_questions"] = ast.literal_eval(pq_raw)
-            except Exception as e:
-                print(f"[Loader] conv {idx} probing_questions 解析失败: {e}")
-                row["probing_questions"] = {}
-        elif pq_raw is None:
-            row["probing_questions"] = {}
-
+        _normalize_probing_row(row, idx)
     print(f"[Loader] 已加载 {len(rows)} 条 conversation")
     return rows
 
@@ -388,24 +538,23 @@ async def cmd_ingest_plan(
     """把单个 plan 的所有 turn 通过 ``batch_observe`` 灌入。"""
     plan_id = plan["plan_id"]
     turns = extract_turns_from_plan(plan)
+    plan["batches"] = []
     print(f"[Ingest] user_id={user_id}, plan_id={plan_id}, turns={len(turns)}")
-
-    # 把 time_anchor 转成 ISO8601
-    payload_turns: List[Dict[str, Any]] = []
-    for t in turns:
-        item: Dict[str, Any] = {"role": t["role"], "content": t["content"]}
-        iso = parse_time_anchor(t.get("time_anchor", ""))
-        if iso:
-            item["timestamp"] = iso
-        payload_turns.append(item)
 
     # 整包 POST 会撞 300s 默认超时；200 条一块，末块才 flush/rebuild。
     chunk_size = 200
     last_resp: Dict[str, Any] = {"status": 1, "msg": "no chunks", "data": None}
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-        n = len(payload_turns)
+        n = len(turns)
         for start in range(0, n, chunk_size):
-            chunk = payload_turns[start : start + chunk_size]
+            raw = turns[start : start + chunk_size]
+            chunk: List[Dict[str, Any]] = []
+            for t in raw:
+                item: Dict[str, Any] = {"role": t["role"], "content": t["content"]}
+                iso = parse_time_anchor(t["time_anchor"] if "time_anchor" in t else "")
+                if iso:
+                    item["timestamp"] = iso
+                chunk.append(item)
             last = start + chunk_size >= n
             print(
                 f"[Ingest] plan_id={plan_id} chunk {start // chunk_size + 1}"
@@ -433,13 +582,17 @@ async def cmd_ingest_plan(
                     break
                 if attempt < 3:
                     await asyncio.sleep(15.0 * attempt)
+            del chunk
             if last_resp.get("status") != 0:
                 break
 
     print(
         f"[Ingest] plan_id={plan_id} -> {last_resp.get('status')}: {last_resp.get('msg')} data={last_resp.get('data')}"
     )
-    return {"plan_id": plan_id, "turns": len(turns), "response": last_resp}
+    n_turns = len(turns)
+    del turns
+    gc.collect()
+    return {"plan_id": plan_id, "turns": n_turns, "response": last_resp}
 
 
 async def cmd_ingest_batch(
@@ -465,6 +618,8 @@ async def cmd_ingest_batch(
             timeout=timeout,
         )
         results.append(r)
+        plans[i] = {"plan_id": -1, "batches": []}
+        gc.collect()
         resp = r["response"] if isinstance(r, dict) and "response" in r else {}
         if not isinstance(resp, dict) or resp.get("status") != 0:
             break
@@ -670,25 +825,36 @@ async def cmd_judge(
 # ─────────────────────────────────────────────
 
 
+def _plan_data_id(plan: Dict[str, Any]) -> int | None:
+    raw = plan["plan_id"] if "plan_id" in plan else None
+    if raw is None and "id" in plan:
+        raw = plan["id"]
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _resolve_plans(row: Dict[str, Any], plan_ids: List[int]) -> List[Dict[str, Any]]:
-    """从 conversation row 中挑选指定 plan 序号（1-indexed）的标准化 plan 列表。
-
-    BEAM-10M 内部 plan_id 是 0-indexed 字符串（'0'..'9'），但 CLI 上对外采用
-    1-indexed（用户说 ``--plan 1`` 即 plans 数组里的第一个）。
-
-    Args:
-        plan_ids: 用户传入的 1-indexed plan 序号。
-    """
-    plans = [normalize_plan(p) for p in (row.get("plans") or [])]
-    by_data_id = {p["plan_id"]: p for p in plans}
+    """只标准化本次要灌的 plan，避免一次物化全部 10 档。"""
+    raw_plans = row["plans"] if "plans" in row and row["plans"] else []
+    chat_dict = row["chat"] if "chat" in row and row["chat"] else {}
     selected: List[Dict[str, Any]] = []
     for user_idx in plan_ids:
-        data_id = user_idx - 1  # 1-indexed CLI → 0-indexed data
-        if data_id in by_data_id:
-            selected.append(by_data_id[data_id])
+        data_id = user_idx - 1
+        found: Dict[str, Any] | None = None
+        if isinstance(raw_plans, list):
+            for p in raw_plans:
+                if isinstance(p, dict) and _plan_data_id(p) == data_id:
+                    found = p
+                    break
+        if found is not None:
+            selected.append(normalize_plan(found))
             continue
-        # 回退到 row['chat']['plan-<n>']
-        chat_dict = row.get("chat") or {}
+        if not isinstance(chat_dict, dict):
+            continue
         key = f"plan-{user_idx}"
         if key in chat_dict and chat_dict[key] is not None:
             selected.append(normalize_plan({"plan_id": data_id, "chat": chat_dict[key]}))
@@ -778,37 +944,22 @@ async def main_async(args: argparse.Namespace) -> int:
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    if args.cmd in {"probe", "judge"}:
-        # probe/judge 只读探针题，列裁剪跳过 ~12M token 的 chat/plans（省 ~3.5GB 客户端内存）
-        rows = load_beam_dataset(args.data, columns=["probing_questions"])
-    elif args.cmd in {"all", "ingest-plan", "ingest-batch", "clear"}:
-        rows = load_beam_dataset(args.data)
-    else:
-        rows = []
-
     if args.cmd == "clear":
         user_id = USER_ID_TEMPLATE.format(conv_id=args.conv)
         await cmd_clear(base_url, user_id, timeout=args.timeout)
         return 0
 
-    # 预绑定避免下游各 cmd 分支里 row 被判 possibly-unbound（judge 分支不读 row）
     row: Dict[str, Any] = {}
-    if args.cmd in {"ingest-plan", "ingest-batch", "probe", "all"}:
-        if args.conv < 0 or args.conv >= len(rows):
-            print(f"[Error] conv={args.conv} 越界，共 {len(rows)} 条")
-            return 2
-        row = rows[args.conv]
+    if args.cmd == "probe":
+        row = load_beam_row(args.conv, args.data, columns=["probing_questions"])
 
     if args.cmd == "ingest-plan":
         user_id = USER_ID_TEMPLATE.format(conv_id=args.conv)
-        plans = _resolve_plans(row, [args.plan])
-        if not plans:
-            print(f"[Error] conv {args.conv} 找不到 plan {args.plan}")
-            return 2
+        plan = load_beam_plan(args.conv, args.plan, args.data)
         await cmd_ingest_plan(
             base_url=base_url,
             user_id=user_id,
-            plan=plans[0],
+            plan=plan,
             flush=args.flush,
             trigger_rebuild=args.rebuild,
             timeout=args.timeout,
@@ -818,15 +969,22 @@ async def main_async(args: argparse.Namespace) -> int:
     if args.cmd == "ingest-batch":
         user_id = USER_ID_TEMPLATE.format(conv_id=args.conv)
         plan_ids = [int(x) for x in args.plans.split(",") if x.strip()]
-        plans = _resolve_plans(row, plan_ids)
-        await cmd_ingest_batch(
-            base_url=base_url,
-            user_id=user_id,
-            plans=plans,
-            flush=args.flush,
-            trigger_rebuild=args.rebuild,
-            timeout=args.timeout,
-        )
+        n_plans = len(plan_ids)
+        for i, pid in enumerate(plan_ids):
+            plan = load_beam_plan(args.conv, pid, args.data)
+            r = await cmd_ingest_plan(
+                base_url=base_url,
+                user_id=user_id,
+                plan=plan,
+                flush=args.flush,
+                trigger_rebuild=args.rebuild and i + 1 == n_plans,
+                timeout=args.timeout,
+            )
+            del plan
+            gc.collect()
+            resp = r["response"] if isinstance(r, dict) and "response" in r else {}
+            if not isinstance(resp, dict) or resp.get("status") != 0:
+                return 2
         return 0
 
     if args.cmd == "probe":
@@ -859,20 +1017,28 @@ async def main_async(args: argparse.Namespace) -> int:
     if args.cmd == "all":
         user_id = args.scope or USER_ID_TEMPLATE.format(conv_id=args.conv)
         plan_ids = [int(x) for x in args.plans.split(",") if x.strip()]
-        plans = _resolve_plans(row, plan_ids)
+        n_plans = len(plan_ids)
 
         # 1) clear
         await cmd_clear(base_url, user_id, timeout=args.timeout)
-        # 2) ingest
-        await cmd_ingest_batch(
-            base_url=base_url,
-            user_id=user_id,
-            plans=plans,
-            flush=True,
-            trigger_rebuild=args.rebuild,
-            timeout=args.timeout,
-        )
+        # 2) ingest：每档单独物化，避免 10 plan 同时留在内存
+        for i, pid in enumerate(plan_ids):
+            plan = load_beam_plan(args.conv, pid, args.data)
+            r = await cmd_ingest_plan(
+                base_url=base_url,
+                user_id=user_id,
+                plan=plan,
+                flush=True,
+                trigger_rebuild=args.rebuild and i + 1 == n_plans,
+                timeout=args.timeout,
+            )
+            del plan
+            gc.collect()
+            resp = r["response"] if isinstance(r, dict) and "response" in r else {}
+            if not isinstance(resp, dict) or resp.get("status") != 0:
+                return 2
         # 3) probe
+        row = load_beam_row(args.conv, args.data, columns=["probing_questions"])
         answers_file = os.path.join(output_dir, f"answers_{args.conv}.json")
         probes = iter_probing_questions(row)
         await cmd_probe(

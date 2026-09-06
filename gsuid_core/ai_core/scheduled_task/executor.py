@@ -326,8 +326,7 @@ async def execute_scheduled_task(task_id: str) -> None:
                 suppress_when_heartbeat_recent=False,
             )
         elif result_stripped:
-            # 溯源尾注（§5）。不用整行（…）形态——send_chat_result 的人设净化会把
-            # "整行仅括号"当舞台旁白删除，尾注会静默丢失（评审修复 F4）。
+            # 溯源尾注（§5）。不用整行（…），避免和人设可见心声抢形态。
             message_with_source = f"{result_stripped}\n⏰ 定时任务 {task_id}"
             sent = await emit_proactive_message(
                 event=ev,

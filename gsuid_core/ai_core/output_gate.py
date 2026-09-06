@@ -50,7 +50,7 @@ class GateResult:
     policy: str = ""
     feedback: str = ""
     send_text: str = ""
-    # OOC 主路径：收集后在 run 末尾轻量重说
+    # OOC 主路径：收集后在 run 末尾请模型自主判断（无下一轮请求时）
     defer_ooc: bool = False
     ooc_hit: Any = None
     fused: bool = False
@@ -255,6 +255,33 @@ def _persona_from_extra(extra: Dict[str, Any]) -> str | None:
     return raw if isinstance(raw, str) and raw else None
 
 
+def _extra_turn_id(extra: Dict[str, Any]) -> str:
+    if "turn_id" not in extra or extra["turn_id"] is None:
+        return ""
+    return str(extra["turn_id"])
+
+
+def mark_ooc_reminded(extra: Dict[str, Any]) -> None:
+    """系统提醒已交给模型（注入下一轮或工具 return）后调用。"""
+    turn_id = _extra_turn_id(extra)
+    if not turn_id:
+        return
+    ensure_gate_bag(extra).ooc_warned_turn_ids.add(turn_id)
+
+
+def ooc_reminder_delivered(extra: Dict[str, Any]) -> bool:
+    turn_id = _extra_turn_id(extra)
+    if not turn_id:
+        return False
+    return turn_id in ensure_gate_bag(extra).ooc_warned_turn_ids
+
+
+def is_ooc_judge_feedback(text: str) -> bool:
+    from gsuid_core.ai_core import output_firewall as of
+
+    return bool(text) and (of.OOC_JUDGE_MARKER in text or text.startswith("⛔ 你要发送的内容命中"))
+
+
 def _eval_ooc(
     text: str,
     extra: Dict[str, Any],
@@ -301,8 +328,6 @@ def _eval_ooc(
         )
 
     if hit.category == "delivery_narration":
-        # 交付状态汇报：交付已完成，重说无意义——主通道直接熔断静默；
-        # 工具通道打回，要求改 <SILENCE> 或一句角色短话。
         if channel == "main":
             logger.warning(
                 i18n_t(
@@ -328,10 +353,38 @@ def _eval_ooc(
             detail=hit.category,
         )
 
-    if channel == "main":
+    warn = of.build_rewrite_warning(hit)
+    if hit.category in of.NEVER_RELEASE_CATEGORIES:
         logger.warning(
             i18n_t(
-                "log.ai.output_gate_ooc_defer",
+                "log.ai.output_gate_ooc_rewrite_never_release",
+                category=hit.category,
+            )
+        )
+        return GateResult(
+            decision=GateDecision.REWRITE,
+            policy="ooc",
+            feedback=warn,
+            defer_ooc=channel == "main",
+            ooc_hit=hit,
+            detail=hit.category,
+        )
+
+    # 软出戏：主/工具同一套。提醒已送达后，只放行主路径新一代正文（自主判断）。
+    # 工具发送不二次放行，继续打回，要求改用正文。
+    turn_id = _extra_turn_id(extra)
+    if turn_id and ooc_reminder_delivered(extra):
+        if channel == "main":
+            logger.warning(
+                i18n_t(
+                    "log.ai.output_gate_ooc_allow_after_warn",
+                    category=hit.category,
+                )
+            )
+            return GateResult(decision=GateDecision.ALLOW, policy="ooc", detail="judged")
+        logger.warning(
+            i18n_t(
+                "log.ai.output_gate_ooc_rewrite_first_warn",
                 category=hit.category,
                 matched=repr(hit.matched[:4]),
             )
@@ -339,45 +392,16 @@ def _eval_ooc(
         return GateResult(
             decision=GateDecision.REWRITE,
             policy="ooc",
-            feedback=of.build_rewrite_warning(hit),
-            defer_ooc=True,
+            feedback=warn,
             ooc_hit=hit,
             detail=hit.category,
         )
 
-    # tool：提醒一次 → 再命中非 never-release 放行
-    bag = ensure_gate_bag(extra)
-    turn_id = ""
-    if "turn_id" in extra and extra["turn_id"] is not None:
-        turn_id = str(extra["turn_id"])
-    if turn_id and turn_id in bag.ooc_warned_turn_ids:
-        if hit.category in of.NEVER_RELEASE_CATEGORIES:
-            logger.warning(
-                i18n_t(
-                    "log.ai.output_gate_ooc_rewrite_never_release",
-                    category=hit.category,
-                )
-            )
-            return GateResult(
-                decision=GateDecision.REWRITE,
-                policy="ooc",
-                feedback=of.build_rewrite_warning(hit),
-                ooc_hit=hit,
-                detail=hit.category,
-            )
-        logger.warning(
-            i18n_t(
-                "log.ai.output_gate_ooc_allow_after_warn",
-                category=hit.category,
-            )
-        )
-        return GateResult(decision=GateDecision.ALLOW, policy="ooc", detail="second_pass")
-
-    if turn_id:
-        bag.ooc_warned_turn_ids.add(turn_id)
+    if channel == "tool":
+        mark_ooc_reminded(extra)
     logger.warning(
         i18n_t(
-            "log.ai.output_gate_ooc_rewrite_first_warn",
+            "log.ai.output_gate_ooc_defer" if channel == "main" else "log.ai.output_gate_ooc_rewrite_first_warn",
             category=hit.category,
             matched=repr(hit.matched[:4]),
         )
@@ -385,7 +409,8 @@ def _eval_ooc(
     return GateResult(
         decision=GateDecision.REWRITE,
         policy="ooc",
-        feedback=of.build_rewrite_warning(hit),
+        feedback=warn,
+        defer_ooc=channel == "main",
         ooc_hit=hit,
         detail=hit.category,
     )
@@ -556,6 +581,8 @@ def tool_gate_feedback(
 GATE_NUDGE_MARKERS: tuple[str, ...] = (
     "（系统校验：发送内容含非法尖括号标签",
     "⛔ 你要发送的内容命中",
+    "（系统校验：刚才要发的内容可能出戏",
+    "（系统校验：内容可能含内部工具名",
     "（系统校验：删除（心想：",
 )
 

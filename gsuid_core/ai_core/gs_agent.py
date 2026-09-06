@@ -1189,26 +1189,28 @@ class GsCoreAIAgent(RunOnceMixin):
         bot: Bot,
         ev: Optional[Event],
     ) -> None:
-        """出戏命中后的重说闭环：轻量重写一次，产物放行；history 脏文替换。"""
+        """出戏命中且本轮没有下一轮请求：把系统提醒交给模型自判，按它的正文发送。"""
         original = "\n\n".join(text for text, _ in blocked)
         first_hit = blocked[0][1]
         rewrite_message = (
             f"{output_firewall.build_rewrite_warning(first_hit)}\n\n"
-            f"【被拦下的原文】\n{original}\n\n"
-            "请保持原意、用你的角色口吻重写这段话，直接输出重写后的内容，不要解释。"
+            f"【待判断的原文】\n{original}\n\n"
+            "请自主判断后直接输出要发给用户的内容："
+            "不是出戏就原样或微调；是暴露自身身份再用角色口吻改写。不要解释。"
         )
         rewritten = await self._lightweight_text_rewrite(rewrite_message)
         _ooc_fb = output_firewall.fallback_ooc_text(self.persona_name)
+        _hard = first_hit.category in output_firewall.NEVER_RELEASE_CATEGORIES
         if not rewritten:
-            rewritten = _ooc_fb
-        if first_hit.category in output_firewall.NEVER_RELEASE_CATEGORIES:
+            rewritten = _ooc_fb if _hard else original
+        if _hard:
             _user_text = ev.raw_text if ev is not None and ev.raw_text else ""
             _recheck = output_firewall.check_ooc(rewritten, user_text=_user_text)
             if _recheck is not None and _recheck.category in output_firewall.NEVER_RELEASE_CATEGORIES:
                 logger.warning(i18n_t("log.agent.firewall_rewrite_output_hit_non"))
                 rewritten = _ooc_fb
         if angle_bracket_guard.has_illegal_angle_tags(rewritten):
-            rewritten = angle_bracket_guard.sanitize_illegal_angle_tags(rewritten) or _ooc_fb
+            rewritten = angle_bracket_guard.sanitize_illegal_angle_tags(rewritten) or (_ooc_fb if _hard else original)
         self._session_logger.log_text_output(rewritten)
         try:
             await send_chat_result(bot, rewritten, ev=ev, ooc_check=False)
@@ -1348,7 +1350,10 @@ class GsCoreAIAgent(RunOnceMixin):
             return text
         if hit.category == "machine_dump":
             return output_firewall.fallback_machine_text(self.persona_name)
-        # never-release 与其它 OOC：收尾单次路径用角色兜底，避免 ooc_check=False 漏放
+        if hit.category in output_firewall.NEVER_RELEASE_CATEGORIES:
+            return output_firewall.fallback_ooc_text(self.persona_name)
+        if hit.category in output_firewall.SOFT_JUDGE_CATEGORIES:
+            return text
         return output_firewall.fallback_ooc_text(self.persona_name)
 
     async def _resolve_output_gate_after_run(

@@ -2,15 +2,16 @@
 
 见 ``docs/SESSION_LOG_SECURITY_FINDINGS_20260707.md`` §D.4。
 
-职责分层（勿再写回旧「主路径在 send_chat_result 里注入重说」故事）：
+职责分层（勿再写回旧「主路径强制剥模型名 / 工具路径二次发送放行」故事）：
 - **策略**：本模块（分类命中、never-release、兜底句、``build_rewrite_warning``）
 - **编排**：``output_gate.pre_send_gate``（尖括号 → OOC；main / tool 决策）
-- **环内接线 / 收尾重说**：``gs_agent``（defer 列表、轻量重写、history scrub）
+- **环内接线**：``gs_agent``（系统提醒注入、收尾自主判断、history scrub）
 - **呈现末端**：``send_chat_result`` 仅在 ``ooc_check=True`` 时做整段替换兜底
 
 工具路径兼容入口：``gate_warn_once`` → ``output_gate.tool_gate_feedback``。
 
-**设计核心**：命中即重说（非永久封禁）→ 词库可高召回；漏杀才是事故。
+**设计核心**：软出戏命中 = 系统提醒 + 模型自主判断（非强制改写 / 非二次放行）。
+词库可高召回；资金 / 机器腔仍 never-release。
 """
 
 import re
@@ -29,6 +30,8 @@ from gsuid_core.ai_core.persona.settings import (
 # 规范化后匹配（吃掉"M i M o"式规避）。部署者可经 ai_config.output_firewall_extra_terms 补充。
 
 # 模型 / 厂商名（最高危：公开群聊暴露即事故）
+# 规范化后是子串匹配：短码/颜文字/成语/生活词不收（qwq、xai、即梦、混元、可灵、元宝）。
+# 部署者自家供应商走 ai_config.output_firewall_extra_terms，不要往这里硬编码。
 _MODEL_TERMS: Tuple[str, ...] = (
     "mimo",
     "minimax",
@@ -51,6 +54,30 @@ _MODEL_TERMS: Tuple[str, ...] = (
     "小米大模型",
     "chatgpt",
     "llama",
+    "grok",
+    "moonshot",
+    "月之暗面",
+    "copilot",
+    "mistral",
+    "mixtral",
+    "deepmind",
+    "perplexity",
+    "chatglm",
+    "internlm",
+    "hailuo",
+    "stepfun",
+    "baichuan",
+    "零一万物",
+    "智谱",
+    "hunyuan",
+    "讯飞",
+    "kling",
+    "midjourney",
+    "stablediffusion",
+    "火山方舟",
+    "华为盘古",
+    "openrouter",
+    "characterai",
 )
 
 # 系统 / 技术术语（出戏痕迹）——**硬词**：任何角色语境下出现都算泄露，裸子串匹配。
@@ -435,14 +462,14 @@ def is_enabled() -> bool:
     return bool(ai_config.get_config("output_firewall_enable").data)
 
 
-# 不可放行类别：重写后仍命中不得放行（身份词漏放代价=出戏；资金欺骗漏放代价=事故），
-# gate_warn_once 与 gs_agent 重说闭环共同引用（评审修复 F10 穿透面）。
-# machine_dump 直接兜底句，不重说（重说易继续复读堆栈）。
-NEVER_RELEASE_CATEGORIES: frozenset = frozenset({"fund_claim", "machine_dump"})
+# 资金欺骗 / 机器腔：提醒后仍不得放行。软出戏（身份词）走系统提醒 + 自主判断。
+NEVER_RELEASE_CATEGORIES: frozenset[str] = frozenset({"fund_claim", "machine_dump"})
+SOFT_JUDGE_CATEGORIES: frozenset[str] = frozenset({"model_identity", "ai_selfref"})
+OOC_JUDGE_MARKER = "（系统校验：刚才要发的内容可能出戏"
 
 
 def build_rewrite_warning(hit: FirewallHit) -> str:
-    """给模型的重说警告（工具 return / 反馈注入共用），按类别给针对性整改指引。"""
+    """给模型的系统提醒（工具 return / 反馈注入共用）。软出戏只请模型自判，不强制改写。"""
     if hit.category == "fund_claim":
         return (
             f"⛔ 你要发送的内容命中资金红线【命中：{'、'.join(hit.matched[:4])}】。"
@@ -460,15 +487,15 @@ def build_rewrite_warning(hit: FirewallHit) -> str:
         )
     if any("框架泄漏" in m or "系统文案" in m for m in hit.matched):
         return (
-            "⛔ 内容含内部工具名 / 资源句柄 / 编排或系统文案（如 read_handle、res_/to_、"
-            "系统校验、过程口头禅），禁止对用户念出。"
-            "请用【纯角色口吻】重写：只说结论与情绪；查不到就角色化说没查到，"
-            "不要提工具、句柄、代理、流程或内部提示语。"
+            "（系统校验：内容可能含内部工具名 / 句柄 / 编排文案。"
+            "请判断后用角色口吻只说结论；不要对用户念工具、句柄或内部提示。"
+            "直接输出你决定发给用户的正文，不要再调用发送工具重复同一句。）"
         )
     return (
-        f"⛔ 你要发送的内容命中出戏红线【类别：{hit.category}，命中：{'、'.join(hit.matched[:4])}】，"
-        "会破坏角色扮演。请用【纯角色口吻】重写这条消息，去掉任何模型名 / AI 身份 / 系统术语 / "
-        "报错信息后再发送——绝不透露你的模型、供应商、版本或任何系统实现细节。"
+        f"{OOC_JUDGE_MARKER}【类别：{hit.category}，命中：{'、'.join(hit.matched[:4])}】。"
+        "请你自己判断：介绍/对比第三方模型、聊行业新闻可以保持原意；"
+        "若是在承认自己是某个模型或 AI，才改成角色口吻。"
+        "直接输出你决定发给用户的正文，不要再调用发送工具重复同一句。）"
     )
 
 

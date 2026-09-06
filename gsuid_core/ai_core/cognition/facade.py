@@ -65,6 +65,10 @@ def _fileos_hit_title(summary: str, tool_name: str, profile: str = "") -> str:
 # 记忆片段/事实/偏好不过这条帽——否则「命中 12」只展开 4 条，比纯 Episode dump 更差。
 _HIGH_CONF_FUSED_CAP = 4
 _FUSED_CAP_KINDS = KNOWLEDGE_KINDS | WORK_KINDS | MEDIA_KINDS
+# 工具回执：高置信片段最多摊开这么多条，其余进「未展开」。
+_EPISODE_EXPAND_CAP = 6
+_EPISODE_SEED_SCORE = 0.8
+_EPISODE_NEIGHBOR_SCORE = 0.4
 
 
 def _min_score_ratio() -> float:
@@ -370,7 +374,10 @@ async def _search_memory(
         bot_self_id=scope.bot_self_id,
         include_self=True,
     )
+    seed_ep_ids: set[str] = set()
+    neighbor_ep_ids: set[str] = set()
     if CogKind.EPISODE in kinds:
+        seed_ep_ids = {str(ep["id"]) for ep in ctx.episodes if "id" in ep}
         if ctx.episodes:
             ctx.episodes = await _expand_time_neighbors(
                 ctx.episodes,
@@ -379,6 +386,7 @@ async def _search_memory(
                 after=4,
                 order_by_time=False,
             )
+            neighbor_ep_ids = {str(ep["id"]) for ep in ctx.episodes if "id" in ep} - seed_ep_ids
         ctx.episodes = await expand_lexical_recall(
             ctx.episodes,
             query=search_q,
@@ -419,13 +427,20 @@ async def _search_memory(
             content = str(ep["content"]) if "content" in ep else ""
             if not content:
                 continue
+            raw_id = str(ep["id"]) if "id" in ep else ""
+            # 邻条只为计数/时间线补上下文；降分后进弱相关，避免和语义命中一起摊开。
+            ep_score = (
+                _EPISODE_NEIGHBOR_SCORE
+                if raw_id and raw_id in neighbor_ep_ids and raw_id not in seed_ep_ids
+                else _EPISODE_SEED_SCORE
+            )
             _add(
                 CognitiveHit(
                     kind=CogKind.EPISODE,
                     id=f"ep_{ep['id']}" if "id" in ep else f"ep_{i}",
                     title="",
                     summary=content,
-                    score=0.8,  # dual_route 已精排；0.4 会被 pref(1.0)×0.55 折成弱相关
+                    score=ep_score,
                     as_of=str(ep["valid_at"])[:16] if "valid_at" in ep else "",
                     source="memory",
                 )
@@ -915,9 +930,15 @@ def render_cognition_block(
         lines.append(SET_RECALL_HINT)
     weak_n = 0
     shown = 0
+    ep_shown = 0
     for hit in hits:
+        if hit.kind is CogKind.EPISODE and hit.high_confidence and ep_shown >= _EPISODE_EXPAND_CAP:
+            weak_n += 1
+            continue
         if hit.high_confidence:
             shown += 1
+            if hit.kind is CogKind.EPISODE:
+                ep_shown += 1
             lines.append(hit.render_line(shown))
         else:
             weak_n += 1
