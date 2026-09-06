@@ -87,7 +87,7 @@ async def get_current_commit(repo_path: Path) -> Optional[CommitInfo]:
     )
 
     if returncode != 0 or not stdout:
-        logger.warning(t("[Git Update] 获取当前 commit 失败: {stderr}", stderr=stderr))
+        logger.warning(t("log.plugin.git_update_get_commit_stderr", stderr=stderr))
         return None
 
     return _parse_commit_line(stdout)
@@ -131,7 +131,7 @@ async def get_remote_commits(
     # 尝试 fetch 获取最新远程信息，失败则使用本地缓存
     success, message = await git_fetch(repo_path)
     if not success:
-        logger.warning(t("[Git Update] git fetch 失败（将使用本地缓存的远程 ref）: {message}", message=message))
+        logger.warning(t("log.plugin.git_update_fetch_use_locally", message=message))
 
     # 获取当前分支
     branch = await git_get_current_branch(repo_path)
@@ -146,7 +146,7 @@ async def get_remote_commits(
     )
 
     if returncode != 0 or not stdout:
-        logger.warning(t("[Git Update] 获取远程 commit 列表失败: {stderr}", stderr=stderr))
+        logger.warning(t("log.plugin.git_update_get_remote_commit_fail", stderr=stderr))
         return []
 
     commits: List[CommitInfo] = []
@@ -186,7 +186,7 @@ async def get_local_commits(
     )
 
     if returncode != 0 or not stdout:
-        logger.warning(t("[Git Update] 获取本地 commit 列表失败: {stderr}", stderr=stderr))
+        logger.warning(t("log.plugin.git_update_get_local_commit_list", stderr=stderr))
         return []
 
     commits: List[CommitInfo] = []
@@ -262,10 +262,10 @@ async def checkout_commit(repo_path: Path, commit_hash: str) -> tuple[bool, str]
     success, msg = await git_reset_hard(repo_path, commit_hash)
 
     if not success:
-        logger.warning(t("[Git Update] reset --hard 失败: {msg}", msg=msg))
+        logger.warning(t("log.plugin.git_update_reset_hard_msg", msg=msg))
         return False, f"reset --hard 失败: {msg}"
 
-    logger.info(t("[Git Update] 已回退到 commit: {commit_hash}", commit_hash=commit_hash))
+    logger.info(t("log.plugin.git_update_rolled_commit_hash", commit_hash=commit_hash))
     return True, f"已回退到 commit: {commit_hash[:7]}"
 
 
@@ -297,13 +297,13 @@ async def force_update(repo_path: Path) -> tuple[bool, str]:
     # git reset --hard origin/{branch}
     success, message = await git_reset_hard(repo_path, f"origin/{branch}")
     if not success:
-        logger.warning(t("[Git Update] git reset --hard 失败: {message}", message=message))
+        logger.warning(t("log.plugin.git_update_reset_hard", message=message))
         return False, f"git reset --hard 失败: {message}"
 
     # git pull
     success, message = await git_pull(repo_path)
     if not success:
-        logger.warning(t("[Git Update] git pull 失败: {message}", message=message))
+        logger.warning(t("log.plugin.git_update_pull", message=message))
         return False, f"git pull 失败: {message}"
 
     # 获取更新后的 commit 信息
@@ -313,7 +313,7 @@ async def force_update(repo_path: Path) -> tuple[bool, str]:
     else:
         message = "强制更新成功"
 
-    logger.info(f"[Git Update] {message}")
+    logger.info(t("log.git_update.force_update_result", message=message))
     return True, message
 
 
@@ -341,7 +341,7 @@ async def update(repo_path: Path) -> tuple[bool, str]:
     # 执行 git pull
     success, message = await git_pull(repo_path)
     if not success:
-        logger.warning(t("[Git Update] git pull 失败: {message}", message=message))
+        logger.warning(t("log.plugin.git_update_pull", message=message))
         return False, f"git pull 失败: {message}"
 
     # 获取更新后的 commit 信息
@@ -351,7 +351,7 @@ async def update(repo_path: Path) -> tuple[bool, str]:
     else:
         message = "更新成功"
 
-    logger.info(f"[Git Update] {message}")
+    logger.info(t("log.git_update.update_result", message=message))
     return True, message
 
 
@@ -390,17 +390,29 @@ def _resolve_plugin_path(plugin_name: str) -> Optional[Path]:
     Returns:
         插件路径，不存在返回 None
     """
-    if plugin_name.lower() == "gsuid_core":
+    if plugin_name.lower() in {"gsuid_core", "gscore"}:
         return CORE_PATH
 
+    from gsuid_core.utils.path_safety import PathEscapeError, safe_join, is_safe_filename
+
+    if not is_safe_filename(plugin_name):
+        return None
+
     # 尝试精确匹配
-    plugin_path = PLUGINS_PATH / plugin_name
-    if plugin_path.exists():
+    try:
+        plugin_path = safe_join(PLUGINS_PATH, plugin_name)
+    except PathEscapeError:
+        return None
+    if plugin_path.exists() and plugin_path.is_dir():
         return plugin_path
 
-    # 尝试大小写不敏感匹配
-    for d in PLUGINS_PATH.iterdir():
-        if d.is_dir() and d.name.lower() == plugin_name.lower():
-            return d
+    # 尝试大小写不敏感匹配（仅枚举 plugins 的直接子目录）
+    if PLUGINS_PATH.exists():
+        for d in PLUGINS_PATH.iterdir():
+            if d.is_dir() and d.name.lower() == plugin_name.lower():
+                try:
+                    return safe_join(PLUGINS_PATH, d.name)
+                except PathEscapeError:
+                    return None
 
     return None

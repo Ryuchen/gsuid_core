@@ -1,10 +1,10 @@
-"""docs/skills 开发文档 → 知识库挂载（启动期）+ 命名空间检索（通用）。
+"""开发文档 Skill（``.agents/skills``）→ 知识库挂载（启动期）+ 命名空间检索（通用）。
 
-把 ``docs/skills/<skill>/`` 下的全部 SKILL 文档（``references/*.md``，无 references 时退回
+把 ``.agents/skills/<skill>/`` 下的全部 SKILL 文档（``references/*.md``，无 references 时退回
 ``SKILL.md``）在框架启动时挂载进知识库，供能力代理（如 ``plugin_developer_agent``）用
 **混合检索（dense + BM25 稀疏 RRF）**按需查阅——取代在单文件里做子串标题匹配的脆弱方式。
 
-本模块**发现并挂载 docs/skills 下的每一个 skill**（如 ``gscore-plugin-development`` /
+本模块**发现并挂载 .agents/skills 下的每一个 skill**（如 ``gscore-plugin-development`` /
 ``gscore-ai-core-api`` / ``gscore-adapter-development``），新增 skill 目录无需改代码、自动纳入。
 
 ## 隔离设计（关键）
@@ -13,7 +13,7 @@
 
 - 与插件知识（``source="plugin"``）/ 手动知识（``source="manual"``）的同步、对账互不干扰
   （``sync_knowledge`` 只清 plugin 来源、``reconcile_manual_knowledge`` 只管 manual 来源）。
-- 通用 ``search_knowledge`` 工具与意图分类器按 ``exclude_sources=["skill_doc"]`` 把**整类**开发
+- 通用 ``search_cognition`` 与意图分类器按 ``exclude_sources=["skill_doc"]`` 把**整类**开发
   文档挡在日常聊天 RAG 之外（一处排除覆盖全部 skill、且对将来新增 skill 自动生效），避免污染。
 - 能力代理用 ``search_skill_docs`` 工具按 ``plugin="skilldoc:<skill>"`` 命名空间过滤检索；
   不限定 skill 时检索全部已挂载 skill。
@@ -52,8 +52,8 @@ _SUB_TARGET: int = 1000
 _SUB_HARD_CAP: int = 2200
 _SUB_OVERLAP: int = 120
 
-# docs/skills 根目录（相对仓库根；parents[3] 即仓库根，与 buildin_tools 同深度）。
-_SKILLS_ROOT: Path = Path(__file__).resolve().parents[3] / "docs" / "skills"
+# .agents/skills 根目录（相对仓库根；parents[3] 即仓库根）。
+_SKILLS_ROOT: Path = Path(__file__).resolve().parents[3] / ".agents" / "skills"
 
 
 def skill_doc_namespace(skill: str) -> str:
@@ -62,7 +62,7 @@ def skill_doc_namespace(skill: str) -> str:
 
 
 def _discover_skill_docs() -> Dict[str, List[Path]]:
-    """发现 docs/skills 下每个 skill 及其文档文件。
+    """发现 .agents/skills 下每个 skill 及其文档文件。
 
     优先取 ``<skill>/references/*.md``（正文）；无 references 目录时退回单篇 ``<skill>/SKILL.md``。
     返回 ``{skill 目录名: [md 文件...]}``（均按文件名稳定排序）。
@@ -241,12 +241,12 @@ async def _skill_docs_point_count() -> int:
         )
         return result.count
     except Exception as e:
-        logger.debug(t("🧠 [SkillsKB] 统计 skill_doc 点数失败（按非空处理）: {e}", e=e))
+        logger.debug(t("log.rag.skillskb_skill_doc_points_fail", e=e))
         return -1
 
 
 async def sync_skill_docs() -> None:
-    """启动期把 docs/skills 下全部 skill 文档挂载进知识库（幂等）。供 ``rag.startup.init_all`` 调用。"""
+    """启动期把 .agents/skills 下全部 skill 文档挂载进知识库（幂等）。供 ``rag.startup.init_all`` 调用。"""
     from gsuid_core.ai_core.rag.base import client, embedding_model
     from gsuid_core.ai_core.rag.knowledge import (
         add_knowledge_document,
@@ -256,10 +256,10 @@ async def sync_skill_docs() -> None:
 
     skills = _discover_skill_docs()
     if not skills:
-        logger.warning(t("🧠 [SkillsKB] 未发现任何 skill 文档，跳过挂载: {_SKILLS_ROOT}", _SKILLS_ROOT=_SKILLS_ROOT))
+        logger.warning(t("log.rag.skillskb_skill_documents_found_skip", _SKILLS_ROOT=_SKILLS_ROOT))
         return
     if client is None or embedding_model is None:
-        logger.debug(t("🧠 [SkillsKB] RAG 未就绪，跳过 skill 文档挂载"))
+        logger.debug(t("log.rag.skillskb_ready_skipping_skill"))
         return
 
     # 现存 skill_doc 分片：doc_id -> 已存内容哈希（取自分片 tags 里的 _srchash:）
@@ -285,7 +285,7 @@ async def sync_skill_docs() -> None:
             try:
                 text = f.read_text(encoding="utf-8")
             except OSError as e:
-                logger.warning(t("🧠 [SkillsKB] 读取文档失败，跳过: {skill}/{p0}: {e}", skill=skill, p0=f.name, e=e))
+                logger.warning(t("log.rag.skillskb_read_document_skipping_fail", skill=skill, p0=f.name, e=e))
                 continue
             doc_id = _doc_id_for(skill, f)
             desired_doc_ids.add(doc_id)
@@ -315,8 +315,7 @@ async def sync_skill_docs() -> None:
     if changed or stale:
         logger.info(
             t(
-                "🧠 [SkillsKB] skill 文档挂载完成：更新 {changed} 篇、清理 {p0} 篇"
-                "（{p1} 个 skill / 共 {total_files} 篇文档）",
+                "log.rag.skillskb_skill_changed_total_ok",
                 changed=changed,
                 p0=len(stale),
                 p1=len(skills),
@@ -326,7 +325,7 @@ async def sync_skill_docs() -> None:
     else:
         logger.debug(
             t(
-                "🧠 [SkillsKB] skill 文档已是最新（{p0} 个 skill / {total_files} 篇），跳过重嵌",
+                "log.rag.skillskb_skill_documents_date_skip",
                 p0=len(skills),
                 total_files=total_files,
             )

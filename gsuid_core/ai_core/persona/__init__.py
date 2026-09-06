@@ -19,7 +19,7 @@
 1. 主人格 prompt 由 ``processor.build_persona_prompt`` 一次性拼装：人设
    + ``SYSTEM_CONSTRAINTS`` 决策树 + 自我认知 + 上下文摘要。
 2. 决策树关键分支（``prompts.py``）：
-   - §3.1  专业域强制委派：遇到证券 / 天气 / 代码 / 内部周报等专业问题必须
+   - §3.1  专业域强制委派：遇到清单内能力代理覆盖的专业问题必须
            走 ``create_subagent`` 或 ``register_kanban_task``，不允许自己用
            工具池 + ``web_search`` 拼答案。
    - §3.4  ``scheduled_task`` ↔ ``Kanban`` 边界：单步周期用 ``add_interval_task``；
@@ -47,17 +47,31 @@ from gsuid_core.ai_core.persona.prompts import (
 )
 from gsuid_core.ai_core.persona.startup import init_default_personas
 from gsuid_core.ai_core.persona.resource import (
+    copy_persona,
     load_persona,
     save_persona,
     delete_persona,
+    get_tone_markers,
     get_voice_anchor,
+    extract_tone_markers,
     get_persona_metadata,
     get_persona_audio_path,
     get_persona_image_path,
     get_persona_avatar_path,
     list_available_personas,
+    reply_ends_with_tone_marker,
     invalidate_voice_anchor_cache,
     migrate_voice_anchor_from_config,
+)
+from gsuid_core.ai_core.persona.settings import (
+    DEFAULT_PERSONA_SETTINGS,
+    PersonaSettingsManager,
+    get_fallback_ooc,
+    get_master_title,
+    get_persona_setting,
+    get_fallback_machine,
+    persona_name_from_event,
+    persona_settings_manager,
 )
 from gsuid_core.ai_core.persona.processor import build_persona_prompt
 
@@ -78,9 +92,13 @@ __all__ = [
     "get_persona_audio_path",
     "get_persona_metadata",
     "get_voice_anchor",
+    "get_tone_markers",
+    "extract_tone_markers",
+    "reply_ends_with_tone_marker",
     "invalidate_voice_anchor_cache",
     "migrate_voice_anchor_from_config",
     "delete_persona",
+    "copy_persona",
     # 提示词模板
     "CHARACTER_BUILDING_TEMPLATE",
     "ROLE_PLAYING_START",
@@ -93,4 +111,12 @@ __all__ = [
     "PersonaConfigManager",
     "persona_config_manager",
     "DEFAULT_PERSONA_CONFIG",
+    "PersonaSettingsManager",
+    "persona_settings_manager",
+    "DEFAULT_PERSONA_SETTINGS",
+    "get_persona_setting",
+    "get_master_title",
+    "get_fallback_ooc",
+    "get_fallback_machine",
+    "persona_name_from_event",
 ]

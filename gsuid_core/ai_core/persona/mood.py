@@ -10,8 +10,8 @@
 使用方式:
     from gsuid_core.ai_core.persona.mood import get_mood_state, update_mood
 
-    mood = await get_mood_state(persona_name="早柚", group_id="123456")
-    await update_mood(persona_name="早柚", group_id="123456", event_type="praise")
+    mood = await get_mood_state(persona_name="示例人格", group_id="123456")
+    await update_mood(persona_name="示例人格", group_id="123456", event_type="praise")
 """
 
 from __future__ import annotations
@@ -273,7 +273,7 @@ async def update_mood(
 
     logger.debug(
         t(
-            "🎭 [Mood] {persona_name}@{group_id}: {p0} (强度: {p1:.2f}, 触发: {p2})",
+            "log.persona.mood_name_group_id",
             persona_name=persona_name,
             group_id=group_id,
             p0=new_state.mood.value,
@@ -294,7 +294,7 @@ async def reset_mood(persona_name: str, group_id: str) -> None:
     """
     key = _make_mood_key(persona_name, group_id)
     _mood_states.pop(key, None)
-    logger.debug(t("🎭 [Mood] {persona_name}@{group_id}: 情绪已重置", persona_name=persona_name, group_id=group_id))
+    logger.debug(t("log.persona.mood_persona_name_group_id_reset", persona_name=persona_name, group_id=group_id))
 
 
 def get_all_mood_states() -> Dict[str, MoodState]:

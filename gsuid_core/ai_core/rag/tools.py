@@ -78,24 +78,27 @@ async def _rerank_tool_candidates(
 
     documents: List[str] = []
     for name, obj, _ in candidates:
-        desc = getattr(obj, "description", "") or ""
-        documents.append(f"{name}\n{desc}")
+        if isinstance(obj, ToolBase):
+            documents.append(obj.retrieval_text)
+        else:
+            desc = getattr(obj, "description", "") or ""
+            documents.append(f"{name}\n{desc}")
 
     try:
         scores = await asyncio.to_thread(reranker.rerank, query, documents)
     except Exception as e:
-        logger.warning(i18n_t("🧠 [Tools] Reranker 精排失败，退回向量分数排序: {e}", e=e))
+        logger.warning(i18n_t("log.rag.tools_reranker_rerank_falling_fail", e=e))
         return candidates[:top_k]
 
     if len(scores) != len(candidates):
-        logger.warning(i18n_t("🧠 [Tools] Reranker 返回分数数量不匹配，退回向量分数排序"))
+        logger.warning(i18n_t("log.rag.tools_reranker_score_mismatch"))
         return candidates[:top_k]
 
     ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
     reranked = [c for _, c in ranked[:top_k]]
     logger.info(
         i18n_t(
-            "🧠 [Tools] Reranker 精排: {p0} 候选 → 取前 {p1} ({p2})",
+            "log.rag.tools_reranker_rerank_candidates",
             p0=len(candidates),
             p1=len(reranked),
             p2=", ".join((n for n, _, _ in reranked)),
@@ -118,7 +121,7 @@ async def init_tools_collection():
         if await collection_vector_mismatched(TOOLS_COLLECTION_NAME, dimension):
             logger.warning(
                 i18n_t(
-                    "🧠 [Tools] 集合 {TOOLS_COLLECTION_NAME} 维度变化，强制重建后由 sync_tools 自动重建",
+                    "log.rag.tools_collection_name_dimension",
                     TOOLS_COLLECTION_NAME=TOOLS_COLLECTION_NAME,
                 )
             )
@@ -128,7 +131,7 @@ async def init_tools_collection():
 
     logger.info(
         i18n_t(
-            "🧠 [Tools] 初始化新集合: {TOOLS_COLLECTION_NAME}, 维度: {dimension}",
+            "log.rag.tools_initializing_collection_name",
             TOOLS_COLLECTION_NAME=TOOLS_COLLECTION_NAME,
             dimension=dimension,
         )
@@ -149,10 +152,10 @@ async def sync_tools(tools_map: Dict[str, ToolBase]) -> None:
     from gsuid_core.ai_core.rag.base import client, embedding_model
 
     if client is None or embedding_model is None:
-        logger.debug(i18n_t("🧠 [Tools] AI功能未启用，跳过工具同步"))
+        logger.debug(i18n_t("log.rag.tools_skip_sync_tool_ai_feature"))
         return
 
-    logger.info(i18n_t("🧠 [Tools] 开始同步工具库..."))
+    logger.info(i18n_t("log.rag.tools_library_sync"))
 
     # 1. 获取向量库中现有工具
     existing_tools: Dict[str, dict] = {}
@@ -184,8 +187,13 @@ async def sync_tools(tools_map: Dict[str, ToolBase]) -> None:
     local_tool_names: Set[str] = set(tools_map.keys())
 
     for tool_name, tool in tools_map.items():
-        # 计算哈希
-        tool_dict = {"name": tool.name, "description": tool.description}
+        # 计算哈希：covers/aliases 也进哈希，声明变化即触发重嵌入
+        tool_dict = {
+            "name": tool.name,
+            "description": tool.description,
+            "covers": tool.covers,
+            "aliases": tool.aliases,
+        }
         current_hash = calculate_hash(tool_dict)
 
         # 检查是否需要更新
@@ -193,15 +201,21 @@ async def sync_tools(tools_map: Dict[str, ToolBase]) -> None:
         is_modified = not is_new and existing_tools[tool_name]["hash"] != current_hash
 
         if is_new or is_modified:
-            # 生成向量：使用 name + description
-            desc_and_name = f"{tool_name}\n{tool.description}"
+            # 生成向量：name + description + covers + aliases（完整检索面）
+            retrieval_text = tool.retrieval_text
 
             # 构建payload
-            payload = {"name": tool.name, "description": tool.description, "_hash": current_hash}
-            pending_items.append((tool_name, payload, desc_and_name))
+            payload = {
+                "name": tool.name,
+                "description": tool.description,
+                "covers": tool.covers,
+                "aliases": tool.aliases,
+                "_hash": current_hash,
+            }
+            pending_items.append((tool_name, payload, retrieval_text))
 
     if pending_items:
-        logger.info(i18n_t("🧠 [Tools] 需要新增/更新 {p0} 个工具，开始批量嵌入...", p0=len(pending_items)))
+        logger.info(i18n_t("log.rag.tools_start_update_tool_need_add", p0=len(pending_items)))
 
     async def _embed_pending(texts: Sequence[str]) -> list[list[float]]:
         return list(await embedding_model.aembed(list(texts)))
@@ -216,7 +230,7 @@ async def sync_tools(tools_map: Dict[str, ToolBase]) -> None:
         if vector is None:
             continue
         action_str = "新增" if tool_name not in existing_tools else "更新"
-        logger.info(i18n_t("🧠 [Tools] [{action_str}] 工具: {tool_name}", action_str=action_str, tool_name=tool_name))
+        logger.info(i18n_t("log.rag.tools_action_str_name", action_str=action_str, tool_name=tool_name))
         points_to_upsert.append(
             PointStruct(
                 id=get_point_id(tool_name),
@@ -227,7 +241,7 @@ async def sync_tools(tools_map: Dict[str, ToolBase]) -> None:
 
     # 3. 执行更新
     if points_to_upsert:
-        logger.info(i18n_t("🧠 [Tools] 写入 {p0} 个工具...", p0=len(points_to_upsert)))
+        logger.info(i18n_t("log.rag.tools_write_tool_writing", p0=len(points_to_upsert)))
         await _upsert_tool_points(points_to_upsert)
 
     # 4. 清理已删除的工具
@@ -240,11 +254,11 @@ async def sync_tools(tools_map: Dict[str, ToolBase]) -> None:
                 collection_name=TOOLS_COLLECTION_NAME,
                 points_selector=ids_to_delete,
             )
-            logger.info(i18n_t("🧠 [Tools] 清理 {p0} 个已删除的工具", p0=len(ids_to_delete)))
+            logger.info(i18n_t("log.rag.tools_cleaning_deleted", p0=len(ids_to_delete)))
     else:
-        logger.info(i18n_t("🧠 [Tools] 本地工具为空，跳过清理步骤"))
+        logger.info(i18n_t("log.rag.tools_local_empty_skipping"))
 
-    logger.info(i18n_t("🧠 [Tools] 工具同步完成"))
+    logger.info(i18n_t("log.rag.tools_sync_done_tool_complete"))
 
 
 async def _upsert_tool_points(points: list[PointStruct], batch_size: int | None = None) -> None:
@@ -268,7 +282,7 @@ async def _upsert_tool_points(points: list[PointStruct], batch_size: int | None 
         message = str(e)
         if "broadcast input array" not in message and "not aligned" not in message and "dim" not in message:
             raise
-        logger.warning(i18n_t("🧠 [Tools] 写入检测到本地 Qdrant 旧维度残留，强制重建集合后重试: {e}", e=e))
+        logger.warning(i18n_t("log.rag.tools_write_local_qdrant_retry", e=e))
         await force_recreate_collection(
             collection_name=TOOLS_COLLECTION_NAME,
             vectors_config=VectorParams(size=get_strict_dimension(), distance=Distance.COSINE, on_disk=True),
@@ -285,31 +299,16 @@ async def _upsert_tool_points(points: list[PointStruct], batch_size: int | None 
         await upsert_points_with_backoff(points, _do_upsert_after_recreate, initial_batch_size=bs, log_tag="Tools")
 
 
-# 框架保底工具分类——这些分类下的工具会被无条件全部注入主Agent，
-# 不受向量搜索影响。"保底工具"由工具注册时声明的 category 决定，而非硬编码名单：
-#   - "self"    ：主Agent核心工具（好感度、子Agent、定时任务、消息发送等）
-#   - "buildin" ：框架基础工具（搜索、记忆、自我认知、持久状态 state_* 等）
-#
-# planning（长任务编排 / 产物 / 结构化集合：register_kanban_task、respawn_subtask、
-# fail_task_tree、respond_subtask_approval、artifact_*、record_*）**刻意不再保底**：
-# 这 15 个重型 schema 每轮常驻会显著抬高 Token 并稀释工具选择精度（实测闲聊一句
-# "宝宝下午好"也挂满 15 个规划工具）。改为按持久状态精确召回——
-#   · 有活跃 Kanban 任务      → 状态驱动补「长期任务编排」+「产物」族（见 tool_state_signals）
-#   · 有未完成定时任务        → 状态驱动补「定时任务」族
-#   · 名下有 record:* 集合     → 状态驱动补「结构化记录」族
-#   · 临时起意（记账/建任务/查产物）→ 第 3 层向量检索命中后按能力族整族展开（L4）
-# 既解决 A-1「想调却无工具」（状态驱动让 artifact_get_recent / record_* 在该场景下
-# 必然在列），又避免无关轮次的全量常驻。
-# 插件/核心若要让某个工具进入保底池，只需注册时使用 self / buildin 分类即可。
+# 历史分类名：self/buildin 曾整类进保底。现通道核是 MAIN_AGENT_CORE_TOOLS 名单，
+# 本常量只给注释/诊断对照，装配不再按它全量加载。
 GUARANTEED_TOOL_CATEGORIES: List[str] = ["self", "buildin"]
 
-# O-B 白名单：只有框架核心 self 工具才允许进入保底池。
-# 插件滥用 category="self" 会导致保底池膨胀（如鸣潮插件把 12+ 个游戏查询工具
-# 全部注册为 self，使闲聊时也常驻）。此处用函数名白名单兜底，不依赖插件自觉。
-# 不在白名单中的 self 分类工具，降级走向量检索（common/media 路径）。
+# 允许进入通道核的 self 工具。调度整族仍是 self（仅主人格），但不进核、走检索。
+# 插件滥用 category="self" 的不进核；检索按「本轮未暴露」召回，不再按分类一刀切。
 _SELF_CATEGORY_WHITELIST: Set[str] = {
     "send_message_by_ai",
-    "update_user_favorability",
+    "send_meme",
+    "record_meme",
     "add_once_task",
     "add_interval_task",
 }
@@ -334,45 +333,93 @@ def _tool_plugin(tool_name: str) -> str:
     return tool_base.plugin
 
 
+async def _plugins_from_scope_ambiguity(route_text: str, scope_key: str) -> List[str]:
+    """歧义 surface 与本群已连世界枢纽的插件交集恰好 1 个才路由。"""
+    if not route_text or not scope_key:
+        return []
+    from gsuid_core.ai_core.entity_index import find_entities_in_text
+    from gsuid_core.ai_core.cognition.hub import plugin_from_world_ref
+    from gsuid_core.ai_core.cognition.nodes import AICogNode
+
+    ambiguous: set[str] = set()
+    for ref in find_entities_in_text(route_text):
+        if not ref.is_ambiguous:
+            continue
+        for plugin in ref.plugins:
+            if plugin:
+                ambiguous.add(plugin)
+    if not ambiguous:
+        return []
+    canons = await AICogNode.list_world_canons_in_scope(scope_key)
+    scope_plugins = {plugin_from_world_ref(canon) for canon in canons}
+    scope_plugins.discard("")
+    hit = [plugin for plugin in ambiguous if plugin in scope_plugins]
+    uniq = list(dict.fromkeys(hit))
+    if len(uniq) != 1:
+        return []
+    return uniq
+
+
 async def search_tools_with_entity_routing(
     query: str,
     route_text: str,
     limit: int,
     non_category: Union[str, list[str]] = "",
     threshold: float = 0.38,
+    scope_key: str = "",
+    ignore_surfaces: Sequence[str] = (),
+    exclude_names: Optional[Set[str]] = None,
 ) -> ToolList:
     """两级召回：实体身份**确定性**定插件，向量检索在插件内做细选（L0）。
 
-    「玄翎秧秧属于鸣潮」是**世界知识，不是文本相似度**——嵌入学不会。实测跨插件路由
-    准确率只有 ~50%（`eval/tool_selection`），"tartaglia面板"（原神）能召回一池子异环
-    工具。本函数先查 `entity_index` 拿到确定的插件归属，再把该插件的工具提到种子队列
-    前面，让嵌入只负责"插件内选哪个工具"（scope 从上千缩到几十，它擅长）。
+    先查 `entity_index` 拿到确定的插件归属，再把该插件的工具提到种子队列
+    前面，让嵌入只负责插件内细选。
 
     保守规则：
-    - **没有实体命中 / 命中归属歧义** → 行为与普通 `search_tools` **完全一致**（零影响）；
-    - 只按**当前消息**路由，不吃 L5 拼进来的历史原话——否则"上轮问长离、这轮设提醒"
-      会被上轮的实体劫持（跨轮延续由 L3 会话驻留负责，不该由实体路由兜）；
-    - 至少留 1 个种子名额给通用最佳匹配，实体路由是**加分项**，不接管整个召回。
+    - **没有实体命中 / 歧义且本群不能收成一个插件** → 与普通 `search_tools` 一致；
+    - 只按**当前消息**路由，不吃 L5 拼进来的历史原话；
+    - 至少留 1 个种子名额给通用最佳匹配，实体路由是加分项。
+    - ``ignore_surfaces``（唤醒词/人格名）从 ``route_text`` 剥掉再查表，避免把点名
+      当成游戏实体。
     """
-    from gsuid_core.ai_core.entity_index import plugins_in_text
+    from gsuid_core.ai_core.entity_index import strip_surfaces, plugins_in_text
 
-    routed = plugins_in_text(route_text)
+    scan = strip_surfaces(route_text, ignore_surfaces) if ignore_surfaces else route_text
+    routed = plugins_in_text(scan)
+    if not routed and scope_key:
+        routed = await _plugins_from_scope_ambiguity(scan, scope_key)
     if not routed:
-        return await search_tools(query=query, limit=limit, non_category=non_category, threshold=threshold)
+        return await search_tools(
+            query=query,
+            limit=limit,
+            non_category=non_category,
+            threshold=threshold,
+            exclude_names=exclude_names,
+        )
 
-    wide = await search_tools(query=query, limit=_ENTITY_ROUTE_RECALL, non_category=non_category, threshold=threshold)
+    wide = await search_tools(
+        query=query,
+        limit=_ENTITY_ROUTE_RECALL,
+        non_category=non_category,
+        threshold=threshold,
+        exclude_names=exclude_names,
+    )
     hits = [t for t in wide if _tool_plugin(t.name) in routed]
 
     # 命中插件一个工具都没进宽召回（被阈值砍掉了）→ 撤掉阈值再捞一次。
     # 插件归属已由实体索引**确定性**确认，不必再让一个按模型标定的语义阈值来否决它。
     if not hits:
         deep = await search_tools(
-            query=query, limit=_ENTITY_ROUTE_DEEP_RECALL, non_category=non_category, threshold=0.0
+            query=query,
+            limit=_ENTITY_ROUTE_DEEP_RECALL,
+            non_category=non_category,
+            threshold=0.0,
+            exclude_names=exclude_names,
         )
         hits = [t for t in deep if _tool_plugin(t.name) in routed]
 
     if not hits:
-        logger.debug(i18n_t("🧠 [Tools] 实体路由命中插件 {routed}，但该插件无工具可召回", routed=routed))
+        logger.debug(i18n_t("log.rag.tools_entity_routing_hit_plugin", routed=routed))
         return wide[:limit]
 
     max_routed = max(1, limit - 1)
@@ -386,7 +433,7 @@ async def search_tools_with_entity_routing(
 
     logger.debug(
         i18n_t(
-            "🧠 [Tools] 实体路由: {route_text!r} → 插件 {routed}，前置 {p0} 个种子",
+            "log.rag.tools_entity_routing_route",
             route_text=route_text,
             routed=routed,
             p0=len(hit_names),
@@ -409,16 +456,10 @@ def expand_tools_to_families(
 
     规则：
 
-    - **整族要么全进、要么不进**，避免把一个族截断成半个。排名第一的族即使超出
-      ``max_tools`` 也整族纳入——它是本轮语义最匹配的能力，必须完整可用。
-    - 后续族放不下整族时**跳过**（继续看下一个族），不再中断整个循环，
-      让排在后面的小族仍有机会补齐剩余预算。
+    - **整族要么全进、要么不进**，避免把一个族截断成半个；放不下整族就跳过该族。
+    - **所有族（含排名第一）都受 ``max_tools`` 约束**，防止超大插件族独占附加池。
     - **种子兜底席位**：族展开后仍未进池的**种子**，逐个补进来（至多 ``seed_seats`` 个），
-      宁可小幅超预算。种子是本轮的语义命中，**一个都不该被大族挤掉**：
-      ① 跨族提问（"看看我练度 + 这角色怎么提升"）要同时用到面板族与资料库族的工具，
-      资料库族整族放不下时，它命中的那几个种子必须仍然可用；
-      ② 否则超大族会独占附加池——``异环面板`` 族 9 个成员 > 上限 8，展开后预算耗尽，
-      鸣潮的面板工具永远召不回，AI 只能拿异环工具硬答"玄翎秧秧面板"。
+      宁可小幅超预算，保证语义命中工具仍可用。
     - 跨族去重，并排除 ``exclude_names``（通常是保底池工具名，避免重复）。
       未声明 capability_domain 的工具视为单工具族。
     """
@@ -448,8 +489,8 @@ def expand_tools_to_families(
         new_members = [ft for ft in family_tools if ft.name not in seen]
         if not new_members:
             continue
-        # out 为空 = 排名第一的族：不看预算整族纳入（与旧行为一致，不回退）。
-        if out and len(out) + len(new_members) > max_tools:
+        # 各族一律受 max_tools 约束；超大族由下方 seed_seats 保种子，避免单族吃满附加池。
+        if len(out) + len(new_members) > max_tools:
             continue
         for ft in new_members:
             seen.add(ft.name)
@@ -475,6 +516,7 @@ async def search_tools_by_domain(
     domain_limit: int = 3,
     per_domain_limit: int = 6,
     recall: int = 12,
+    exclude_names: Optional[Set[str]] = None,
 ) -> ToolList:
     """两段式·domain 粒度工具检索（Phase 3a）。
 
@@ -494,7 +536,8 @@ async def search_tools_by_domain(
     """
     from gsuid_core.ai_core.register import find_tool_base, get_tools_by_capability_domain
 
-    seeds = await search_tools(query=query, limit=recall, non_category=["self", "buildin", "meta"])
+    seeds = await search_tools(query=query, limit=recall, exclude_names=exclude_names)
+    skip = set(exclude_names or set())
 
     out: ToolList = []
     seen_names: Set[str] = set()
@@ -504,6 +547,8 @@ async def search_tools_by_domain(
     for seed in seeds:
         if slots_used >= domain_limit:
             break
+        if seed.name in skip:
+            continue
         tb = find_tool_base(seed.name)
         dom = tb.capability_domain if tb else None
         if dom:
@@ -513,9 +558,10 @@ async def search_tools_by_domain(
             slots_used += 1
             members = get_tools_by_capability_domain(dom)[:per_domain_limit]
             for m in members:
-                if m.name not in seen_names:
-                    seen_names.add(m.name)
-                    out.append(m.tool)
+                if m.name in seen_names or m.name in skip:
+                    continue
+                seen_names.add(m.name)
+                out.append(m.tool)
         else:
             if seed.name in seen_names:
                 continue
@@ -525,7 +571,7 @@ async def search_tools_by_domain(
 
     logger.info(
         i18n_t(
-            "🧠 [Tools] 两段式 domain 检索: query='{p0}' → {slots_used} 族/单工具, 共 {p1} 个工具",
+            "log.rag.tools_two_stage_domain_retrieval",
             p0=query[:30],
             slots_used=slots_used,
             p1=len(out),
@@ -541,7 +587,7 @@ def get_tools_by_context_tags(tags: List[str], max_count: int = 8) -> ToolList:
     当当前会话语境（群组画像标签）与之匹配时，自动加载该工具集。
 
     Args:
-        tags: 当前会话的语境标签，如 ["原神", "游戏"]
+        tags: 当前会话的语境标签，如 ["游戏", "资讯"]
         max_count: 返回工具数量上限
 
     Returns:
@@ -574,57 +620,36 @@ async def get_scope_context_tags(scope_key: str) -> List[str]:
 
         return await get_context_tags(scope_key)
     except Exception as e:
-        logger.debug(i18n_t("🧠 [Tools] 读取语境标签失败: {e}", e=e))
+        logger.debug(i18n_t("log.rag.tools_read_context_tag", e=e))
         return []
 
 
 async def get_main_agent_tools(query: str = "", exclude_categories: Optional[List[str]] = None) -> ToolList:
-    """获取主Agent的框架保底工具集。
+    """主 Agent 通道核（群/私同一份名单，见 MAIN_AGENT_CORE_TOOLS）。
 
-    `GUARANTEED_TOOL_CATEGORIES`（即 `self` + `buildin` 分类）下的工具
-    **无条件全部加载**，不受向量搜索影响——这些分类就是"框架保底工具池"，
-    覆盖搜索、记忆、自我认知、持久状态、好感度、子Agent、定时任务等基础能力。
-
-    判定一个工具是否为保底工具，完全取决于它注册时声明的 `category`，
-    不再依赖任何硬编码的工具名单。
-
-    `planning` / `by_trigger` / `common` / `media` / `mcp` 等分类的工具不在此函数加载，
-    而是通过状态驱动工具池（见 tool_state_signals）与 `search_tools()` 向量检索按需
-    加载，避免重型规划工具与插件工具膨胀浪费 Token。
+    发现 / 回想 / 委派 / 发送 / 一次性与周期提醒入口常驻。列出/改/删/暂停、
+    web_search、self 信息、命令执行不进核，由本句检索、find_tools、或 L2 补上。
 
     Args:
-        query: 保留参数（保底工具不再依赖 query 筛选），仅作签名兼容。
-        exclude_categories: 可选，按需从保底池再剔除的分类（保留给调用方做进一步精简）。
+        query: 保留参数，仅签名兼容。
+        exclude_categories: 再按注册分类剔除（调用方精简）。
     """
-    all_tools_cag = get_registered_tools()
+    from gsuid_core.ai_core.register import find_tool_base
+    from gsuid_core.ai_core.interaction_scaffold import MAIN_AGENT_CORE_TOOLS
+
     result_tools: ToolList = []
-
-    cats = [c for c in GUARANTEED_TOOL_CATEGORIES if not (exclude_categories and c in exclude_categories)]
-    for cat in cats:
-        if cat not in all_tools_cag:
+    seen: Set[str] = set()
+    for name in MAIN_AGENT_CORE_TOOLS:
+        if name in seen:
             continue
-        loaded = 0
-        skipped = 0
-        for tool_base in all_tools_cag[cat].values():
-            # O-B self 白名单：只有框架核心 self 工具才进保底池。
-            # 插件滥用 category="self" 的，降级走向量检索（search_tools 仍会召回）。
-            if cat == "self" and tool_base.name not in _SELF_CATEGORY_WHITELIST:
-                skipped += 1
-                continue
-            result_tools.append(tool_base.tool)
-            loaded += 1
-        if skipped:
-            logger.debug(
-                i18n_t(
-                    "🧠 [Tools] 保底分类 [{cat}] 加载 {loaded} 个工具，过滤掉 {skipped} 个非白名单工具",
-                    cat=cat,
-                    loaded=loaded,
-                    skipped=skipped,
-                )
-            )
-        else:
-            logger.debug(i18n_t("🧠 [Tools] 保底分类 [{cat}] 加载 {loaded} 个工具", cat=cat, loaded=loaded))
-
+        tb = find_tool_base(name)
+        if tb is None:
+            continue
+        if exclude_categories and tb.category in exclude_categories:
+            continue
+        seen.add(name)
+        result_tools.append(tb.tool)
+    logger.debug(i18n_t("log.rag.tools_fallback_category_cat", cat="kernel", loaded=len(result_tools)))
     return result_tools
 
 
@@ -636,6 +661,7 @@ async def search_tools(
     threshold: float = 0.38,
     debug: bool = False,
     rerank: bool = True,
+    exclude_names: Optional[Set[str]] = None,
 ) -> ToolList:
     """根据自然语言意图检索关联工具
 
@@ -650,6 +676,7 @@ async def search_tools(
         limit: 返回结果数量限制，默认为10
         category: 工具分类名称，可选值："buildin"、"default"、"common"、"all"，默认为"all", 也可传入列表
         non_category: 将不会在这个分类中找工具, 优先级比category高，可选值："self"、"buildin"、"common"，默认为空
+        exclude_names: 已暴露给模型的工具名，从候选剔除（核内工具改走检索时用）
         threshold: 相似度分数阈值，只有分数高于该值的工具才会被返回，默认为0.38
         debug: 是否启用调试模式，启用后会记录所有返回工具的分数（无论是否超过阈值），默认为False
         rerank: 是否启用 Reranker 二次精排（默认开）。仅当系统已启用 rerank 功能时实际生效。
@@ -668,11 +695,12 @@ async def search_tools(
     # 接 Reranker 时向量侧要多召回一些候选喂给精排；否则只取 limit 即可。
     do_rerank = rerank and is_enable_rerank()
     recall_limit = max(limit, _RERANK_RECALL_LIMIT) if do_rerank else limit
+    if exclude_names:
+        recall_limit = max(recall_limit, limit + len(exclude_names) + 8)
 
     logger.info(
         i18n_t(
-            "🧠 [Tools] 正在查询: {query}, threshold={threshold}, limit={limit},"
-            " recall={recall_limit}, rerank={do_rerank}, debug={debug}",
+            "log.rag.tools_querying_query_threshold",
             query=query,
             threshold=threshold,
             limit=limit,
@@ -683,7 +711,7 @@ async def search_tools(
     )
     vectors = list(await embedding_model.aembed([query]))
     if not vectors:
-        logger.warning(i18n_t("🧠 [Tools] 嵌入模型返回空结果，跳过工具向量检索"))
+        logger.warning(i18n_t("log.rag.tools_embedding_empty_result_skip"))
         return []
     query_vec = vectors[0]
 
@@ -708,7 +736,7 @@ async def search_tools(
         from .collection_migration import is_vector_structure_error
 
         if is_vector_structure_error(str(e)):
-            logger.warning(i18n_t("🧠 [Tools] 工具集合向量维度异常，尝试重建并重新同步: {e}", e=e))
+            logger.warning(i18n_t("log.rag.tools_collection_vector_dimension_fail", e=e))
             try:
                 await client.delete_collection(collection_name=TOOLS_COLLECTION_NAME)
             except Exception:
@@ -718,12 +746,10 @@ async def search_tools(
             try:
                 response = await _query_tools()
             except Exception as retry_e:
-                logger.warning(
-                    i18n_t("🧠 [Tools] 工具集合重建后仍查询失败，跳过向量工具检索: {retry_e}", retry_e=retry_e)
-                )
+                logger.warning(i18n_t("log.rag.tools_collection_fails_query_fail", retry_e=retry_e))
                 return []
         else:
-            logger.warning(i18n_t("🧠 [Tools] 工具向量检索失败，跳过向量工具检索: {e}", e=e))
+            logger.warning(i18n_t("log.rag.tools_vector_retrieval_skipping", e=e))
             return []
 
     tool_names: List[str] = []
@@ -744,7 +770,7 @@ async def search_tools(
                 all_scores_info.append(f"{name}={score:.4f}")
 
     if debug:
-        logger.debug(i18n_t("🧠 [Tools] 向量搜索所有工具分数(debug): {p0}", p0=", ".join(all_scores_info)))
+        logger.debug(i18n_t("log.rag.tools_vector_search_scores_debug", p0=", ".join(all_scores_info)))
 
     # 根据 category/non_category 过滤工具（non_category 优先级高于 category）
     all_tools_cag = get_registered_tools()
@@ -779,6 +805,11 @@ async def search_tools(
             if hidden_name in all_tools_dict:
                 del all_tools_dict[hidden_name]
 
+    if exclude_names:
+        for hidden_name in list(all_tools_dict.keys()):
+            if hidden_name in exclude_names:
+                del all_tools_dict[hidden_name]
+
     # 从 all_tools_dict 中筛选出 tool_names 中的候选（保持向量分数降序）。
     # all_tools_dict 的 value 是 ToolBase 对象（有 .tool / .description），也可能是 Tool 对象。
     candidates: List[Tuple[str, Any, float]] = []
@@ -802,8 +833,6 @@ async def search_tools(
             tools.append(tool_obj)
         filtered_info.append(f"{tool_name}({score:.4f})")
 
-    logger.info(
-        i18n_t("🧠 [Tools] 查询结果(category={category}): {p0}", category=category, p0=", ".join(filtered_info))
-    )
+    logger.info(i18n_t("log.rag.tools_query_result_category", category=category, p0=", ".join(filtered_info)))
 
     return tools

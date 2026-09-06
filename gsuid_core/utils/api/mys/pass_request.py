@@ -8,6 +8,7 @@ from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.utils.plugins_config.gs_config import pass_config
 
+from .api import VERIFY, BBS_VERIFY, VERIFICATION, BBS_VERIFICATION
 from .tools import get_ds_token
 from .base_request import BaseMysApi
 
@@ -44,7 +45,7 @@ class PassMysApi(BaseMysApi):
                                 msg = data["info"]
                             else:
                                 msg = f"错误码{data['code']}, 请检查API是否配置正确"
-                            logger.info(f"[upass] {msg}")
+                            logger.info(t("log.upass.response_error", message=msg))
                             return None, None
                         validate = data["data"]["validate"]
                         ch = data["data"]["challenge"]
@@ -54,7 +55,7 @@ class PassMysApi(BaseMysApi):
         return validate, ch
 
     async def _upass(self, header: Dict, is_bbs: bool = False) -> str:
-        logger.info(t("[upass] 进入处理..."))
+        logger.info(t("log.mys.upass_starting_processing"))
         if is_bbs:
             raw_data = await self.get_bbs_upass_link(header)
         else:
@@ -69,7 +70,7 @@ class PassMysApi(BaseMysApi):
         if vl:
             await self.get_header_and_vl(header, ch, vl, is_bbs)
             if ch:
-                logger.info(t("[upass] 获取ch -> {ch}", ch=ch))
+                logger.info(t("log.mys.upass_ch_obtained", ch=ch))
                 return ch
             else:
                 return ""
@@ -79,7 +80,7 @@ class PassMysApi(BaseMysApi):
     async def get_upass_link(self, header: Dict) -> Union[int, Dict]:
         header["DS"] = get_ds_token("is_high=false")
         return await self._mys_request(
-            url=self.MAPI["VERIFICATION_URL"],
+            url=VERIFICATION.get(),
             method="GET",
             header=header,
         )
@@ -87,7 +88,7 @@ class PassMysApi(BaseMysApi):
     async def get_bbs_upass_link(self, header: Dict) -> Union[int, Dict]:
         header["DS"] = get_ds_token("is_high=true")
         return await self._mys_request(
-            url=self.MAPI["BBS_VERIFICATION_URL"],
+            url=BBS_VERIFICATION.get(),
             method="GET",
             header=header,
         )
@@ -102,7 +103,7 @@ class PassMysApi(BaseMysApi):
             },
         )
         _ = await self._mys_request(
-            url=(self.MAPI["VERIFY_URL"] if not is_bbs else self.MAPI["BBS_VERIFY_URL"]),
+            url=(VERIFY.get() if not is_bbs else BBS_VERIFY.get()),
             method="POST",
             header=header,
             data={

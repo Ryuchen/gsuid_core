@@ -6,6 +6,7 @@ import time
 import uuid
 import random
 import asyncio
+import hashlib
 from abc import abstractmethod
 from string import digits
 from typing import Any, Dict, Tuple, Union, Literal, Optional, overload
@@ -22,11 +23,45 @@ from gsuid_core.utils.database.utils import SERVER as RECOGNIZE_SERVER, SR_SERVE
 from gsuid_core.utils.database.models import GsUID, GsUser
 from gsuid_core.utils.plugins_config.gs_config import pass_config
 
-from .api import _API
-from .tools import random_hex, mys_version, get_ds_token, generate_os_ds, generate_passport_ds
+from .api import (
+    GET_FP,
+    SAVE_DEVICE,
+    DEVICE_LOGIN,
+    ApiEndpoint,
+)
+from .tools import (
+    random_hex,
+    mys_version,
+    get_ds_token,
+    generate_os_ds,
+    get_web_ds_token,
+    generate_passport_ds,
+)
 
 _DEAD_CODE = [10035, 5003, 10041, 1034]
 ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+# game_name 中不对应 GsUser 游戏 UID 列的值（如米游社账号维度）
+_NON_GAME_UID_NAMES = frozenset({"account"})
+
+# 验证码 / 风控挑战头，按 game_name 区分
+_CHALLENGE_META: Dict[str, Dict[str, str]] = {
+    "gs": {
+        "x-rpc-challenge_game": "2",
+        "x-rpc-page": "v4.1.5-ys_#ys",
+        "x-rpc-tool-verison": "v4.1.5-ys",
+    },
+    "sr": {
+        "x-rpc-challenge_game": "6",
+        "x-rpc-page": "v1.4.1-rpg_#/rpg",
+        "x-rpc-tool-verison": "v1.4.1-rpg",
+    },
+    "zzz": {
+        "x-rpc-challenge_game": "8",
+        "x-rpc-page": "v1.0.14_#/zzz",
+        "x-rpc-tool-verison": "v1.0.14-zzz",
+    },
+}
 
 
 class BaseMysApi:
@@ -45,11 +80,14 @@ class BaseMysApi:
     }
     _HEADER_OS = {
         "x-rpc-app_version": "1.5.0",
-        "x-rpc-client_type": "4",
+        "x-rpc-client_type": "5",
         "x-rpc-language": "zh-cn",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/111.0.5563.116 Safari/537.36"
+        ),
     }
-    MAPI = _API
-    is_sr = False
     RECOGNIZE_SERVER = RECOGNIZE_SERVER
     chs = {}
 
@@ -108,7 +146,7 @@ class BaseMysApi:
         uid = await self.get_uid(uid, game_name)
         return await GsUser.get_user_stoken_by_uid(uid, game_name)
 
-    async def get_user_fp(self, uid: str, game_name: Optional[str] = None) -> Optional[str]:
+    async def get_user_fp(self, uid: str, game_name: Optional[str] = None) -> str:
         uid = await self.get_uid(uid, game_name)
         data = await GsUser.get_user_attr_by_uid(
             uid,
@@ -126,7 +164,7 @@ class BaseMysApi:
             )
         return data
 
-    async def get_user_device_id(self, uid: str, game_name: Optional[str] = None) -> Optional[str]:
+    async def get_user_device_id(self, uid: str, game_name: Optional[str] = None) -> str:
         uid = await self.get_uid(uid, game_name)
         data = await GsUser.get_user_attr_by_uid(
             uid,
@@ -143,15 +181,20 @@ class BaseMysApi:
         return data
 
     def check_os(self, uid: str, game_name: str = "gs") -> bool:
+        is_os = False
         if game_name == "gs" or game_name == "sr":
             is_os = False if int(str(uid)[0]) < 6 else True
         elif game_name == "zzz":
             is_os = False if len(str(uid)) < 10 else True
         return is_os
 
-    def get_server_id(self, uid: str, game_name: str = "gs") -> str:
+    def get_server_id(
+        self,
+        uid: str,
+        game_name: Optional[str] = "gs",
+    ) -> str:
         server_id = "prod_gf_cn"
-        if game_name == "gs":
+        if game_name == "gs" or game_name is None:
             server_id = self.RECOGNIZE_SERVER.get(str(uid)[0], "cn_gf01")
         elif game_name == "sr":
             server_id = SR_SERVER.get(str(uid)[0], "prod_gf_cn")
@@ -165,6 +208,15 @@ class BaseMysApi:
     def get_device_id(self) -> str:
         device_id = str(uuid.uuid4()).lower()
         return device_id
+
+    @staticmethod
+    def get_overseas_device_id(account_id: str) -> str:
+        return str(uuid.uuid3(uuid.NAMESPACE_URL, str(account_id))).lower()
+
+    @classmethod
+    def get_overseas_device_fp(cls, account_id: str) -> str:
+        device_id = cls.get_overseas_device_id(account_id)
+        return hashlib.md5(device_id.encode()).hexdigest()[:13]
 
     def generate_random_fp(self, length: int = 13) -> str:
         char = digits + "abcdef"
@@ -231,16 +283,16 @@ class BaseMysApi:
 
         HEADER = copy.deepcopy(self._HEADER)
         res = await self._mys_request(
-            url=self.MAPI["GET_FP_URL"],
+            url=GET_FP.get(),
             method="POST",
             header=HEADER,
             data=body,
         )
         if not isinstance(res, Dict):
-            logger.error(t("获取fp连接失败{res}", res=res))
+            logger.error(t("log.mys.fp_res_connect_fail", res=res))
             return random_hex(13).lower()
         elif res["data"]["code"] != 200:
-            logger.error(t("获取fp参数不正确{p0}", p0=res["data"]["msg"]))
+            logger.error(t("log.mys.incorrect_parameters_obtaining_fp", p0=res["data"]["msg"]))
             return random_hex(13).lower()
         else:
             return res["data"]["device_fp"]
@@ -269,83 +321,202 @@ class BaseMysApi:
         HEADER["Cookie"] = cookie
 
         await self._mys_request(
-            url=self.MAPI["DEVICE_LOGIN"],
+            url=DEVICE_LOGIN.get(),
             method="POST",
             header=HEADER,
             data=body,
         )
 
         await self._mys_request(
-            url=self.MAPI["SAVE_DEVICE"],
+            url=SAVE_DEVICE.get(),
             method="POST",
             header=HEADER,
             data=body,
         )
 
-    async def simple_mys_req(
+    async def endpoint_request(
         self,
-        URL: str,
-        uid: Union[str, bool],
-        params: Dict = {},  # noqa: B006
-        header: Dict = {},  # noqa: B006
+        endpoint: ApiEndpoint,
+        uid: str,
+        *,
+        method: Literal["GET", "POST"] = "GET",
+        params: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        header: Optional[Dict[str, Any]] = None,
         cookie: Optional[str] = None,
-        game_name: Optional[str] = None,
+        cookie_mode: Literal["OWNER", "RANDOM"] = "OWNER",
+        cookie_type: Literal["cookie", "stoken"] = "cookie",
+        game_name: Optional[str] = "gs",
+        ds_mode: Literal["auto", "web", "none"] = "auto",
+        ds_q: Optional[str] = None,
+        ds_body: Optional[Dict[str, Any]] = None,
     ) -> Union[Dict, int]:
-        if isinstance(uid, bool):
-            is_os = uid
-            server_id = (
-                ("cn_qd01" if is_os else "cn_gf01") if not self.is_sr else ("prod_gf_cn" if is_os else "prod_gf_cn")
-            )
-        else:
-            server_id = self.RECOGNIZE_SERVER.get(uid[0])
-            is_os = False if int(uid[0]) < 6 else True
-        ex_params = "&".join([f"{k}={v}" for k, v in params.items()])
-        if is_os:
-            _URL = self.MAPI[f"{URL}_OS"]
-            HEADER = copy.deepcopy(self._HEADER_OS)
-            HEADER["DS"] = generate_os_ds()
-        else:
-            _URL = self.MAPI[URL]
-            HEADER = copy.deepcopy(self._HEADER)
-            HEADER["DS"] = get_ds_token(ex_params if ex_params else f"role_id={uid}&server={server_id}")
-        HEADER.update(header)
+        """对 ``ApiEndpoint`` 发起一次带鉴权上下文的米游社请求。
+
+        封装国服/国际服差异与样板逻辑，业务方法只需关心「调哪个 endpoint、
+        传什么参数」，而不必重复拼 header / Cookie / DS / URL。
+
+        处理顺序大致为：
+
+        1. 用 ``check_os(uid, game_name)`` 判断区服；
+        2. 选择 ``_HEADER`` 或 ``_HEADER_OS``；
+        3. 注入 Cookie（显式传入 / 库内 cookie / stoken）；
+        4. 按 ``ds_mode`` 写入 ``DS``；
+        5. 合并调用方 ``header``；
+        6. ``url = endpoint.get(is_os)``，交给 ``_mys_request``。
+
+        Args:
+            endpoint: 成对的 CN/OS 地址（见 ``api.ApiEndpoint``）。
+            uid: 游戏 UID 或账号相关 id；用于区服判断与取 Cookie。
+            method: HTTP 方法，默认 ``GET``。
+            params: Query 参数。
+            data: JSON body（POST 等）；部分 GET 也会带 body。
+            header: 额外请求头，最后合并进默认 header（可覆盖 DS 等）。
+            cookie: 若给定则直接使用，不再查库。
+            cookie_mode: 查库取 cookie 时用 ``OWNER`` 还是 ``RANDOM``。
+            cookie_type:
+                - ``cookie``: ``get_ck``
+                - ``stoken``: ``get_stoken``（如桌面小组件）
+            game_name: 游戏维度，影响区服与 Cookie 查询（``gs`` / ``sr`` / ``zzz`` 等）。
+            ds_mode:
+                - ``auto``: 国际服用 ``generate_os_ds``；国服用
+                  ``get_ds_token(ds_q 或 params 拼串, ds_body 或 data)``
+                - ``web``: ``get_web_ds_token(True)``
+                - ``none``: 不自动写 DS（可在 ``header`` 里自行设置）
+            ds_q: 国服 DS 的 query 串；为 ``None`` 时由 ``params`` 自动拼接。
+            ds_body: 国服 DS 签名用的 body；为 ``None`` 时用 ``data``。
+
+        Returns:
+            成功时为米游社 JSON（``dict``，通常含 ``retcode`` / ``data``）；
+            失败时为错误码 ``int``（如 ``-51`` 无 Cookie，或上游 ``retcode``）。
+
+        Note:
+            底层 ``use_proxy`` 仍会随国际服传入，是否真正走代理取决于
+            ``_mys_request`` 的实现（当前可能尚未接线）。
+        """
+        if game_name is None:
+            game_name = "gs"
+        is_os = self.check_os(uid, game_name)
+        HEADER = copy.deepcopy(self._HEADER_OS if is_os else self._HEADER)
+
         if cookie is not None:
             HEADER["Cookie"] = cookie
-        elif "Cookie" not in HEADER and isinstance(uid, str):
-            ck = await self.get_ck(uid, "RANDOM", game_name)
+        else:
+            if cookie_type == "stoken":
+                ck = await self.get_stoken(uid, game_name)
+            else:
+                ck = await self.get_ck(uid, cookie_mode, game_name)
             if ck is None:
                 return -51
             HEADER["Cookie"] = ck
-        data = await self._mys_request(
-            url=_URL,
-            method="GET",
+
+        if ds_mode == "web":
+            HEADER["DS"] = get_web_ds_token(True)
+        elif ds_mode == "auto":
+            if is_os:
+                HEADER["DS"] = generate_os_ds()
+            else:
+                if ds_q is not None:
+                    q = ds_q
+                elif params:
+                    q = "&".join(f"{k}={v}" for k, v in params.items())
+                else:
+                    q = ""
+                body = ds_body if ds_body is not None else data
+                HEADER["DS"] = get_ds_token(q, body)
+
+        if header:
+            HEADER.update(header)
+
+        return await self._mys_request(
+            url=endpoint.get(is_os),
+            method=method,
             header=HEADER,
-            params=params if params else {"role_id": uid, "server": server_id},
-            use_proxy=True if is_os else False,
+            params=params,
+            data=data,
+            use_proxy=is_os,
             game_name=game_name,
         )
-        return data
+
+    async def simple_mys_req(
+        self,
+        endpoint: ApiEndpoint,
+        uid: str,
+        params: Dict = {},
+        header: Dict = {},
+        cookie: Optional[str] = None,
+        game_name: Optional[str] = None,
+    ) -> Union[Dict, int]:
+        """按游戏 UID 发起 GET 请求（自动判区服、拼 role_id/server）。
+
+        无游戏 UID、需显式指定区服时，请用 ``simple_mys_req_by_region``。
+        """
+        server_id = self.get_server_id(uid, game_name)
+        req_params = params if params else {"role_id": uid, "server": server_id}
+        return await self.endpoint_request(
+            endpoint,
+            uid,
+            method="GET",
+            params=req_params,
+            header=header or None,
+            cookie=cookie,
+            cookie_mode="RANDOM",
+            game_name=game_name,
+        )
+
+    async def simple_mys_req_by_region(
+        self,
+        endpoint: ApiEndpoint,
+        is_os: bool,
+        params: Dict = {},
+        header: Dict = {},
+        cookie: Optional[str] = None,
+        game_name: Optional[str] = None,
+    ) -> Union[Dict, int]:
+        """按显式区服发起 GET 请求（不依赖游戏 UID 自动判服）。
+
+        用于米游社账号查询等场景：没有可 ``check_os`` 的游戏 UID，
+        由调用方通过 ``is_os`` 指定国服（``False``）或国际服（``True``），
+        并自行提供 Cookie（``cookie`` 或 ``header``）。
+        """
+        HEADER = copy.deepcopy(self._HEADER_OS if is_os else self._HEADER)
+        if is_os:
+            HEADER["DS"] = generate_os_ds()
+        else:
+            ex_params = "&".join(f"{k}={v}" for k, v in params.items())
+            HEADER["DS"] = get_ds_token(ex_params)
+        HEADER.update(header)
+        if cookie is not None:
+            HEADER["Cookie"] = cookie
+        return await self._mys_request(
+            url=endpoint.get(is_os),
+            method="GET",
+            header=HEADER,
+            params=params,
+            use_proxy=is_os,
+            game_name=game_name,
+        )
 
     async def _mys_req_get(
         self,
-        url: str,
+        endpoint: ApiEndpoint,
         is_os: bool,
         params: Dict,
         header: Optional[Dict] = None,
+        game_name: Optional[str] = None,
     ) -> Union[Dict, int]:
+        _URL = endpoint.get(is_os)
         if is_os:
-            _URL = self.MAPI[f"{url}_OS"]
             HEADER = copy.deepcopy(self._HEADER_OS)
             use_proxy = True
         else:
-            _URL = self.MAPI[url]
             HEADER = copy.deepcopy(self._HEADER)
             use_proxy = False
         if header:
             HEADER.update(header)
 
         if "Cookie" not in HEADER and "uid" in params:
-            ck = await self.get_ck(params["uid"])
+            ck = await self.get_ck(params["uid"], game_name=game_name)
             if ck is None:
                 return -51
             HEADER["Cookie"] = ck
@@ -355,18 +526,32 @@ class BaseMysApi:
             header=HEADER,
             params=params,
             use_proxy=use_proxy,
+            game_name=game_name,
         )
         return data
 
     @overload
-    async def ck_in_new_device(self, uid: str, app_cookie: str) -> Tuple[str, str, str, str]: ...
+    async def ck_in_new_device(
+        self,
+        uid: str,
+        app_cookie: str,
+        game_name: Optional[str] = None,
+    ) -> Tuple[str, str, str, str]: ...
 
     @overload
     async def ck_in_new_device(
-        self, uid: str, app_cookie: Optional[str] = None
+        self,
+        uid: str,
+        app_cookie: Optional[str] = None,
+        game_name: Optional[str] = None,
     ) -> Optional[Tuple[str, str, str, str]]: ...
 
-    async def ck_in_new_device(self, uid: str, app_cookie: Optional[str] = None):
+    async def ck_in_new_device(
+        self,
+        uid: str,
+        app_cookie: Optional[str] = None,
+        game_name: Optional[str] = None,
+    ):
         data = await GsUser.base_select_data(stoken=app_cookie)
         device_id = self.get_device_id()
         seed_id, seed_time = self.get_seed()
@@ -377,18 +562,16 @@ class BaseMysApi:
             fp = await self.generate_fake_fp(device_id, seed_id, seed_time)
             device_info = "OnePlus/PHK110/OP2020L1"
         if app_cookie is None:
-            app_cookie = await self.get_stoken(uid)
+            app_cookie = await self.get_stoken(uid, game_name)
             if app_cookie is None:
-                return logger.warning(t("设备登录流程错误..."))
+                return logger.warning(t("log.mys.device_login_flow_fail"))
 
         if fp is None:
             fp = await self.generate_fake_fp(device_id, seed_id, seed_time)
 
         await self.device_login_and_save(device_id, fp, device_info, app_cookie)
-        if await GsUser.user_exists(uid, "sr" if self.is_sr else None):
-            await GsUser.update_data_by_uid_without_bot_id(
-                uid, "sr" if self.is_sr else None, fp=fp, device_id=device_id
-            )
+        if await GsUser.user_exists(uid, game_name):
+            await GsUser.update_data_by_uid_without_bot_id(uid, game_name, fp=fp, device_id=device_id)
         return fp, device_id, seed_id, seed_time
 
     async def _mys_request(
@@ -406,12 +589,10 @@ class BaseMysApi:
         if params:
             params = {k: str(v).lower() if isinstance(v, bool) else v for k, v in params.items()}
 
-        logger.debug(t("[米游社请求] BaseUrl: {base_url}", base_url=base_url))
-        logger.debug(t("[米游社请求] Url: {url}", url=url))
-        logger.debug(t("[米游社请求] Params: {params}", params=params))
-        logger.debug(t("[米游社请求] Data: {data}", data=data))
-
-        proxy = None
+        logger.debug(t("log.mys.baseurl_base_url", base_url=base_url))
+        logger.debug(t("log.mys.miyoushe_request_url", url=url))
+        logger.debug(t("log.mys.miyoushe_request_params", params=params))
+        logger.debug(t("log.mys.miyoushe_request_data", data=data))
 
         if not base_url:
             base_url = None
@@ -433,39 +614,55 @@ class BaseMysApi:
                 uid = data["role_id"]
             elif params and "uid" in params:
                 uid = params["uid"]
+            elif data and "uid" in data:
+                # 签到等 POST body 常用 uid 字段
+                uid = data["uid"]
 
             if uid is not None:
                 try:
-                    if "x-rpc-device_fp" not in header or "x-rpc-device_id" not in header:
-                        async with timeout(5):
-                            device_id = await self.get_user_device_id(
-                                uid,
-                                game_name,
-                            )
-                            header["x-rpc-device_fp"] = await self.get_user_fp(
-                                uid,
-                                game_name,
-                            )
-                            if device_id is not None:
-                                header["x-rpc-device_id"] = device_id
-
-                    dfp: Optional[str] = await GsUser.get_user_attr_by_uid(
-                        uid,
-                        "device_info",
-                        "sr" if self.is_sr else game_name,
-                    )
-                    if dfp is not None:
-                        df = dfp.split("/")
-                        header["User-Agent"] = (
-                            "Mozilla/5.0 (Linux; Android 13; "
-                            f"{df[1]} {df[3]} "
-                            "; wv)AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Version/4.0 Chrome/104.0.5112.97"
-                            "Mobile Safari/537.36 miHoYoBBS/2"
-                            f"{mys_version}"
+                    # game_name=account 表示米游社账号维度，uid 为 mys_id，
+                    # 不能按游戏 UID 列（会拼成 account_uid 导致 AttributeError）
+                    if game_name in _NON_GAME_UID_NAMES:
+                        account_id = str(uid)
+                        header.setdefault(
+                            "x-rpc-device_id",
+                            self.get_overseas_device_id(account_id),
                         )
+                        header.setdefault(
+                            "x-rpc-device_fp",
+                            self.get_overseas_device_fp(account_id),
+                        )
+                    else:
+                        if "x-rpc-device_fp" not in header or "x-rpc-device_id" not in header:
+                            async with timeout(5):
+                                device_id = await self.get_user_device_id(
+                                    uid,
+                                    game_name,
+                                )
+                                header["x-rpc-device_fp"] = await self.get_user_fp(
+                                    uid,
+                                    game_name,
+                                )
+                                if device_id is not None:
+                                    header["x-rpc-device_id"] = device_id
+
+                        dfp: Optional[str] = await GsUser.get_user_attr_by_uid(
+                            uid,
+                            "device_info",
+                            game_name,
+                        )
+                        if dfp is not None:
+                            df = dfp.split("/")
+                            header["User-Agent"] = (
+                                "Mozilla/5.0 (Linux; Android 13; "
+                                f"{df[1]} {df[3]} "
+                                "; wv)AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Version/4.0 Chrome/104.0.5112.97"
+                                "Mobile Safari/537.36 miHoYoBBS/2"
+                                f"{mys_version}"
+                            )
                 except asyncio.TimeoutError:
-                    logger.warning(t("[mhy_request] 获取DFP超时, 未知原因..."))
+                    logger.warning(t("log.mys.mhy_request_timeout_obtaining_dfp_fail"))
 
             logger.debug(header)
 
@@ -478,7 +675,6 @@ class BaseMysApi:
                         params=params,
                         json=data,
                         timeout=aiohttp.ClientTimeout(total=time_out),
-                        proxy=proxy,
                     ) as resp:
                         raw_data = await resp.json()
                 except aiohttp.ClientConnectionError:
@@ -505,9 +701,8 @@ class BaseMysApi:
                 # 做特殊处理
                 if retcode in _DEAD_CODE:
                     if uid:
-                        header["x-rpc-challenge_game"] = "6" if self.is_sr else "2"
-                        header["x-rpc-page"] = "v1.4.1-rpg_#/rpg" if self.is_sr else "v4.1.5-ys_#ys"
-                        header["x-rpc-tool-verison"] = "v1.4.1-rpg" if self.is_sr else "v4.1.5-ys"
+                        challenge_key = game_name if game_name in _CHALLENGE_META else "gs"
+                        header.update(_CHALLENGE_META[challenge_key])
 
                     if pass_config.get_config("MysPass").data:
                         pass_header = copy.deepcopy(header)
@@ -530,9 +725,12 @@ class BaseMysApi:
                             )
                         else:
                             q = ""
-                        header["DS"] = get_ds_token(q, data)
+                        if header.get("x-rpc-app_version") == "1.5.0":
+                            header["DS"] = generate_os_ds()
+                        else:
+                            header["DS"] = get_ds_token(q, data)
 
-                    logger.debug(t("[米游社请求] Header: {header}", header=header))
+                    logger.debug(t("log.mys.miyoushe_request_header", header=header))
                 elif retcode != 0:
                     return retcode
                 else:

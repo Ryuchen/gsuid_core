@@ -5,7 +5,7 @@
 
 修复面与测试对应：
 - ``_extract_report_blocks``：``<report>`` 制品块与角色台词分离（发送端解析）；
-- ``_report_footer``：制品图片统一免责/数据时点脚注（§3 合规垫层，不依赖用户偏好）；
+- ``_report_footer``：制品图片统一脚注（Agent 自主生成 + ``render_md_to_bytes`` 渲染溯源）；
 - ``SYSTEM_CONSTRAINTS``：persona prompt 教学输出契约；
 - ``execute_scheduled_task``：中性执行体（不注入 persona）+ 静默闸 + 溯源尾注。
 """
@@ -78,15 +78,18 @@ def test_plain_text_untouched() -> None:
 
 
 # ─────────────────────────────────────────────
-# _report_footer（§3 合规垫层）
+# _report_footer（生成来源 + 渲染入口溯源）
 # ─────────────────────────────────────────────
 
 
-def test_footer_contains_disclaimer_and_staleness() -> None:
+def test_footer_contains_agent_origin_and_render_fn() -> None:
     footer = _report_footer()
-    assert "仅供参考" in footer
-    assert "滞后" in footer
-    assert "不构成" in footer
+    assert "Agent" in footer
+    assert "自主生成" in footer
+    assert "render_md_to_bytes" in footer
+    # 不再附带投资/决策类免责声明
+    assert "不构成" not in footer
+    assert "投资" not in footer
 
 
 # ─────────────────────────────────────────────
@@ -95,12 +98,22 @@ def test_footer_contains_disclaimer_and_staleness() -> None:
 
 
 def test_system_constraints_teach_report_contract() -> None:
+    """system prompt 必须教「长信息走出图通道、禁 `<report>`」，并在工具后契约重申。
+
+    锁点说明：原先锁的小节名「重信息输出契约」已并入「事实 / 输出」，锁标题会随排版
+    改动误红。改锁**语义要素**：禁 `<report>`、指向 render 通道、出戏防线仍在。
+    """
     from gsuid_core.ai_core.persona.prompts import SYSTEM_CONSTRAINTS
+    from gsuid_core.ai_core.capability_agents.delegation_contracts import POST_TOOL_OUTPUT_CONTRACT
 
     assert "<report" in SYSTEM_CONSTRAINTS
-    assert "重信息输出契约" in SYSTEM_CONSTRAINTS
-    # 契约必须点名"表格/标题当台词=出戏"，否则模型没有理由改变行为
+    report_line = next((ln for ln in SYSTEM_CONSTRAINTS.splitlines() if "<report>" in ln), "")
+    assert any(word in report_line for word in ("禁", "不要", "不许")), report_line
+    assert "render" in SYSTEM_CONSTRAINTS.lower()
     assert "出戏" in SYSTEM_CONSTRAINTS
+    # 同一契约在工具后阶段重申（那里才有本轮工具返回的语境）
+    assert "<report>" in POST_TOOL_OUTPUT_CONTRACT
+    assert "render_agent" in POST_TOOL_OUTPUT_CONTRACT
 
 
 # ─────────────────────────────────────────────
@@ -132,8 +145,8 @@ def _make_task(**overrides) -> Any:
     fields = {
         "task_id": "scheduled_task_test01",
         "task_type": "once",
-        "user_id": "514971204",
-        "group_id": "914411529",
+        "user_id": "100000002",
+        "group_id": "200000001",
         "bot_self_id": "bot",
         "user_type": "group",
         "WS_BOT_ID": None,

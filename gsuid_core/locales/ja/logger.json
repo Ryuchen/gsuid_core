@@ -1,0 +1,22 @@
+{
+  "log.logger.exception_handler": "[エラー発生] {name}: {error}",
+  "log.logger.trace_end_event": "[TraceEnd] trace_id={trace_id} command={command} duration={duration_ms}ms logs={log_count}",
+  "log.logger.trace_jsonl_archive_id": "[TraceCollector] JSONL アーカイブに失敗しました trace_id={trace_id}: {e}",
+  "log.logger.trace_jsonl_running_write": "[TraceCollector] JSONL running マーカーの書き込みに失敗しました trace_id={trace_id}: {e}",
+  "log.logger.trace_max_traces_sacrificed": "[TraceCollector] 执行中追踪数达上限 {max_traces}，已强制回收 {sacrificed} 条活跃追踪以保证内存上界；通常意味着大量命令异常退出未正常结束追踪，请排查；如属正常高并发可调大 max_traces",
+  "log.logger.trace_scheduled_reclamation_fail": "[TraceCollector] 定期回収で異常が発生しました: {e}",
+  "log.logger.trace_scheduled_reclamation_removed_delete": "[TraceCollector] 定期回収によりゾンビトレース {dropped} 件を削除しました",
+  "log.logger.trace_start_event": "[TraceStart] trace_id={trace_id} command={command} user_id={user_id}",
+  "log.logger.tracecollector_exception": "[TraceCollector] 定时回收异常: {e}",
+  "log.logger.http_trace_jsonl_archive_id": "[HttpTraceCollector] JSONL アーカイブに失敗しました trace_id={trace_id}: {e}",
+  "log.logger.http_trace_jsonl_running_write": "[HttpTraceCollector] JSONL running マーカーの書き込みに失敗しました trace_id={trace_id}: {e}",
+  "log.logger.http_trace_max_traces_sacrificed": "[HttpTraceCollector] 実行中 HTTP トレースが上限 {max_traces} に達し、{sacrificed} 件を回収しました",
+  "log.logger.http_trace_scheduled_reclamation_removed_delete": "[HttpTraceCollector] 定期回収によりゾンビ HTTP トレース {dropped} 件を削除しました",
+  "log.logger.trace_jsonl_flush_retry": "トレース JSONL の書き込みに失敗したため再試行します",
+  "log.logger.trace_jsonl_flush_dropped": "トレース JSONL の書き込みに失敗し、バッチを破棄しました",
+  "log.logger.trace_jsonl_writer_crashed": "トレース JSONL 書き込みスレッドがクラッシュしました",
+  "log.logger.trace_jsonl_queue_full": "トレース JSONL キューが満杯のため {n} 行を破棄しました",
+  "log.logger.trace_jsonl_drain_queue_full": "トレース JSONL のシャットダウン排出時にキューが満杯のため join をスキップします",
+  "log.logger.trace_jsonl_missing_index": "トレースディレクトリに index.jsonl がないため shard を走査します（低速）: {path}",
+  "log.logger.unhandled_exception": "未処理の例外"
+}

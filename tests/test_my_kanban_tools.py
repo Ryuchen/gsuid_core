@@ -336,17 +336,9 @@ def test_resume_one_shot_kicks_root():
     root = _make_task(ordinal=1, goal="一次性", recurring_trigger=None)
     sub = _make_task(ordinal=1, node_kind="subtask", root_task_id="rt_1")
 
-    created_tasks = []
-
-    def fake_create_task(coro):
-        created_tasks.append(coro)
-        # 关闭 coroutine 避免 warning
-        try:
-            coro.close()
-        except Exception:
-            pass
-        return MagicMock()
-
+    # 注意：@ai_tools 装饰器自身用 asyncio.create_task+wait_for 包工具调用，
+    # 不能再全局 patch asyncio.create_task（会把装饰器的 task 换成 MagicMock 导致 await 崩）。
+    # 改为 patch kick_root：resume 内部 asyncio.create_task(kick_root(...)) 调度的是 mock 协程。
     with (
         patch(
             "gsuid_core.ai_core.planning.kanban_tools._resolve_subtask",
@@ -359,14 +351,16 @@ def test_resume_one_shot_kicks_root():
         patch(
             "gsuid_core.ai_core.planning.models.AIAgentTask",
         ) as mock_task,
+        patch(
+            "gsuid_core.ai_core.planning.kanban_executor.kick_root",
+            AsyncMock(return_value=None),
+        ) as mock_kick,
     ):
         mock_task.update_data_by_data = AsyncMock()
-        # 直接 patch asyncio.create_task（全局 asyncio 模块）
-        with patch("asyncio.create_task", side_effect=fake_create_task):
-            result = _run(resume_my_kanban_tree(ctx, "一次性"))
-            assert "已重新派发一次性" in result
-            mock_task.update_data_by_data.assert_called_once()
-            assert len(created_tasks) == 1
+        result = _run(resume_my_kanban_tree(ctx, "一次性"))
+        assert "已重新派发一次性" in result
+        mock_task.update_data_by_data.assert_called_once()
+        assert mock_kick.call_count == 1
     print("[OK] resume 一次性 → status=pending + kick_root")
 
 
@@ -396,6 +390,58 @@ def test_resume_periodic_arm_fails():
         assert "arm 失败" in result
         assert "冲突" in result
     print("[OK] resume 周期模板 arm 失败 → 错误提示")
+
+
+class _FakeKanbanTask:
+    def __init__(self, ordinal: int, name: str, group_id: Optional[str]) -> None:
+        self.id = f"id_{ordinal}"
+        self.ordinal = ordinal
+        self.display_name = name
+        self.group_id = group_id
+        self.status = "running"
+        self.updated_at = None
+        self.recurring_trigger = None
+        self.goal = name
+        self.agent_profile = None
+
+
+def test_other_group_and_private_tasks_masked() -> None:
+    import gsuid_core.ai_core.planning.context as ctx_mod
+
+    async def fake_list_for_owner(user_id: str, only_active: bool = True, root_only: bool = True) -> list:
+        return [
+            _FakeKanbanTask(36, "他群周期托管", "200000002"),
+            _FakeKanbanTask(37, "本群翻译任务", "200000003"),
+            _FakeKanbanTask(1, "调研跳槽公司名单", None),
+        ]
+
+    async def fake_get_task_tree(task_id: str) -> tuple:
+        return None, []
+
+    with (
+        patch.object(ctx_mod.AIAgentTask, "list_for_owner", fake_list_for_owner),
+        patch.object(ctx_mod.kanban_manager, "get_task_tree", fake_get_task_tree),
+    ):
+        text = _run(ctx_mod.build_task_context("100000001", current_group_id="200000003"))
+        assert "本群翻译任务" in text
+        assert "200000002" not in text
+        assert "他群周期托管" not in text
+        assert "跳槽" not in text
+        assert "其他会话" in text
+        priv = _run(ctx_mod.build_task_context("100000001", current_group_id=None))
+        assert "跳槽" in priv
+
+
+def test_has_actionable_task_scoped_by_group() -> None:
+    import gsuid_core.ai_core.planning.context as ctx_mod
+
+    async def fake_list_for_owner(user_id: str, only_active: bool = True, root_only: bool = True) -> list:
+        return [_FakeKanbanTask(1, "任务", "group_A")]
+
+    with patch.object(ctx_mod.AIAgentTask, "list_for_owner", fake_list_for_owner):
+        assert _run(ctx_mod.has_actionable_task("u1")) is True
+        assert _run(ctx_mod.has_actionable_task("u1", current_group_id="group_A")) is True
+        assert _run(ctx_mod.has_actionable_task("u1", current_group_id="group_B")) is False
 
 
 if __name__ == "__main__":

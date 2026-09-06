@@ -7,7 +7,7 @@ import importlib
 import subprocess
 import importlib.util
 from types import ModuleType
-from typing import Any, Set, Dict, List, Tuple, Union, TypeVar, Callable, Optional, overload
+from typing import Any, Set, Dict, List, Tuple, Union, Literal, TypeVar, Callable, Optional, overload
 from pathlib import Path
 from importlib import metadata
 from itertools import groupby
@@ -27,9 +27,9 @@ except ImportError:
 
 
 from gsuid_core.bot import _Bot
-from gsuid_core.i18n import t
+from gsuid_core.i18n import t, discover_and_register_plugin_locales
 from gsuid_core.config import core_config, plugin_config_store
-from gsuid_core.logger import logger
+from gsuid_core.logger import logger, hl_plugin
 from gsuid_core.gs_logger import GsLogger
 from gsuid_core.utils.plugins_config.gs_config import core_plugins_config
 
@@ -53,6 +53,70 @@ BUILDIN_PLUGIN_PATH = Path(__file__).parent / "buildin_plugins"
 
 if not PLUGIN_PATH.exists():
     PLUGIN_PATH.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass(frozen=True)
+class PluginKindMeta:
+    """发现期读到的基础设施插件元数据（早于 import，不能靠 Plugins()）。"""
+
+    kind: Literal["meta"]
+    provides: str
+    plugin_name: str
+
+
+def _read_pyproject_table(pyproject: Path) -> Optional[dict]:
+    """读插件 pyproject。读失败返回 None，由调用方决定是否仍当 meta。"""
+    try:
+        with open(pyproject, "r", encoding="utf-8") as fh:
+            raw: object = toml.loads(fh.read())
+    except (OSError, UnicodeDecodeError, toml.TomlDecodeError) as e:
+        logger.error(t("log.server.pyproject_parse_fail", pyproject=pyproject, error=e))
+        return None
+    if not isinstance(raw, dict):
+        logger.error(t("log.server.pyproject_parse_fail", pyproject=pyproject, error="root is not a table"))
+        return None
+    return raw
+
+
+def read_meta_plugin_info(plugin: Path) -> Optional[PluginKindMeta]:
+    """目录是 meta plugin 则返回元数据，否则 None。
+
+    识别：根目录 ``__meta_plugin__.py``，或 ``pyproject.toml`` 的
+    ``[tool.gsuid] kind = "meta"``。``provides`` 缺省为目录名。
+    """
+    if not plugin.is_dir():
+        return None
+
+    is_meta = (plugin / "__meta_plugin__.py").is_file()
+    provides = plugin.stem
+    pyproject = plugin / "pyproject.toml"
+    if pyproject.is_file():
+        toml_data = _read_pyproject_table(pyproject)
+        if toml_data is None:
+            if not is_meta:
+                return None
+        else:
+            tool = toml_data["tool"] if "tool" in toml_data and isinstance(toml_data["tool"], dict) else {}
+            gsuid = tool["gsuid"] if "gsuid" in tool and isinstance(tool["gsuid"], dict) else {}
+            kind = gsuid["kind"] if "kind" in gsuid else None
+            if kind == "meta":
+                is_meta = True
+            raw_provides = gsuid["provides"] if "provides" in gsuid else None
+            if isinstance(raw_provides, str) and raw_provides.strip():
+                provides = raw_provides.strip()
+
+    if not is_meta:
+        return None
+    return PluginKindMeta(kind="meta", provides=provides, plugin_name=plugin.stem)
+
+
+def should_load_plugin(plugin: Path, dev_mode: bool) -> bool:
+    """``--dev`` 只加载 ``*-dev`` 常规插件；基础设施插件始终加载。"""
+    if not dev_mode:
+        return True
+    if plugin.name.endswith("-dev"):
+        return True
+    return read_meta_plugin_info(plugin) is not None
 
 
 def normalize_name(name: str) -> str:
@@ -284,9 +348,30 @@ class GsServer:
                     )
         return module_list
 
+    @staticmethod
+    def resolve_plugin_path(plugin_name: str) -> Optional[Path]:
+        """按插件名解析磁盘路径：先 ``plugins/``，再 ``buildin_plugins/``。
+
+        支持目录插件与单文件插件（如 ``gs_test.py``）。热重载 ``reload_plugin`` 只传
+        字符串名，若不解析 buildin 路径，会先清理 SL/定时任务再因「插件不存在」加载失败，
+        导致 ``core_command`` 等内置插件从列表中消失直至重启。
+        """
+        for base in (PLUGIN_PATH, BUILDIN_PLUGIN_PATH):
+            candidate = base / plugin_name
+            if candidate.exists():
+                return candidate
+            single = base / f"{plugin_name}.py"
+            if single.is_file():
+                return single
+        return None
+
     def load_plugin(self, plugin: Union[str, Path], dev_mode: bool = False):
         if isinstance(plugin, str):
-            plugin = PLUGIN_PATH / plugin
+            resolved = self.resolve_plugin_path(plugin)
+            if resolved is None:
+                logger.warning(t("log.server.plugin_not_exist", plugin_name=plugin))
+                return f"❌ 插件{plugin}不存在!"
+            plugin = resolved
 
         if not plugin.exists():
             logger.warning(t("log.server.plugin_not_exist", plugin_name=plugin.name))
@@ -296,9 +381,21 @@ class GsServer:
         if plugin.stem.startswith("_"):
             return f'插件{plugin.name}包含"_", 跳过加载!'
 
-        logger.debug(t("log.server.importing_plugin", stem=plugin.stem))
-        logger.trace("===============")
+        logger.debug(t("log.server.importing_plugin", stem=hl_plugin(plugin.stem)))
+        logger.trace(t("log.server.plugin_import_separator"))
         try:
+            # 插件一等公民 i18n：在 import 前摄入 plugins/<Name>/locales/
+            # 词条不得进入框架 gsuid_core/locales，仅运行时合并。
+            if plugin.is_dir():
+                n_loc = discover_and_register_plugin_locales(plugin, plugin.stem)
+                if n_loc:
+                    logger.debug(
+                        t(
+                            "log.server.plugin_locales_loaded",
+                            name=hl_plugin(plugin.stem),
+                            count=n_loc,
+                        )
+                    )
             module_list = []
             if plugin.is_dir():
                 plugin_path = plugin / "__init__.py"
@@ -384,18 +481,47 @@ class GsServer:
 
         if _type == "plugin":
             name = filepath.parent.stem
-            logger.success(t("log.server.plugin_imported", name=name, duration=duration))
+            logger.success(t("log.server.plugin_imported", name=hl_plugin(name), duration=duration))
         elif _type == "single":
             name = filepath.stem
-            logger.success(t("log.server.plugin_imported", name=name, duration=duration))
+            logger.success(t("log.server.plugin_imported", name=hl_plugin(name), duration=duration))
         else:
             name = filepath.parent.stem
             if _type != "full":
-                logger.trace(t("log.server.module_imported", name=name, duration=duration))
+                logger.trace(t("log.server.module_imported", name=hl_plugin(name), duration=duration))
         _import_durations.append((name, duration))
 
         _module_cache[module_name] = module
         return module
+
+    def _import_module_list(self, modules: List[Tuple[str, Path, str]]) -> None:
+        for module_name, filepath, _type in modules:
+            try:
+                self.cached_import(module_name, filepath, _type)
+            except Exception as e:
+                logger.exception(t("log.server.plugin_import_fail", stem=filepath.stem, error=e))
+
+    def bind_loaded_meta_plugin(self, info: PluginKindMeta, modules: List[Tuple[str, Path, str]]) -> None:
+        """import 完一个 meta plugin 后挂 ``<目录名>.api`` 别名。"""
+        from gsuid_core.meta_plugins import bind_meta_plugin_facade
+
+        names = [module_name for module_name, _filepath, _typ in modules]
+        if bind_meta_plugin_facade(info.provides, info.plugin_name, names):
+            logger.info(
+                t(
+                    "log.server.meta_plugin_registered",
+                    plugin_name=info.plugin_name,
+                    provides=info.provides,
+                )
+            )
+            return
+        logger.warning(
+            t(
+                "log.server.meta_plugin_api_missing",
+                plugin_name=info.plugin_name,
+                provides=info.provides,
+            )
+        )
 
     async def load_plugins(self, dev_mode: bool = False):
         logger.info(t("log.server.load_start"))
@@ -414,29 +540,35 @@ class GsServer:
 
         # 阶段一：发现插件 + 收集缺失依赖（不立即安装）
         _discover_start = time.time()
-        all_plugins: List[Tuple[str, Path, str]] = []
+        meta_groups: List[Tuple[Path, List[Tuple[str, Path, str]], PluginKindMeta]] = []
+        regular_modules: List[Tuple[str, Path, str]] = []
         for plugin in plug_path_list:
-            if dev_mode and not plugin.name.endswith("-dev"):
+            if not should_load_plugin(plugin, dev_mode):
                 continue
 
-            d = self.load_plugin(plugin, dev_mode)
+            # 只有目录名带 -dev 才改模块名前缀，避免 meta 与 <name>-dev 抢同一 sys.modules 键
+            d = self.load_plugin(plugin, dev_mode and plugin.name.endswith("-dev"))
             if isinstance(d, str):
                 continue
-            all_plugins.extend(d)
+            info = read_meta_plugin_info(plugin)
+            if info is not None:
+                meta_groups.append((plugin, d, info))
+            else:
+                regular_modules.extend(d)
         logger.info(t("log.server.discover_done", elapsed=time.time() - _discover_start))
 
         # 阶段二：合并安装所有插件收集到的缺失依赖（一次性 pip 调用）
         flush_pending_installs()
 
-        # 阶段三：导入所有插件模块
+        # 阶段三：先 import 基础设施插件并挂短 import 别名，再 import 常规插件
         _import_start = time.time()
         _import_durations.clear()
-        for module_name, filepath, _type in all_plugins:
-            try:
-                self.cached_import(module_name, filepath, _type)
-            except Exception as e:
-                logger.exception(t("log.server.plugin_import_fail", stem=filepath.stem, error=e))
-                continue
+        if meta_groups:
+            logger.info(t("log.server.meta_plugin_import_start", count=len(meta_groups)))
+        for _plugin, modules, info in meta_groups:
+            self._import_module_list(modules)
+            self.bind_loaded_meta_plugin(info, modules)
+        self._import_module_list(regular_modules)
         logger.info(t("log.server.import_done", elapsed=time.time() - _import_start))
 
         # 启动耗时归因：输出导入最慢的插件 Top 10
@@ -445,7 +577,7 @@ class GsServer:
             total = sum(d for _, d in _import_durations)
             logger.info(t("log.server.import_slow_header", count=len(_import_durations), total=total))
             for name, dur in top:
-                logger.info(t("log.server.import_slow_item", dur=dur, name=name))
+                logger.info(t("log.server.import_slow_item", dur=dur, name=hl_plugin(name)))
 
         plugin_config_store.save_all()
         core_config.lazy_write_config()
@@ -797,7 +929,7 @@ def execute_cmd(cmd_list: List[str]):
     fix: 使用 list 传参且 shell=False，防止命令注入
     """
     cmd_str = " ".join(cmd_list)
-    logger.info(t("log.server.cmd_exec", cmd_str=cmd_str))
+    logger.info(t("log.server.cmd_str_cmd_str", cmd_str=cmd_str))
 
     try:
         # shell=False 是安全的默认值
@@ -806,8 +938,8 @@ def execute_cmd(cmd_list: List[str]):
             logger.success(t("log.server.cmd_success"))
             return 0, result.stdout
         else:
-            logger.warning(t("log.server.cmd_fail", code=result.returncode))
-            logger.warning(f"Stderr: {result.stderr}")
+            logger.warning(t("log.server.cmd_code_fail", code=result.returncode))
+            logger.warning(t("log.server.cmd_stderr", stderr=result.stderr))
 
             return result.returncode, result.stderr
     except Exception as e:

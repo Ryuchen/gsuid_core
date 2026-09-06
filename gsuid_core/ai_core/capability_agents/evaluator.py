@@ -35,15 +35,6 @@ _EVAL_TTL_SECONDS = 15 * 60
 _RECENT_EVALUATIONS_PER_OWNER = 4
 # 模糊匹配阈值：register goal 与 evaluate user_goal 的"重叠系数"≥ 0.30 视为同一组任务
 # 重叠系数 = |A ∩ B| / min(|A|, |B|)；选这个而非 Jaccard 是因为：register goal 通常
-# 是 evaluate user_goal 的"精炼版"或反过来（一个长一个短），用 Jaccard 会被长度差
-# 严重惩罚（同一组任务也只 0.15-0.25），用 overlap coefficient 不受长度影响。
-#
-# 阈值从 0.45 → 0.30（2026-05-24 调整）：原阈值挡住了"虚拟盘账户初始化"这种从一个
-# evaluate user_goal 派生出的"子任务级精简标题"——同组任务但分词重叠仅 0.30~0.40。
-# 实测会话 a5696b00 中"虚拟股票账户初始化（30万本金）"与原 evaluate user_goal
-# "虚拟股票投资模拟：初始化30万虚拟账户，每日A股开盘时段..."重叠正好在 0.30 区间。
-# 调到 0.30 后这类合法精简能命中；同时仍能挡住完全不同的主题（如把"画一张天气图"
-# 跟"虚拟盘"匹配上的 token 重叠会远低于 0.20）。
 _FUZZY_MIN_OVERLAP = 0.30
 
 # owner_user_id -> 最近 N 份评估结果列表（按时间倒序追加，超过 _RECENT_EVALUATIONS_PER_OWNER 滚动淘汰）
@@ -202,7 +193,7 @@ def get_recent_evaluation(
     if best is not None and best_score >= fuzzy_min_overlap:
         logger.debug(
             t(
-                "📋 [Kanban] evaluator 模糊匹配命中: overlap={best_score:.2f} owner={owner_user_id} target={p0}",
+                "log.ai.kanban_evaluator_fuzzy_match_hit",
                 best_score=best_score,
                 owner_user_id=owner_user_id,
                 p0=repr(user_goal[:30]),
@@ -232,7 +223,7 @@ _EVALUATOR_PROMPT = """你是「能力评估代理（capability_evaluator）」�
      周期性更新它 + 期末做汇总"的任务都属于此类，框架已具备完整能力
      （`record_*` 通用集合 + 业务画像分析能力 + Kanban 周期触发 + 子任务
      `not_before`），**必须 covered=true**。常见形态举例（不限于）：
-       - 资产模拟：虚拟盘 / 模拟交易 / 给 N 元让你管理 N 天后考察 / 模拟运营
+       - 资源模拟：给定预算 / 配额做 N 天运营演练 / 模拟经营
        - 健康打卡：每日体重 / 饮食 / 训练量记录 + 周月汇总
        - 学习计划：每日单词 / 课程打卡 + 阶段考核
        - 销售 / 项目追踪：每日跟进记录 + 周报 / 月报
@@ -271,11 +262,11 @@ _EVALUATOR_PROMPT = """你是「能力评估代理（capability_evaluator）」�
      - "每天早晚两次打卡" → `cron:0 8,21 * * *`
      - "每周一例会前" → `cron:0 9 * * 1`
      - "每天傍晚总结" → `cron:0 19 * * *`
-     - 用户提到行业特定时段（如证券开盘、医院门诊时间、餐饮翻台时间）→
-       按该行业实际时段写，如 A 股开盘可写 `cron:0,30 9-11,13-14 * * 1-5`。
-   **禁止**机械套用其它领域的时段——把"每天打卡"派进股票开盘时段、或把
-   "每开盘看盘"派进 8-21 点这种错配是判错的硬错误，应在 risk_notes 顶部首条
-   告警并给出推荐 cron。
+     - 用户提到行业特定时段（如医院门诊时间、餐饮翻台时间、营业窗口）→
+       按该行业实际时段写 cron，并在 risk_notes 说明假设。
+   **禁止**机械套用其它领域的时段——把"每天打卡"派进无关行业的营业窗口、或把
+   "仅某时段才有效"的任务套成全天 8-21 这类错配是判错的硬错误，应在 risk_notes
+   顶部首条告警并给出推荐 cron。
 3. 强专业域（医疗诊断、法律意见、实盘交易）框架既无外接工具又非"虚拟/模拟"
    任务时，按 §1 返回 covered=false 并在 risk_notes 说明原因。
 4. 子任务推荐应粒度合理（每个 1~3 个工具能跑完），并把可并发的标记为相互无依赖；
@@ -287,7 +278,7 @@ _EVALUATOR_PROMPT = """你是「能力评估代理（capability_evaluator）」�
 5. **不要**在 suggested_subtasks 里写"先用 web_search 查一下"这种万能兜底——那是
    research_agent 自己规划的事，不是你的拆解。
 6. **周期触发提示（必须）**：当用户描述包含"每天 / 每周 / 每隔 N / N 小时后 /
-   每开盘日 / 持续 / 定时"等周期触发关键词，**且** suggested_subtasks ≥ 2 个时：
+   每工作日 / 持续 / 定时"等周期触发关键词，**且** suggested_subtasks ≥ 2 个时：
 
    - **首选**：把推荐的 cron / interval **直接写在对应"周期阶段子任务" spec 的
      `params_hint.recurring_trigger` 字段里**（同时在 risk_notes 顶部首条说明"这条
@@ -375,8 +366,7 @@ def _build_evaluator_context(
             else "（无显式白名单，按 tool_query 动态检索）"
         )
         lines.append(f"- {p.node_id} | {p.display_name} | {p.when_to_use} | 工具: {tool_summary}")
-    # 能力域：直接读 ToolBase.capability_domain（已在 models.py 定义为属性），
-    # 不再用 getattr 兜底（LLM.md §1.4）
+    # 能力域：直接读 ToolBase.capability_domain（已在 models.py 定义为属性）， 不再用 getattr 兜底（AGENTS.md §1.4）
     from gsuid_core.ai_core.register import get_registered_tools
 
     cat_map = get_registered_tools()
@@ -459,7 +449,7 @@ def _parse_evaluator_output(
             data, end_idx = decoder.raw_decode(candidate)
             logger.warning(
                 t(
-                    "📋 [Kanban] evaluator 输出有冗余字符，已取首个 JSON 对象（{end_idx}/{p0} bytes）；原错误：{e}",
+                    "log.ai.kanban_evaluator_output_redundant_fail",
                     end_idx=end_idx,
                     p0=len(candidate),
                     e=e,
@@ -501,7 +491,6 @@ def _parse_evaluator_output(
 
 # evaluator 解析失败时的自动重试次数（共最多跑 _EVAL_MAX_ATTEMPTS 次）。
 # 解析失败本身是模型抖动（输出格式漂移），统一一次重试即可——主人格不该被推回
-# "评估失败 → 自己硬干" 的旁路，本字段是兜底闸刀。
 _EVAL_MAX_ATTEMPTS = 2
 
 
@@ -577,7 +566,7 @@ async def evaluate_capability(
         try:
             raw = await _run_evaluator_once(user_message, owner_user_id, extra_system)
         except Exception as e:
-            logger.exception(t("📋 [Kanban] 能力评估代理执行失败 attempt={attempt}: {e}", attempt=attempt, e=e))
+            logger.exception(t("log.ai.kanban_capability_evaluation_agent_fail", attempt=attempt, e=e))
             last_result = CapabilityEvaluationResult(
                 covered=False,
                 risk_notes=[f"评估代理执行抛出异常：{type(e).__name__}: {e}"],
@@ -593,8 +582,7 @@ async def evaluate_capability(
             record_evaluation(result)
             logger.info(
                 t(
-                    "📋 [Kanban] 能力评估完成 owner={owner_user_id} covered={p0}"
-                    " attempt={attempt} subtasks={p1} missing={p2}",
+                    "log.ai.kanban_capability_evaluation_owner_ok",
                     owner_user_id=owner_user_id,
                     p0=result.covered,
                     attempt=attempt,
@@ -607,7 +595,7 @@ async def evaluate_capability(
         last_result = result
         logger.warning(
             t(
-                "📋 [Kanban] 能力评估解析失败 owner={owner_user_id} attempt={attempt}，将{p0}。原始片段：{p1}",
+                "log.ai.kanban_capability_evaluation_parsing_fail",
                 owner_user_id=owner_user_id,
                 attempt=attempt,
                 p0="重试" if attempt < _EVAL_MAX_ATTEMPTS else "放弃",

@@ -36,6 +36,19 @@ def _auth_headers() -> Dict[str, str]:
     return {"X-Local-Test-Token": _LOCAL_TEST_TOKEN} if _LOCAL_TEST_TOKEN else {}
 
 
+def _send_msg_headers() -> Dict[str, str]:
+    """``/api/send_msg`` 需要 ``X-WS-Token``（与核心 ``WS_TOKEN`` 一致）。"""
+    headers = _auth_headers()
+    token = os.getenv("GSUID_WS_TOKEN") or os.getenv("WS_TOKEN") or ""
+    if not token:
+        from gsuid_core.config import core_config
+
+        token = str(core_config.get_config("WS_TOKEN") or "")
+    if token:
+        headers["X-WS-Token"] = token
+    return headers
+
+
 # ─────────────────────────────────────────────
 # Chat API
 # ─────────────────────────────────────────────
@@ -55,6 +68,9 @@ async def call_chat_with_history(
     group_id: Optional[str] = None,
     enable_tools: Optional[bool] = None,
     max_history: Optional[int] = None,
+    as_judge: Optional[bool] = None,
+    memory_eval: Optional[bool] = None,
+    clock_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """调用 ``/api/chat_with_history`` 接口。
 
@@ -98,6 +114,12 @@ async def call_chat_with_history(
     # 让端点把请求 history 真正喂进模型上下文（默认 None 不入 payload，端点仍按 0 = 原记忆评测行为）
     if max_history is not None:
         payload["max_history"] = max_history
+    if as_judge is not None:
+        payload["as_judge"] = as_judge
+    if memory_eval is not None:
+        payload["memory_eval"] = memory_eval
+    if clock_at is not None:
+        payload["clock_at"] = clock_at
 
     try:
         response = await client.post(url, json=payload, headers=_auth_headers(), timeout=timeout)
@@ -140,7 +162,7 @@ async def call_send_msg(
     }
 
     try:
-        response = await client.post(url, json=payload, headers=_auth_headers(), timeout=timeout)
+        response = await client.post(url, json=payload, headers=_send_msg_headers(), timeout=timeout)
         response.raise_for_status()
         return response.json()
     except httpx.TimeoutException:

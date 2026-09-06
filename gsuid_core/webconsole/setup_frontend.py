@@ -1,65 +1,9 @@
 import json
 from typing import Optional
-from pathlib import Path
-
-from fastapi.responses import FileResponse, HTMLResponse
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.data_store import DIST_PATH, DIST_EX_PATH
-
-# 常见文件扩展名到 MIME 类型的映射
-MIME_TYPES = {
-    # JavaScript
-    ".js": "application/javascript",
-    ".mjs": "application/javascript",
-    # CSS
-    ".css": "text/css",
-    # 图片
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-    ".svg": "image/svg+xml",
-    ".ico": "image/x-icon",
-    # 字体
-    ".woff": "font/woff",
-    ".woff2": "font/woff2",
-    ".ttf": "font/ttf",
-    ".eot": "application/vnd.ms-fontobject",
-    ".otf": "font/otf",
-    # 文档
-    ".html": "text/html",
-    ".htm": "text/html",
-    ".json": "application/json",
-    ".xml": "application/xml",
-    ".txt": "text/plain",
-    # 其他
-    ".wasm": "application/wasm",
-    ".map": "application/json",
-}
-
-
-def get_mime_type(file_path: Path) -> str:
-    """根据文件扩展名获取 MIME 类型"""
-
-    import mimetypes
-
-    suffix = file_path.suffix.lower()
-    mime_type = MIME_TYPES.get(suffix, None)
-
-    if mime_type is None:
-        # 尝试使用 mimetypes 模块
-        mime_type, _ = mimetypes.guess_type(str(file_path))
-        logger.debug(
-            t("[WebConsole] 文件 {file_path} 的 MIME 类型为 {mime_type}", file_path=file_path, mime_type=mime_type)
-        )
-
-    if mime_type is None:
-        mime_type = "application/octet-stream"
-
-    return mime_type
 
 
 def parse_version(version_str: str) -> tuple[int, ...]:
@@ -124,18 +68,23 @@ def _import_webconsole_apis() -> None:
         version_api,
         database_api,
         dashboard_api,
+        # 控制台 Live Chat 会话持久化
+        live_chat_api,
         scheduler_api,
         git_mirror_api,
         git_update_api,
+        http_trace_api,
         core_config_api,
         plugin_icon_api,
+        plugin_page_api,
+        http_agent_keys_api,
     )
 
     # —— AI API（拉起 AI 重依赖，仅在 AI 开启时导入）——
     from gsuid_core.ai_core.configs.ai_config import ai_config
 
     if not ai_config.get_config("enable").data:
-        logger.info(t("💻 [网页控制台] AI 总开关已关闭，跳过 AI 相关 API 路由导入（节省约 150MB 内存）"))
+        logger.info(t("log.webconsole.ai_api_mb_skip_import"))
         return
 
     from gsuid_core.webconsole import (  # noqa: F401
@@ -154,13 +103,18 @@ def _import_webconsole_apis() -> None:
         artifacts_api,
         image_rag_api,
         workspace_api,
+        # Agent 套件槽位 / Hook 总线 / 关系温度的只读治理
+        agent_kits_api,
         mcp_config_api,
         agent_debug_api,
         state_store_api,
+        tool_outputs_api,
         ai_statistics_api,
         ai_performance_api,
         knowledge_base_api,
         ai_session_logs_api,
+        # 运维诊断中心（Bot/Session/触发回放/配置快照等）
+        ops_diagnostics_api,
         provider_config_api,
         embedding_config_api,
         ai_scheduled_task_api,
@@ -170,7 +124,7 @@ def _import_webconsole_apis() -> None:
     )
 
 
-async def setup_frontend_b():
+async def setup_frontend_b() -> None:
     """Setup frontend static files and API routes"""
 
     """确保核心数据库表存在"""
@@ -179,18 +133,16 @@ async def setup_frontend_b():
 
         await ensure_core_database_tables()
     except Exception as e:
-        logger.warning(t("[数据库] 核心数据库表创建失败: {e}", e=e))
+        logger.warning(t("log.webconsole.create_fail", e=e))
 
     # 导入 app 对象
     from gsuid_core.webconsole.app_app import app
 
     # 导入所有 webconsole API 模块以注册路由。
-    # 这些模块部分会拉起 AI 核心等重依赖，原先在插件加载阶段同步执行严重阻塞启动，
-    # 现移至此处（由后台任务调用），不阻塞 WS 服务。
     try:
         _import_webconsole_apis()
     except Exception as e:
-        logger.exception(t("💻 [网页控制台] API 模块导入失败（部分路由可能不可用）: {e}", e=e))
+        logger.exception(t("log.webconsole.api_import_fail", e=e))
 
     dvj = DIST_PATH / "version.json"
     devj = DIST_EX_PATH / "version.json"
@@ -242,14 +194,14 @@ async def setup_frontend_b():
         dist_path = DIST_PATH
     else:
         # 两个目录都不存在或为空
-        logger.warning(t("💻 [网页控制台] DIST_PATH 和 DIST_EX_PATH 都不存在或为空"))
+        logger.warning(t("log.webconsole.dist_path_ex"))
         dist_path = DIST_PATH
 
     last_version = get_version_str(devj_version if dist_path == DIST_EX_PATH else dvj_version)
     # 最终结果日志
     logger.info(
         t(
-            "💻 [网页控制台] 使用前端路径: {dist_path}, 版本: {last_version}",
+            "log.webconsole.dist_path_last_version",
             dist_path=dist_path,
             last_version=last_version,
         )
@@ -263,61 +215,22 @@ async def setup_frontend_b():
         HOST = core_config.get_config("HOST")
         PORT = core_config.get_config("PORT")
 
-        logger.info(t("💻 [网页控制台] 准备挂载前端到 /app, 目录: {dist_path}", dist_path=dist_path))
+        logger.info(t("log.webconsole.app_dist_path", dist_path=dist_path))
 
-        # 使用 APIRouter 来托管前端
-        from fastapi import APIRouter
+        from gsuid_core.webconsole.static_serve import build_frontend_router
 
-        router = APIRouter()
+        app.include_router(build_frontend_router(dist_path), prefix="/app")
 
-        @router.get("/")
-        @router.get("/{path:path}")
-        async def serve_frontend(path: str = ""):
-            logger.info(t("💻 [网页控制台] 收到请求: /app/{path}", path=path))
+        logger.info(t("log.webconsole.apirouter_app"))
 
-            # 如果路径为空或只有 /，返回 index.html
-            if not path or path == "/":
-                index_path = dist_path / "index.html"
-                logger.info(t("💻 [网页控制台] 返回 index.html, 路径: {index_path}", index_path=index_path))
-                if index_path.exists():
-                    return FileResponse(index_path, media_type="text/html")
-
-            # 尝试作为文件提供
-            file_path = dist_path / path
-            logger.info(t("💻 [网页控制台] 尝试提供文件: {file_path}", file_path=file_path))
-            if file_path.exists() and file_path.is_file():
-                # 强制设置正确的 MIME 类型
-                mime_type = get_mime_type(file_path)
-                logger.info(
-                    t(
-                        "💻 [网页控制台] 强制设置 {file_path} MIME 类型: {mime_type}",
-                        file_path=file_path,
-                        mime_type=mime_type,
-                    )
-                )
-                return FileResponse(file_path, media_type=mime_type)
-
-            # 对于 SPA，返回 index.html 让前端路由处理
-            index_path = dist_path / "index.html"
-            logger.info(t("💻 [网页控制台] SPA fallback 返回 index.html"))
-            if index_path.exists():
-                return FileResponse(index_path, media_type="text/html")
-
-            return HTMLResponse("Not Found", status_code=404)
-
-        # 注册路由，添加 /app 前缀
-        app.include_router(router, prefix="/app")
-
-        logger.info(t("💻 [网页控制台] 已通过 APIRouter 挂载前端到 /app"))
-
-        logger.info(t("💻 [网页控制台] 尝试挂载WebConsole"))
+        logger.info(t("log.webconsole.webconsole"))
 
         if HOST == "localhost" or HOST == "127.0.0.1":
             _host = "localhost"
-            logger.warning(t("💻 WebConsole挂载于本地, 如想外网访问请修改data/config.json中host为0.0.0.0!"))
+            logger.warning(t("log.webconsole.webconsole_data_config_json_host"))
         else:
             _host = HOST
 
-        logger.success(t("💻 WebConsole挂载成功: http://{_host}:{PORT}/app", _host=_host, PORT=PORT))
+        logger.success(t("log.webconsole.webconsole_http_host_port_app_ok", _host=_host, PORT=PORT))
     else:
-        logger.warning(t("💻 [网页控制台] dist目录不存在 ({DIST_PATH}), 前端页面未挂载", DIST_PATH=DIST_PATH))
+        logger.warning(t("log.webconsole.dist_path", DIST_PATH=DIST_PATH))

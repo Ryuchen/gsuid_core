@@ -12,7 +12,9 @@
 
 设计原则：
 - 无 UUID：任务引用走自然语言句柄；artifact 是显式 ``res_xxx`` 句柄。
-- 权限：默认 owner / master 可操作；artifact 跨 root_task_id 严格隔离。
+- 权限：默认 owner / master 可操作；同树 ``artifact_get`` 自由互读；
+  跨树仅允许「同 owner+session/scope」或「当前任务 goal / input_artifact_ids 显式引用」。
+  （``create_subagent`` 叶子根彼此独立 root，调研→渲染接力依赖跨树放行。）
 """
 
 import re
@@ -30,10 +32,21 @@ from gsuid_core.ai_core.register import ai_tools
 
 from . import kanban
 from .models import AIAgentTask, AIAgentArtifact
-from .runtime import get_plan_context
+from .runtime import PlanRunContext, get_plan_context
 from .resolver import resolve_task_ref
 from .workspace import put_artifact
 from ..capability_agents.evaluator import _FUZZY_MIN_OVERLAP
+
+
+def visible_to_capability_only(ctx: RunContext[ToolContext]) -> bool:
+    """延迟导入，避免 ``kanban_tools`` ↔ ``buildin_tools.__init__`` 环。"""
+    from gsuid_core.ai_core.buildin_tools.visibility import visible_to_capability_only as _impl
+
+    return _impl(ctx)
+
+
+# res_ + 12 hex（与 AIAgentArtifact.id 工厂一致）
+_RES_ID_RE = re.compile(r"res_[0-9a-fA-F]{12}")
 
 _CAP = "长期任务编排"
 
@@ -42,36 +55,23 @@ _REGISTER_KANBAN_RECENT: Dict[str, List[float]] = {}
 _REGISTER_KANBAN_WINDOW_SEC = 60.0
 # 上限从 3 提到 5：每分钟 5 次仍能拦住"模型卡住反复重试"的死循环，但允许主人格
 # 在「子任务级 recurring 没合上的过渡期」一次性创建 2-3 棵相关任务树（如旧版"三棵
-# 树"模式临时存在的兼容场景）。同 evaluation 命中且语义合法的连续 register 不再
-# 误判为循环（见 ``_REGISTER_KANBAN_SAME_EVAL_EXEMPT``）。
 _REGISTER_KANBAN_LIMIT_IN_WINDOW = 5
-# "同 evaluation 短窗内的合法连续 register" 豁免：当一次 evaluate 已经成功命中、
+# "同 evaluation 短窗内的合法连续 register" 豁免：当一次 evaluate 已经成功命中
 # 当前 register 的 goal 跟最近一次 evaluate 重叠率超过阈值（沿用 evaluator 的
-# _FUZZY_MIN_OVERLAP）时，本次调用**不计入** rate-limit 窗口；否则计入。
-# 用于解决"主人格按 evaluator 输出顺序串行建多棵相关树时被无辜限流"的常见错杀。
 _REGISTER_KANBAN_SAME_EVAL_EXEMPT = True
 # same-eval 放宽上限（不再无限豁免）：合法多树够用，但 register→fail→register 失败环
 # 实测 9~11 次必被此上限钉死。修复前 same-eval 会跳过上限且不记时间戳→永久旁路（见 README B2）。
 _REGISTER_KANBAN_SAME_EVAL_LIMIT = 8
 
-# 限流诊断：每次 register 返回拒绝时把"原因短码"塞进 owner 的最近原因栈，
+# 限流诊断：每次 register 返回拒绝时把"原因短码"塞进 owner 的最近原因栈
 # 触发硬限流时按高频原因给出对症诊断（之前文案硬编码"recurring_trigger 反复传 null"
-# 误导主人格——实测 17ed4f85 真正原因是 evaluator 解析失败）。
-# 短码集合：
-#   "eval_miss"       - 找不到匹配的近期 evaluate（含模糊匹配失败）
-#   "eval_failed"     - 最近 evaluate covered=false
-#   "dup_active_root" - 同主题活跃根任务已存在
-#   "recurring_miss"  - goal 含周期意图但 recurring_trigger=None 且无 not_before
-#   "bad_args"        - 子任务字段非法（agent_profile 未注册 / not_before 非 ISO）
 _REGISTER_KANBAN_REJECT_REASONS: Dict[str, List[str]] = {}
 _REGISTER_KANBAN_REASON_KEEP = 6  # 每 owner 最多保留最近 N 条原因短码
 
 # 周期意图关键词：goal 含这些字眼但 recurring_trigger=None 时回警告
 # 不强制阻塞——主人 / 一次性"30 天后给我总账"也合法（一次性兜底）
-# 关键词是**域无关**的——既匹配通用日常表述（每天 / 每周一），也匹配各行业
-# 习惯说法（每开盘 / 每节课 / 每班次）；新增其它领域常见词只需追加 alt。
 _RECURRING_HINTS_RE = re.compile(
-    r"(每天|每日|每周|每月|每隔|每开盘|每节|每班|每场|每轮|"
+    r"(每天|每日|每周|每月|每隔|每营业日|每工作日|每节|每班|每场|每轮|"
     r"每[一二三四五六七八九十0-9]+(分钟|小时|天|周)|"
     r"持续\s*\d+\s*(天|周|月)|每.{0,6}次|周期|定时|recurring|每.{0,4}触发|每.{0,4}执行|"
     r"cron)",
@@ -184,9 +184,7 @@ class KanbanSubtaskSpec(BaseModel):
     )
 
 
-# ─────────────────────────────────────────────────────────────────────
 # 能力评估
-# ─────────────────────────────────────────────────────────────────────
 
 
 @ai_tools(category="common", capability_domain=_CAP)
@@ -194,7 +192,7 @@ async def evaluate_agent_mesh_capability(
     ctx: RunContext[ToolContext],
     user_goal: str,
 ) -> str:
-    """调用内部 capability_evaluator，对复合多代理任务做"现有能力是否覆盖"评估。
+    """查询内部能力网格，评估复合多代理任务现有能力是否覆盖。
 
     必须在 register_kanban_task 之前调用。返回结构化 JSON（已字符串化）：
     - covered: bool
@@ -242,9 +240,7 @@ async def evaluate_agent_mesh_capability(
     return json.dumps(result.to_dict(), ensure_ascii=False)
 
 
-# ─────────────────────────────────────────────────────────────────────
 # 注册任务树
-# ─────────────────────────────────────────────────────────────────────
 
 
 @ai_tools(category="planning", capability_domain=_CAP)
@@ -257,7 +253,7 @@ async def register_kanban_task(
     recurring_until: Optional[str] = None,
     confirm_one_shot: bool = False,
 ) -> str:
-    """注册一棵 Kanban 任务树（主任务 + N 个子任务节点）。
+    """创建一棵 Kanban 任务树（主任务 + N 个子任务节点）。
 
     **⚠️ 周期任务请直接传 `recurring_trigger`（cron / interval 两种格式），
     不要枚举 add_once_task —— 后者一定撞 20 个待执行任务硬上限。**
@@ -281,9 +277,7 @@ async def register_kanban_task(
 
     **周期触发示范**（最容易被错走 add_once_task 枚举的场景）：
 
-        # 「持久化状态 + 周期更新 + 最终汇总」三棵树模板（与具体业务无关）：
-        # ⓐ 一次性初始化主集合 → ⓑ 周期模板每个触发点执行一次更新 → ⓒ 截止日
-        # 一次性汇总。cron 表达式按用户描述的时段写，下例只是示意结构。
+        # 「持久化状态 + 周期更新 + 最终汇总」三棵树模板（与具体业务无关）： ⓐ 一次性初始化主集合 → ⓑ
 
         register_kanban_task(  # ⓐ 一次性：建好任务要维护的 record 主集合
             goal="<任务简称> 状态初始化",
@@ -307,27 +301,26 @@ async def register_kanban_task(
             goal="<任务简称> 最终汇总",
             subtasks=[
                 {"description": "record_list 拉流水 + record_summary 算关键指标 "
-                                "→ render_markdown_to_image 出报告",
+                                "→ create_subagent(render_agent) 出报告图",
                  "agent_profile": "internal_reporter",
                  "not_before": "<结算时刻 ISO>"},
             ],
         )
         # ⚠ 禁忌：① 把"初始化"塞进周期模板——每次开火都会清空主集合；
-        #         ② 用 20 个 add_once_task 枚举每个触发点——撞 20 个任务硬上限；
-        #         ③ 在主人格侧自己写决策循环——必须用 Kanban 周期模板由框架克隆。
+        # ② 用 20 个 add_once_task 枚举每个触发点——撞 20 个任务硬上限；
 
     Args:
         goal: 任务树总目标。
         subtasks: 子任务描述列表（KanbanSubtaskSpec 结构）。
         broadcast_to_group: 是否允许把进展播报到当前群。
         recurring_trigger: 周期触发规则，留空表示一次性任务。**只要用户描述含
-            "每 / 每天 / 每隔 / 每开盘日 / 持续 N 天"等周期意图，必须传本字段**——
+            "每 / 每天 / 每隔 / 每工作日 / 持续 N 天"等周期意图，必须传本字段**——
             不要外挂 add_once_task / add_interval_task。格式：
             - ``"interval:<seconds>"``（最小 60 秒，防过密）
             - ``"cron:<minute> <hour> <day> <month> <day_of_week>"``（标准 5 段 cron）
         recurring_until: 周期模式下的失效时间（ISO 字符串，如 "2026-06-21T15:00:00"）；
             留空表示不过期，需主人手动 disarm。
-        confirm_one_shot: **跳过周期意图强校验的逃生口**。当 goal 含 "每天 / 每开盘 /
+        confirm_one_shot: **跳过周期意图强校验的逃生口**。当 goal 含 "每天 / 每工作日 /
             每隔" 等周期关键词、但你确认就是要"立刻一次性"执行（如"现在演示一次每日
             体检流程"）、且你不需要周期托管时，传 True 跳过强校验。**绝大多数情况
             下不要传 True**——周期任务一律应当走 `recurring_trigger`；只是想延迟
@@ -343,10 +336,6 @@ async def register_kanban_task(
 
     # 0) 循环防护：60 秒内同 owner 调用本工具 ≥ N 次直接拒绝（默认 5）。
     # 用户案例（2026-05-24 session 7a29c54d）显示主人格因模型 schema 误解反复
-    # register_kanban_task(recurring_trigger=None) → fail_task_tree → 再 register，
-    # 框架必须把闸刀拉死，否则一直产生孤儿子任务 + 大量 relay 会话日志。
-    # 但"同一次 evaluation 触发的多次合法 register"（如串行建几棵相关任务树）
-    # 不应计入窗口——见下方 same-eval 豁免逻辑。
     owner_id = str(ev.user_id)
     now = time.time()
     history = [t for t in _REGISTER_KANBAN_RECENT.get(owner_id, []) if now - t <= _REGISTER_KANBAN_WINDOW_SEC]
@@ -410,10 +399,8 @@ async def register_kanban_task(
             "禁止创建任务树。请如实告诉主人缺什么。"
         )
 
-    # 1.5) 重复根任务防护：owner 名下若已存在"活跃且 goal 文本高重叠"的根任务，
-    # 直接拒绝新建，引导主人格走 respawn / fail_task_tree。实测会话 b8cf57ca 一次
-    # 对话里连开了任务#1（3 子任务）和任务#5（1 子任务）两棵同主题长期任务树，
-    # 任务#5 是任务#1 的子集；主人看到看板时有两条根条目，状态错乱。
+    # 1.5) 重复根任务防护：owner 名下若已存在"活跃且 goal 文本高重叠"的根任务， 直接拒绝新建，
+    # 实测会话 b8cf57ca 一次
     own_toks = _tokenize_for_overlap(goal)
     if own_toks:
         active_roots = await AIAgentTask.list_for_owner(owner_id, only_active=True, root_only=True)
@@ -438,16 +425,8 @@ async def register_kanban_task(
                     "请等周期触发或在 webconsole 手动 kick。"
                 )
 
-    # 1.6) 周期意图强校验：goal 含周期关键词，但根级 recurring_trigger=None、
-    # 所有子任务也都没带 `not_before`、且没有任何子任务带 `recurring_trigger` 时
-    # ——直接拒绝。早先版本仅给软警告就允许创建，导致实测会话 17ed4f85 中
-    # "虚拟盘每日看盘"在周日（非开盘日）被立刻派给 stock_agent 执行了一次错误
-    # 交易决策。
-    # 这里通用拦截"看起来要周期执行但忘了表达周期"的所有领域（股票 / 健康打卡 /
-    # 学习计划 / 销售追踪等都受益）。**新版子任务级 `recurring_trigger`** 也算合法
-    # 表达——只要任意子任务带 recurring_trigger 即视为已配置周期，不再拒绝。
-    # 主人格如果确实想"立刻一次性"演示一次周期任务的单轮流程，应显式传
-    # `confirm_one_shot=True` 跳过校验。
+    # 1.6) 周期意图强校验：goal 含周期关键词，但根级 recurring_trigger=None、 所有子任务也都没带 `not_before`
+    # 且没有任何子任务带 `recurring_trigger` 时
     _has_subtask_recurring = any((s.recurring_trigger or "").strip() for s in subtasks)
     if (
         not recurring_trigger
@@ -458,7 +437,7 @@ async def register_kanban_task(
     ):
         _record_register_reject(owner_id, "recurring_miss")
         return (
-            "⚠️ goal 含周期意图关键词（每天 / 每隔 / 每开盘 / 持续 N 天 / cron 等），"
+            "⚠️ goal 含周期意图关键词（每天 / 每隔 / 每工作日 / 持续 N 天 / cron 等），"
             "但 `recurring_trigger=None`、也没有任何子任务带 `recurring_trigger`、"
             "且每个子任务都没设 `not_before`——这棵树会**立刻**派出所有子任务执行"
             "**一次**，与你描述的周期语义不符。\n\n"
@@ -641,7 +620,6 @@ async def register_kanban_task(
 
     # 4.5) 子任务级 not_before 唤醒：把"未到点"的子任务挂上 APScheduler 单次
     # 定时器，到点 kick_root 一次。本根任务下多个子任务有 not_before 时每个都挂
-    # 一个独立 job，按各自时间点轮流唤醒，互不影响。
     for child in children:
         if child.not_before is not None:
             schedule_not_before_wakeup(child.id, root.id, child.not_before)
@@ -687,9 +665,7 @@ async def register_kanban_task(
     return text
 
 
-# ─────────────────────────────────────────────────────────────────────
 # 重派 / 整树失败 / 审批
-# ─────────────────────────────────────────────────────────────────────
 
 
 async def _resolve_subtask(ev, subtask_ref: str) -> Optional[AIAgentTask]:
@@ -740,10 +716,10 @@ async def respawn_subtask(
     new_params: Optional[Dict[str, Any]] = None,
     new_agent_profile: Optional[str] = None,
 ) -> str:
-    """复活某个 failed 子任务并重派执行。
+    """加载并重新派发某个 failed 子任务。
 
     Args:
-        subtask_ref: 子任务引用句柄；形如 "炒股周报#sub2" 或 "#sub2"（默认取最近根任务）。
+        subtask_ref: 子任务引用句柄；形如 "周报任务#sub2" 或 "#sub2"（默认取最近根任务）。
         new_description: 修正后的任务描述（覆盖原 goal）。
         new_params: 修正后的参数（覆盖 params_override）。
         new_agent_profile: 改派给其它 profile（必须已注册）。
@@ -781,10 +757,10 @@ async def respawn_subtask(
 
 @ai_tools(category="planning", capability_domain=_CAP)
 async def fail_task_tree(ctx: RunContext[ToolContext], task_ref_text: str, reason: str) -> str:
-    """主人格明确判断整棵任务树不应继续时调用：根任务 failed + 级联 failed 未完成子任务。
+    """停掉整棵任务树：根任务 failed，并级联 failed 未完成子任务。
 
     Args:
-        task_ref_text: 任务自然语言引用（如 "炒股周报""第3个"）。
+        task_ref_text: 任务自然语言引用（如 "周报任务""第3个"）。
         reason: 终结原因，会写入 failure_reason 与日志。
     """
     ev = ctx.deps.ev
@@ -815,9 +791,7 @@ async def fail_task_tree(ctx: RunContext[ToolContext], task_ref_text: str, reaso
 # （统一审批中心 kanban_subtask 领域），本模块不再注册专用转达工具。
 
 
-# ─────────────────────────────────────────────────────────────────────
 # Artifact Hub 工具
-# ─────────────────────────────────────────────────────────────────────
 
 
 @ai_tools(category="planning", capability_domain="产物")
@@ -829,7 +803,7 @@ async def artifact_put(
     artifact_kind: str = "output",
     file_path: str = "",
 ) -> str:
-    """登记一个产出 artifact（仅在 Kanban / ad-hoc 任务执行上下文中有效）。
+    """写入一个产出 artifact（仅在 Kanban / ad-hoc 任务执行上下文中有效）。
 
     自动绑定当前 root_task_id / task_id；返回 res 句柄供下游引用。
 
@@ -872,12 +846,7 @@ async def artifact_put(
         file_path_obj = Path(file_path)
         # 错误用法预警：同时传 payload + file_path 时只走 file_path 分支
         if payload:
-            logger.warning(
-                i18n_t(
-                    "📋 [Kanban] artifact_put 同时收到 payload 和 file_path，"
-                    "按 file_path 模式登记真实文件，payload 会被丢弃。"
-                )
-            )
+            logger.warning(i18n_t("log.ai.kanban_artifact_put_payload_file"))
 
     art = await put_artifact(
         payload=payload,
@@ -907,26 +876,42 @@ async def artifact_put(
     return f"✅ 已登记 artifact: {art.id}（{art.size_bytes} bytes，mime={art.mime}）{binary_hint}"
 
 
-@ai_tools(category="planning", capability_domain="产物")
+@ai_tools(category="planning", capability_domain="产物", visible_when=visible_to_capability_only)
 async def artifact_get(
     ctx: RunContext[ToolContext],
     res_id: str,
+    offset: int = 0,
+    limit: int = 8000,
 ) -> str:
-    """按 res 句柄取回某 artifact 的内容（同 root_task_id 才允许跨任务读取）。"""
+    """按 res 句柄取回 artifact 内容（支持分页以避免大件截断）。
+
+    长文按 **字符** offset/limit 分页；返回文首含【读窗口】与续读 offset。
+    续读请用上一页提示的 next offset，勿一直 offset=0。
+
+    访问策略：
+    - 同 ``root_task_id``：放行（多步 Kanban 兄弟节点互读）。
+    - 跨树：仅当当前任务显式引用该句柄（goal / ``input_artifact_ids``），
+      或源树与当前任务同 owner 且同 session（否则同 scope）——覆盖
+      ``create_subagent(调研)`` → ``create_subagent(render_agent)`` 接力。
+    - 无 plan 上下文（主人格）：按当前用户是否为源树 owner 校验。
+    """
     plan_ctx = get_plan_context()
     art = await AIAgentArtifact.get_by_id(res_id)
     if art is None:
         return f"⚠️ artifact 不存在: {res_id}"
-    if plan_ctx is not None and plan_ctx.root_task_id and art.root_task_id != plan_ctx.root_task_id:
+    allowed = await _artifact_access_allowed(art=art, plan_ctx=plan_ctx, ctx=ctx)
+    if not allowed:
         logger.warning(
             i18n_t(
-                "📋 [Kanban] 拒绝跨树读取 artifact: req_root={p0} art_root={p1}",
-                p0=plan_ctx.root_task_id,
+                "log.ai.kanban_rejected_cross_tree",
+                p0=getattr(plan_ctx, "root_task_id", None) or "-",
                 p1=art.root_task_id,
             )
         )
         return "⚠️ 该 artifact 属于其它任务树，跨树读取被拒绝。"
-    return _format_artifact(art)
+    lim = max(1, min(int(limit), 32000))
+    off = max(0, int(offset))
+    return _format_artifact(art, offset=off, limit=lim)
 
 
 @ai_tools(category="planning", capability_domain="产物")
@@ -958,7 +943,7 @@ async def artifact_get_recent(
 
     主人追问"为什么这样选 / 基于什么数据决定"时调用本工具，把专职代理留下的
     完整原文拿回来再用角色口吻转告主人；**严禁**自己重新 web_search /
-    search_knowledge 拼凑一个新理由——那不是当时做决定的依据，会与原文矛盾。
+    search_cognition 拼凑一个新理由——那不是当时做决定的依据，会与原文矛盾。
 
     `task_ref_text` 留空时取主人最近活跃的根任务；传自然语言引用时按引用解析。
 
@@ -985,9 +970,63 @@ async def artifact_get_recent(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────
 # helpers
-# ─────────────────────────────────────────────────────────────────────
+
+
+def extract_res_ids(text: str) -> List[str]:
+    """从任务描述中抽取 ``res_`` 句柄（去重、保序）。"""
+    if not text:
+        return []
+    return list(dict.fromkeys(_RES_ID_RE.findall(text)))
+
+
+async def _artifact_access_allowed(
+    *,
+    art: AIAgentArtifact,
+    plan_ctx: PlanRunContext | None,
+    ctx: RunContext[ToolContext],
+) -> bool:
+    """判断当前调用方是否可读该 artifact。
+
+    安全边界：不向其它用户的任务树泄密；允许同一主人会话内显式句柄接力。
+    """
+    # —— 主人格 / 无 Kanban 上下文 ——
+    if plan_ctx is None or not plan_ctx.root_task_id:
+        ev = ctx.deps.ev
+        if ev is None:
+            return True
+        source = await AIAgentTask.get_by_id(art.root_task_id)
+        if source is None or not source.owner_user_id:
+            return True
+        return str(ev.user_id) == str(source.owner_user_id)
+
+    # —— 同树 ——
+    if art.root_task_id == plan_ctx.root_task_id:
+        return True
+
+    current = await AIAgentTask.get_by_id(plan_ctx.task_id)
+    if current is None:
+        return False
+
+    # 显式交接：input_artifact_ids 或 goal 正文里写了该 res_
+    inputs = current.input_artifact_ids
+    if isinstance(inputs, list) and art.id in inputs:
+        return True
+    if art.id and art.id in current.goal:
+        return True
+
+    # 同 owner 叶子根接力（create_subagent 连续两次）
+    source = await AIAgentTask.get_by_id(art.root_task_id)
+    if source is None:
+        return False
+    if not current.owner_user_id or current.owner_user_id != source.owner_user_id:
+        return False
+    if current.session_id and source.session_id:
+        return current.session_id == source.session_id
+    if current.scope_key and source.scope_key:
+        return current.scope_key == source.scope_key
+    # 同 owner 且缺少 session/scope 元数据时仍放行（兼容旧行）
+    return True
 
 
 async def _resolve_root_task_id(ctx: RunContext[ToolContext], task_ref_text: str) -> Optional[str]:
@@ -1007,19 +1046,34 @@ async def _resolve_root_task_id(ctx: RunContext[ToolContext], task_ref_text: str
     return actives[0].id if actives else None
 
 
-def _format_artifact(art: AIAgentArtifact) -> str:
-    head = f"artifact {art.id} | kind={art.artifact_kind} | mime={art.mime}\nsummary: {art.summary}\n"
-    if art.payload_inline:
-        return head + f"payload:\n{art.payload_inline}"
-    if art.payload_path:
-        try:
-            from pathlib import Path
+def _format_artifact(
+    art: AIAgentArtifact,
+    *,
+    offset: int = 0,
+    limit: int = 8000,
+) -> str:
+    """格式化 artifact；与 FileOS 共用分页读协议。"""
+    from gsuid_core.ai_core.planning.tool_output_protocol import (
+        load_payload_text,
+        format_paginated_body,
+    )
 
-            text = Path(art.payload_path).read_text(encoding="utf-8", errors="replace")
-            return head + f"payload:\n{text[:12000]}"
-        except OSError as e:
-            return head + f"⚠️ 读取 artifact 落盘失败: {e}"
-    return head + "（无 inline / 落盘内容）"
+    head = f"artifact {art.id} | kind={art.artifact_kind} | mime={art.mime}\nsummary: {art.summary}\n"
+    text, err = load_payload_text(
+        payload_inline=art.payload_inline,
+        payload_path=art.payload_path or "",
+    )
+    if err:
+        return head + f"⚠️ {err}"
+    if not text:
+        return head + "（无 inline / 落盘内容）"
+    return format_paginated_body(
+        head=head,
+        text=text,
+        offset=offset,
+        limit=limit,
+        read_hint="artifact_get(res_id, offset, limit)",
+    )
 
 
 __all__ = [
@@ -1038,9 +1092,7 @@ __all__ = [
 ]
 
 
-# ─────────────────────────────────────────────────────────────────────
 # Owner 视角的 Kanban Introspect（list / pause / resume）
-# ─────────────────────────────────────────────────────────────────────
 
 
 @ai_tools(category="common", capability_domain="长期任务编排")
@@ -1053,7 +1105,7 @@ async def list_my_kanban_tasks(
 
     用于：
     - 主人格 / 能力代理 introspect 自己的长期任务；
-    - 命令"我有哪些任务在跑""暂停/恢复 AI 模拟盘"前的查表。
+    - 命令「我有哪些任务在跑」「暂停/恢复长期任务」前的查表。
 
     Args:
         goal_filter: 按 goal 模糊过滤（子串匹配，留空返回全部）
@@ -1086,15 +1138,31 @@ async def list_my_kanban_tasks(
     if not roots:
         return f"ℹ️ 过滤后无任务（goal_filter={goal_filter!r}, status={status}）。"
 
-    lines = [f"📋 Kanban 任务树（owner={owner}，{len(roots)} 棵）：", ""]
+    lines = [f"📋 任务树（owner={owner}，{len(roots)} 棵）：", ""]
     lines.append("| # | goal | 状态 | 周期 | 错误 |")
     lines.append("|---|------|------|------|------|")
+    safe_bits: list[str] = []
     for r in roots[:30]:
         trig = (r.recurring_trigger or "-")[:24]
         err = (r.failure_reason or "")[:40]
         lines.append(f"| #{r.ordinal} | {(r.goal or '')[:50]} | {r.status} | {trig} | {err} |")
+        # 聊天通道转述：状态人话，禁止原样念 goal/节点
+        _sc = {
+            "pending": "还没开始",
+            "running": "还在弄、还没好",
+            "paused": "先停着",
+            "waiting_approval": "等你确认",
+            "completed": "弄好了",
+            "failed": "这趟没成",
+            "cancelled": "取消了",
+        }
+        _phrase = _sc[r.status] if r.status in _sc else r.status
+        safe_bits.append(f"事项#{r.ordinal}→{_phrase}")
     if len(roots) > 30:
         lines.append(f"…还有 {len(roots) - 30} 棵未列出。")
+    if safe_bits:
+        lines.append("")
+        lines.append("【user_safe_summary】对用户只转述下列人话（勿念表格/goal/节点名）：" + "；".join(safe_bits))
     return "\n".join(lines)
 
 

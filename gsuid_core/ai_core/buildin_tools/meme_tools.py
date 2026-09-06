@@ -18,9 +18,10 @@ from gsuid_core.ai_core.meme.config import meme_config
 from gsuid_core.ai_core.meme.library import MemeLibrary, _read_file, get_memes_base_path
 from gsuid_core.ai_core.meme.selector import PICK_COOLDOWN, PICK_EXHAUSTED, pick
 from gsuid_core.ai_core.meme.database_model import AiMemeRecord
+from gsuid_core.ai_core.buildin_tools.visibility import visible_to_capability_only
 
 
-@ai_tools(category="common", capability_domain="表情")
+@ai_tools(category="self")
 async def send_meme(
     ev: Event,
     bot: Bot,
@@ -69,7 +70,7 @@ async def send_meme(
     # 发送图片
     file_path = get_memes_base_path() / record.file_path
     if not file_path.exists():
-        logger.warning(t("[Meme] 表情包文件不存在: {file_path}", file_path=file_path))
+        logger.warning(t("log.ai.meme_file_path", file_path=file_path))
         return "表情包文件不存在"
 
     image_data = await _read_file(file_path)
@@ -86,7 +87,7 @@ async def send_meme(
 
     logger.info(
         t(
-            "[Meme] 发送表情包: {p0} (mood={mood}, scene={scene}, persona={persona_name})",
+            "log.ai.meme_mood_scene_persona",
             p0=record.meme_id,
             mood=mood,
             scene=scene,
@@ -102,7 +103,7 @@ async def collect_meme(
     reason: str = "",
 ) -> str:
     """
-    主动收藏当前消息中的图片到表情包库
+    读取当前消息中的图片并写入表情包库
 
     当用户发送了一张有趣的图片时，AI 可以调用此工具将其收藏。
 
@@ -159,7 +160,7 @@ async def collect_meme(
     return "; ".join(results)
 
 
-@ai_tools(category="common", capability_domain="表情")
+@ai_tools(category="common", capability_domain="表情", visible_when=visible_to_capability_only)
 async def search_meme(
     query: str,
 ) -> str:
@@ -210,3 +211,55 @@ def _get_persona_for_event(ev: Event) -> str:
         return persona_name or "common"
     except Exception:
         return "common"
+
+
+@ai_tools(category="self", capability_domain="群聊黑话")
+async def record_meme(
+    ev: Event,
+    term: str,
+    meaning: str,
+    origin: str = "",
+    usage: str = "",
+) -> str:
+    """把刚搞懂的梗/黑话登记进词典，下次免搜。
+
+    接梗失败或刚用网页查清一个梗后调用。不要把学术名词当梗登记。
+
+    Args:
+        term: 梗名或触发短语。
+        meaning: 语义解释（≤300字）。
+        origin: 出处（可选）。
+        usage: 接法范式（可选）。
+    """
+    from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
+    from gsuid_core.ai_core.cognition.types import CogKind
+    from gsuid_core.ai_core.cognition.remember import MemoryWrite, remember
+    from gsuid_core.ai_core.meme.database_model import AiMemeKnowledge
+
+    name = (term or "").strip()
+    gloss = (meaning or "").strip()
+    if not name or not gloss:
+        return "⚠️ term 和 meaning 都不能空。"
+    scope_key = make_scope_key(ScopeType.GROUP, ev.group_id) if ev.group_id else ""
+    row = await AiMemeKnowledge.upsert_term(
+        bot_id=ev.bot_id,
+        term=name,
+        meaning=gloss,
+        origin=origin,
+        usage=usage,
+        scope_key=scope_key,
+        confidence=0.8,
+        source="model",
+    )
+    await remember(
+        MemoryWrite(
+            kind=CogKind.MEME_KNOWLEDGE,
+            ref=str(row.id),
+            scope_key=scope_key or f"self:{ev.bot_id}",
+            owner_user_id=ev.user_id,
+            title=name,
+            summary=gloss[:120],
+            source="model",
+        )
+    )
+    return f"已记住「{name}」。下次群友提到会直接懂。"

@@ -22,6 +22,8 @@ from .persona import Persona
 
 # voice_anchor 缓存 {persona_name: str}，避免每轮对话重复读盘
 _voice_anchor_cache: Dict[str, str] = {}
+# Tone Markers 词表缓存；人格 md 变更时随 voice_anchor 一起清
+_tone_marker_cache: Dict[str, Tuple[str, ...]] = {}
 
 # 兜底正则：从 persona.md 抓取最具描述性的一行作为口吻锚点。
 # 优先级：Style (风格) 块 > Tone Markers (语气词) 块 > Identity 行。
@@ -50,6 +52,22 @@ _TONE_INLINE_RE = re.compile(
     re.IGNORECASE,
 )
 _IDENTITY_RE = re.compile(r"Identity\s*:[ \t]*([^\n]+)", re.IGNORECASE)
+
+_TONE_SKIP_LINE_PREFIXES: Tuple[str, ...] = (
+    "配额",
+    "[SLOT:",
+    "如：",
+    "如:",
+    "例：",
+    "例:",
+    "示例",
+)
+_TONE_SKIP_TOKENS = frozenset(
+    {"配额", "后缀", "语气词", "结尾", "条", "至多", "其余", "不带", "上一条", "本条", "禁带"}
+)
+_TONE_SPLIT_RE = re.compile(r"[、，,/|;；\s]+")
+_TONE_PUNCT_ONLY_RE = re.compile(r"^[\s…。.．!！?？~～、,，'\"“”‘’·\-—]+$")
+_TONE_TRAIL_PUNCT = "…。.．!！?？~～、,， "
 
 # compact persona 抽取：心跳决策只需要"我是谁 / 怎么说话 / 何时开口"四要素，
 # 不需要工具协议、好感度梯度、触发例等执行细节。下列正则与上方块/行版本
@@ -139,6 +157,75 @@ def _extract_voice_anchor_from_persona(persona_text: str) -> str:
             return candidate
 
     return ""
+
+
+def extract_tone_markers(persona_text: str) -> Tuple[str, ...]:
+    """从人格卡 ``Tone Markers (语气词)`` 抽出词表。无块则空。
+
+    跳过配额/SLOT/举例行；纯标点（如省略号）不当语气词，避免把句末省略号当口癖。
+    """
+    if not persona_text:
+        return ()
+    block = ""
+    tone_match = _TONE_BLOCK_RE.search(persona_text)
+    if tone_match:
+        block = tone_match.group(2)
+    else:
+        tone_inline = _TONE_INLINE_RE.search(persona_text)
+        if tone_inline:
+            block = tone_inline.group(1)
+    if not block.strip():
+        return ()
+    found: list[str] = []
+    seen: set[str] = set()
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line or "[SLOT:" in line:
+            continue
+        if any(line.startswith(p) for p in _TONE_SKIP_LINE_PREFIXES):
+            continue
+        for tok in _TONE_SPLIT_RE.split(line):
+            t = tok.strip()
+            if not t or t in seen or t in _TONE_SKIP_TOKENS:
+                continue
+            if len(t) > 8 or _TONE_PUNCT_ONLY_RE.match(t):
+                continue
+            seen.add(t)
+            found.append(t)
+    return tuple(found)
+
+
+def reply_ends_with_tone_marker(text: str, markers: Tuple[str, ...]) -> bool:
+    """上一条助手回复是否以该人格语气词收尾（含词后省略号）。"""
+    if not text or not markers:
+        return False
+    tail = text.rstrip()
+    stripped = tail.rstrip(_TONE_TRAIL_PUNCT)
+    ordered = sorted(markers, key=len, reverse=True)
+    for m in ordered:
+        if tail.endswith(m) or stripped.endswith(m):
+            return True
+    return False
+
+
+def get_tone_markers(persona_name: Optional[str]) -> Tuple[str, ...]:
+    """读当前人格卡语气词。无人格/无块 → 空（框架不写死某角色口癖）。"""
+    if not persona_name:
+        return ()
+    if persona_name in _tone_marker_cache:
+        return _tone_marker_cache[persona_name]
+    from ..resource import PERSONA_PATH
+
+    md_path = PERSONA_PATH / persona_name / "persona.md"
+    markers: Tuple[str, ...] = ()
+    if md_path.exists():
+        try:
+            with open(md_path, "r", encoding="utf-8") as f:
+                markers = extract_tone_markers(f.read())
+        except OSError as e:
+            logger.debug(t("log.persona.read_md_path", md_path=md_path, e=e))
+    _tone_marker_cache[persona_name] = markers
+    return markers
 
 
 def extract_compact_persona(persona_text: str) -> str:
@@ -265,13 +352,13 @@ def migrate_voice_anchor_from_config(persona_name: str) -> bool:
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
-        logger.debug(t("🧠 [Persona] 读取 {cfg_path} 失败, 跳过 voice_anchor 迁移: {e}", cfg_path=cfg_path, e=e))
+        logger.debug(t("log.persona.read_cfg_path_skipping", cfg_path=cfg_path, e=e))
         return False
 
     if not isinstance(cfg, dict) or "voice_anchor" not in cfg:
         return False
 
-    # 已确认 "voice_anchor" in cfg，直接访问（LLM.md §1.4：存在性检查后直接访问）
+    # 已确认 "voice_anchor" in cfg，直接访问（AGENTS.md §1.4：存在性检查后直接访问）
     raw = cfg["voice_anchor"]
     wrote_txt = False
 
@@ -282,7 +369,7 @@ def migrate_voice_anchor_from_config(persona_name: str) -> bool:
                 f.write(raw.strip())
             wrote_txt = True
         except OSError as e:
-            logger.warning(t("🧠 [Persona] 写出 {txt_path} 失败, 保留旧字段: {e}", txt_path=txt_path, e=e))
+            logger.warning(t("log.persona.write_txt_path_keeping", txt_path=txt_path, e=e))
             # 写 txt 失败就不要继续删 JSON 字段, 留着等下次迁移
             return False
 
@@ -293,7 +380,7 @@ def migrate_voice_anchor_from_config(persona_name: str) -> bool:
     if wrote_txt:
         logger.info(
             t(
-                "🧠 [Persona] 已将 '{persona_name}' 的 voice_anchor 从 config.json 迁出到 {_VOICE_ANCHOR_FILENAME}",
+                "log.persona.migrated_name_voice",
                 persona_name=persona_name,
                 _VOICE_ANCHOR_FILENAME=_VOICE_ANCHOR_FILENAME,
             )
@@ -311,7 +398,7 @@ def _write_json_atomic(path: Path, data: dict) -> None:
             json.dump(data, f, indent=4, ensure_ascii=False)
         os.replace(tmp_path, path)
     except OSError as e:
-        logger.warning(t("🧠 [Persona] 写回 {path} 失败: {e}", path=path, e=e))
+        logger.warning(t("log.persona.write_path", path=path, e=e))
         if tmp_path.exists():
             try:
                 tmp_path.unlink()
@@ -344,7 +431,7 @@ def _load_voice_anchor_from_disk(persona_name: str) -> str:
             if raw:
                 return raw
         except OSError as e:
-            logger.debug(t("🧠 [Persona] 读取 {txt_path} 失败: {e}", txt_path=txt_path, e=e))
+            logger.debug(t("log.persona.read_txt_path", txt_path=txt_path, e=e))
 
     # 2. persona.md 正则兜底
     md_path = persona_dir / "persona.md"
@@ -354,7 +441,7 @@ def _load_voice_anchor_from_disk(persona_name: str) -> str:
         with open(md_path, "r", encoding="utf-8") as f:
             md_text = f.read()
     except OSError as e:
-        logger.debug(t("🧠 [Persona] 读取 {md_path} 失败: {e}", md_path=md_path, e=e))
+        logger.debug(t("log.persona.read_md_path", md_path=md_path, e=e))
         return ""
     return _extract_voice_anchor_from_persona(md_text)
 
@@ -392,8 +479,10 @@ def invalidate_voice_anchor_cache(persona_name: Optional[str] = None) -> None:
     """
     if persona_name is None:
         _voice_anchor_cache.clear()
+        _tone_marker_cache.clear()
         return
     _voice_anchor_cache.pop(persona_name, None)
+    _tone_marker_cache.pop(persona_name, None)
 
 
 async def save_persona(char_name: str, profile_content: str) -> None:
@@ -495,6 +584,57 @@ def get_persona_audio_path(char_name: str) -> Optional[str]:
     return persona.get_audio_path()
 
 
+def allocate_copy_name(source_name: str, occupied: set[str]) -> str | None:
+    """在源名后追加 2、3、… 直到不与 occupied 冲突；分尽则 None。"""
+    from gsuid_core.utils.path_safety import is_safe_filename
+
+    for n in range(2, 1000):
+        candidate = f"{source_name}{n}"
+        if candidate not in occupied and is_safe_filename(candidate):
+            return candidate
+    return None
+
+
+def copy_persona(source_name: str) -> str:
+    """复制整个人格目录（含 md / 媒体 / config.json / persona.json）。
+
+    新目录名为 ``{源名}2`` 起的第一个空位。副本 ``scope`` 强制 ``disabled``，
+    避免把 global 范围一并复制出去。
+    """
+    import shutil
+
+    from gsuid_core.utils.path_safety import safe_join
+
+    from .config import persona_config_manager
+    from ..resource import PERSONA_PATH
+
+    source = Persona(source_name)
+    if not source.exists():
+        raise ValueError(t("Persona '{p0}' 不存在", p0=source_name))
+
+    occupied: set[str] = set()
+    if PERSONA_PATH.exists():
+        occupied.update(item.name for item in PERSONA_PATH.iterdir() if item.is_dir())
+    dest_name = allocate_copy_name(source_name, occupied)
+    if dest_name is None:
+        raise ValueError(f"无法为角色 '{source_name}' 分配副本名称")
+
+    dest_dir = safe_join(PERSONA_PATH, dest_name)
+    try:
+        shutil.copytree(source.dir_path, dest_dir)
+    except OSError as e:
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir, ignore_errors=True)
+        logger.warning(t("log.persona.persona_copy_fail", persona_name=source_name, e=e))
+        raise ValueError(f"复制角色失败: {e}") from e
+
+    cfg = persona_config_manager.get_config(dest_name)
+    if not cfg.set_config("scope", "disabled"):
+        logger.warning(t("log.persona.persona_copy_scope_fail", persona_name=dest_name))
+    logger.info(t("log.persona.persona_copied", source=source_name, dest=dest_name))
+    return dest_name
+
+
 def delete_persona(char_name: str) -> bool:
     """
     删除角色资料和相关文件
@@ -508,11 +648,18 @@ def delete_persona(char_name: str) -> bool:
         True 如果成功删除，False 如果角色不存在
     """
     # 先删除配置文件
+    from gsuid_core.utils.path_safety import PathEscapeError
+
     from .config import persona_config_manager
 
-    persona_config_manager.delete_persona_config(char_name)
+    try:
+        persona_config_manager.delete_persona_config(char_name)
+        from .settings import persona_settings_manager
 
-    persona = Persona(char_name)
+        persona_settings_manager.drop_cache(char_name)
+        persona = Persona(char_name)
+    except (ValueError, PathEscapeError):
+        return False
     deleted = persona.delete()
     if deleted:
         invalidate_voice_anchor_cache(char_name)

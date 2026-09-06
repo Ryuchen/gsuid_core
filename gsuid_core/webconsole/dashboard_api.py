@@ -9,6 +9,7 @@ from datetime import date as dt_date, datetime, timedelta
 
 from fastapi import Depends, Request
 
+from gsuid_core.i18n import t
 from gsuid_core.webconsole.app_app import app
 from gsuid_core.webconsole.web_api import TEMP_DICT, require_auth
 from gsuid_core.utils.database.global_val_models import DataType, CoreDataSummary, CoreDataAnalysis
@@ -119,7 +120,7 @@ async def get_dashboard_metrics(request: Request, bot_id: str = "all", _user: Di
     except Exception as e:
         from gsuid_core.logger import logger
 
-        logger.warning(f"Failed to fetch dashboard metrics: {e}")
+        logger.warning(t("log.webconsole.dashboard_metrics_fail", error=e))
         # Fallback to mock data if no real data
         return {
             "status": 0,
@@ -238,6 +239,56 @@ async def get_dashboard_users_groups(
     return {"status": 0, "msg": "ok", "data": data}
 
 
+@app.get("/api/dashboard/daily/command-counts", summary="近 N 天每日命令总数（日历）", tags=DASHBOARD)
+async def get_daily_command_counts(
+    request: Request,
+    days: int = 60,
+    bot_id: str = "all",
+    _user: Dict[str, Any] = Depends(require_auth),
+):
+    """近 N 天每天的命令调用总数——供 Dashboard 日期选择器展示数字 / 禁用无数据日。
+
+    Query:
+    - ``days``: 回溯天数，默认 60，夹取到 [1, 366]
+    - ``bot_id``: ``all`` 或 ``bot_self_id:bot_id``
+
+    ``data`` 为按日期升序列表，每项 ``{date, count}``；``count == 0`` 表示当天无记录。
+    口径与 ``/daily/commands`` 一致：仅汇总 USER 维度的 ``command_count``。
+    """
+    days = max(1, min(int(days or 60), 366))
+    _bot_id = None
+    _bot_self_id = None
+    if bot_id and bot_id != "all" and ":" in bot_id:
+        _bot_self_id, _bot_id = bot_id.split(":", 1)
+
+    try:
+        today = datetime.now().date()
+        start = today - timedelta(days=days - 1)
+        totals = await CoreDataAnalysis.get_daily_command_totals(
+            start,
+            today,
+            _bot_id,
+            _bot_self_id,
+        )
+        data = []
+        for offset in range(days - 1, -1, -1):
+            d = today - timedelta(days=offset)
+            key = d.strftime("%Y-%m-%d")
+            data.append({"date": key, "count": int(totals.get(key, 0))})
+        return {"status": 0, "msg": "ok", "data": data}
+    except Exception as e:
+        from gsuid_core.logger import logger
+
+        logger.exception(t("log.webconsole.fetch_daily_command_counts", error=e))
+        # 降级：仍返回连续日期，count=0，避免前端日历空白
+        today = datetime.now().date()
+        data = []
+        for offset in range(days - 1, -1, -1):
+            d = today - timedelta(days=offset)
+            data.append({"date": d.strftime("%Y-%m-%d"), "count": 0})
+        return {"status": 0, "msg": "ok", "data": data}
+
+
 @app.get("/api/dashboard/daily/commands", summary="每日命令使用统计", tags=DASHBOARD)
 async def get_daily_commands(
     request: Request, date: str, bot_id: str = "all", _user: Dict[str, Any] = Depends(require_auth)
@@ -314,7 +365,7 @@ async def get_daily_commands(
     except Exception as e:
         from gsuid_core.logger import logger
 
-        logger.exception(f"Failed to fetch daily commands: {e}")
+        logger.exception(t("log.webconsole.dashboard_daily_commands_fail", error=e))
         return {
             "status": 0,
             "msg": "ok",
@@ -397,7 +448,7 @@ async def get_daily_group_triggers(
     except Exception as e:
         from gsuid_core.logger import logger
 
-        logger.warning(f"Failed to fetch daily group triggers: {e}")
+        logger.warning(t("log.webconsole.fetch_daily_group_triggers", error=e))
         return {
             "status": 0,
             "msg": "ok",
@@ -480,7 +531,7 @@ async def get_daily_personal_triggers(
     except Exception as e:
         from gsuid_core.logger import logger
 
-        logger.warning(f"Failed to fetch daily personal triggers: {e}")
+        logger.warning(t("log.webconsole.fetch_daily_personal_triggers", error=e))
         return {
             "status": 0,
             "msg": "ok",
@@ -532,7 +583,7 @@ async def get_dashboard_bots(_user: Dict[str, Any] = Depends(require_auth)):
     except Exception as e:
         from gsuid_core.logger import logger
 
-        logger.warning(f"Failed to fetch bot list: {e}")
+        logger.warning(t("log.webconsole.dashboard_bot_list_fail", error=e))
         return {
             "status": 0,
             "msg": "ok",

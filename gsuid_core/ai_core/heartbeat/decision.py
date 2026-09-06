@@ -1,12 +1,13 @@
+import re
 import json
 import time
-from typing import Any, List, Optional
+from typing import List, Optional
 from datetime import datetime
 
 from gsuid_core.i18n import t
 from gsuid_core.config import core_config
 from gsuid_core.logger import logger
-from gsuid_core.ai_core.utils import SILENCE_MARKERS, extract_json_from_text
+from gsuid_core.ai_core.utils import is_silence_marker, extract_json_from_text
 from gsuid_core.ai_core.models import Event
 from gsuid_core.ai_core.gs_agent import GsCoreAIAgent, create_agent
 from gsuid_core.ai_core.statistics import statistics_manager
@@ -14,20 +15,18 @@ from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
 from gsuid_core.ai_core.memory.config import memory_config
 from gsuid_core.ai_core.history_format import format_history_for_agent
 from gsuid_core.ai_core.persona.prompts import ROLE_PLAYING_START
+from gsuid_core.message_history.manager import MessageRecord
 from gsuid_core.ai_core.persona.resource import load_persona, extract_compact_persona
 from gsuid_core.utils.database.base_models import async_maker
 from gsuid_core.ai_core.memory.ingestion.hiergraph import AIMemHierarchicalGraphMeta
 
 # B-1 修复：人格放 system_prompt（稳定前缀），逐轮变化的"群里发生的事 + 决策指令"
 # 放 user_message。原实现把整段 `{persona_text}+history+指令` 同时作为 create_agent
-# 的 system_prompt 和 run() 的 user_message 发送两遍，多群高频巡检下是显著 token 浪费。
-# 下面两个模板**只含 user 侧内容**，persona_text 由调用处单独作为 system_prompt 传入。
 DECISION_USER_TEMPLATE = """现在你独自看着群里的聊天记录，思考自己要不要说点什么。
 
-【当前时间】
-{current_time}
+[当前时间：{current_time}]
 
-【群里最近发生的事】
+[群里最近发生的事]
 {history_context}
 {group_summary_section}{proactive_merge_section}{masters_section}{recent_speak_section}{staleness_section}
 
@@ -37,7 +36,7 @@ DECISION_USER_TEMPLATE = """现在你独自看着群里的聊天记录，思考�
 群聊需要一点"人味"。是否开口，凭你这个角色此刻的真实意愿判断。
 
 以下情况**应当沉默**（should_speak=false）：
-- 群里在聊高度专业、你完全插不上嘴的话题（硬核配队 / 攻略 / 炒股细节等）；
+- 群里在聊高度专业、你完全插不上嘴的话题（硬核配队 / 攻略 / 行业术语细节等）；
 - 上一条明显是别人之间的私聊、或在 @ 别人，与你无关；
 - **最近的消息带「@了用户: xxx（不是你）」标记，或按上下文是在喊别人**——紧随其后的
   "在不在""睡了没""到哪了"是对被 @ / 被喊的那个人说的，不是叫你；群友互相喊人经常
@@ -57,23 +56,32 @@ DECISION_USER_TEMPLATE = """现在你独自看着群里的聊天记录，思考�
 """  # noqa: E501
 
 
-PROACTIVE_MESSAGE_USER_TEMPLATE = """【群里最近发生的事】
+PROACTIVE_MESSAGE_USER_TEMPLATE = """[群里最近发生的事]
 {history_context}
 {proactive_merge_section}{masters_section}{staleness_section}
-【此刻你的状态】
+[此刻你的状态]
 {mood}
 
 ---
 
 你决定开口了。
 称呼必须与消息记录对齐：要回应哪条消息，就看清那条消息的发言人是谁——
-不是主人发的就绝不称"主人"，认不准发言人就不用任何称呼。
+不是主人发的就绝不称"{master_title}"，认不准发言人就不用任何称呼。
 直接输出你想说的话，不要任何前缀、引号或解释。
+
+[主动发言角色约束（OOC 修复 5.8）]
+- 主动发言必须简短：≤50字，最好≤30字。你是群友随口说一句，不是写分析报告。
+- 必须保持角色口吻：用你自己的语气词和说话方式。
+- 禁止主动发表专业分析/市场评论/数据罗列（除非{master_title}委派）。
+- 禁止使用表格、编号列表、加粗标题等结构化格式。
+- 默认潜水，非必要不现身：如果只是"想说点什么"但没有明确话头，宁可不说。
 """
 
-# §10 新鲜度门：最后一条人类消息距今超过该分钟数，视为"话题已冷"——
-# 禁止"说得对"式接旧话茬（35 分钟后才附和会显得诡异），只允许全新话头或沉默。
+# §10 新鲜度门：最后一条人类消息距今超过该分钟数，
 STALE_TOPIC_MINUTES_DEFAULT = 15
+# 可点名窗口：超过则禁止假设对方在场（阈值不进配置，避免运行期漂移）。
+MASTER_ACTIVE_WINDOW_MIN = 30
+ACTIVE_WINDOW_MIN = 30
 
 STALENESS_NOTE_TEMPLATE = (
     "\n\n（注意：群里最后一条消息已经是 {minutes} 分钟前的了，那个话题早就翻篇。"
@@ -82,7 +90,7 @@ STALENESS_NOTE_TEMPLATE = (
 )
 
 
-def build_staleness_section(history: List[Any], now_ts: float) -> str:
+def build_staleness_section(history: List[MessageRecord], now_ts: float) -> str:
     """群内最后一条消息距今超阈值时返回"话题已冷"提示，否则空串（§10）。
 
     看所有角色而非只看 user：bot 刚心跳发过新话头时再注入"最后消息是 X 分钟前"
@@ -103,16 +111,17 @@ def build_staleness_section(history: List[Any], now_ts: float) -> str:
 
 REACTIVE_GATE_TEMPLATE = """这是群聊。{speaker_desc} 最近刚和你说过话，现在 TA 又发了一条消息，但**没有**直接 @ 你。
 
-【群里最近发生的事（最后一条就是要你判断的这条）】
+[群里最近发生的事（最后一条就是要你判断的这条）]
 {history_context}
 
 ---
 
 判断：这条新消息是不是在**继续跟你说话**（接着刚才的话题追问 / 补充 / 回应你）？
 - 明确在接着你们刚才的话题（追问 / 补充 / 直接回应你）→ should_speak=true
-- 泛泛感慨、自言自语、像是在跟群里别人聊、或换到与你无关的新话题 → should_speak=false
+- 只是引用了你上一条、在跟群里别人聊、自言自语、或换到与你无关的新话题 → should_speak=false
 - 消息带「@了用户: xxx（不是你）」标记、或 TA 刚 @ / 点名了群里别人 → 这是在跟那个人
   说话（哪怕内容像问句），should_speak=false
+- 引用你的话 ≠ 在找你。对着引用吩咐你 / 追问你才算。
 
 默认倾向沉默：刚找过你 ≠ 这条就是冲你来的。只有看得出**明确指向你**才说话；
 但凡看不出明确指向你，就 should_speak=false。宁可漏接也不要硬插话。
@@ -155,50 +164,138 @@ async def _get_group_summary_for_heartbeat(group_id: str) -> str:
             )
             row = result.scalar_one_or_none()
             if row:
-                return f"\n\n【群组历史摘要】\n{row}"
+                return (
+                    f"\n\n[群组历史摘要]\n{row}\n"
+                    "（以上摘要来自群友发言的压缩，每条都是有人说过的话，"
+                    "可能是玩笑/文案/反讽，引用前先判断真实性，不要把文案当真实事件。）"
+                )
     except Exception as e:
-        logger.debug(t("🫀 [Heartbeat] 获取群组摘要失败: {e}", e=e))
+        logger.debug(t("log.ai.heartbeat_get_group_summary", e=e))
 
     return ""
 
 
-def _build_masters_section(history: List[Any]) -> str:
-    """列出出现在本群历史里的主人，供巡检以「主人」相称。
-
-    巡检 system_prompt 是裸人格（不含 SYSTEM_CONSTRAINTS 的主人名单），主人身份
-    必须随群况补进 user 侧；只列在场主人，避免塞一串与本群无关的 ID。
-    """
-    masters = {str(m) for m in (core_config.get_config("masters") or [])}
-    if not masters:
-        return ""
-
-    present: List[str] = []
-    seen: set = set()
+def _last_user_seen(history: List[MessageRecord]) -> dict[str, tuple[float, str]]:
+    """user_id → (最后发言 ts, 显示名)。窗口里没出现过的人不收录。"""
+    last: dict[str, tuple[float, str]] = {}
     for record in history:
         if record.role != "user":
             continue
         uid = str(record.user_id)
-        if uid not in masters or uid in seen:
+        if not uid:
             continue
-        seen.add(uid)
-        name = record.user_name
-        present.append(f"{uid}({name})" if name else uid)
+        ts = float(record.timestamp)
+        name = str(record.user_name) if record.user_name else uid
+        if uid not in last or ts >= last[uid][0]:
+            last[uid] = (ts, name)
+    return last
 
-    if not present:
+
+def _pick_recent_speaker_names(
+    last_seen: dict[str, tuple[float, str]],
+    *,
+    limit: int = 8,
+) -> dict[str, str]:
+    """按最后发言时间取最近的人，不是窗口里先出现的人。"""
+    ordered = sorted(last_seen.items(), key=lambda kv: kv[1][0], reverse=True)
+    return {uid: name for uid, (_ts, name) in ordered[:limit]}
+
+
+def _gap_label(gap_min: int, last_ts: float) -> str:
+    if gap_min <= MASTER_ACTIVE_WINDOW_MIN:
+        return f"{gap_min} 分钟前刚发过言"
+    hhmm = time.strftime("%H:%M", time.localtime(last_ts))
+    return f"上次发言是 {hhmm}（{gap_min} 分钟前）——TA 现在很可能不在看群"
+
+
+def _build_masters_section(history: List[MessageRecord], now_ts: float | None = None) -> str:
+    """列出出现在本群历史里的主人，并带最后发言时间（禁止对长时间未发言者点名问候）。"""
+    masters = {str(m) for m in (core_config.get_config("masters") or [])}
+    if not masters:
+        return ""
+    now = now_ts if now_ts is not None else time.time()
+    last_seen = _last_user_seen(history)
+    lines: List[str] = []
+    for uid in masters:
+        if uid not in last_seen:
+            lines.append(f"用户ID:{uid} 是你的主人，但 TA 很久没在这窗口里发言——很可能不在看群。")
+            continue
+        ts, name = last_seen[uid]
+        gap_min = int((now - ts) / 60)
+        label = f"{name}(用户ID:{uid})" if name != uid else f"用户ID:{uid}"
+        lines.append(f"{label} 是你的主人，{_gap_label(gap_min, ts)}。")
+    if not lines:
+        return ""
+    listed = "\n".join(f"- {x}" for x in lines)
+    return (
+        f"\n\n[你的主人（最高权限）]\n{listed}\n"
+        "对主人保持最高信任、亲昵相待；但只有在回应**主人本人发的那条消息**时才称「主人」。"
+        "主人长时间没发言时：禁止向 TA 直接发问或假设 TA 在线，一律不许点名问候；"
+        "想提 TA 用自言自语、口吻以角色卡为准。"
+        "只有主人最近 30 分钟内发过言才可以直接点名关心。"
+    )
+
+
+async def _build_zone_section(
+    history: List[MessageRecord],
+    bot_id: str,
+    now_ts: float | None = None,
+) -> str:
+    """在场发言者的关系温度摘要（决策上下文，不进 system）。
+
+    压缩人格刻意丢掉了整段 Favorability Logic（决策阶段不需要执行细则），但**档位本身**
+    要给：``close``/``familiar`` 可提高「点名关心」权重，``hostile``/``cold`` 禁止点名。
+    只列在场的人，且只给档位不给分数——分数是内部量。
+    """
+    if not history:
+        return ""
+    from gsuid_core.ai_core.relationship import Zone, zone_of, zone_level_name
+    from gsuid_core.ai_core.database.models import UserFavorability
+
+    last_seen = _last_user_seen(history)
+    names = _pick_recent_speaker_names(last_seen, limit=8)
+    if not names:
+        return ""
+    try:
+        scores = await UserFavorability.get_scores_for(list(names), bot_id)
+    except Exception as e:
+        logger.debug(t("log.ai.heartbeat_zone_summary_degraded", e=e))
         return ""
 
-    listed = "、".join(present)
-    return (
-        f"\n\n【你的主人（最高权限）】{listed} 是你的主人。"
-        "对主人保持最高信任、亲昵相待、认真回应；但只有在回应**主人本人发的那条消息**时"
-        "才称「主人」——先核对那条消息的发言人 ID 是否在上述名单里，别人说的话绝不冠给主人；"
-        "其余人仍是普通群友，用昵称称呼即可。"
-    )
+    now = now_ts if now_ts is not None else time.time()
+    warm: List[str] = []
+    cold: List[str] = []
+    for uid, score in scores.items():
+        zone = zone_of(score)
+        ts_name = last_seen[uid] if uid in last_seen else None
+        gap_txt = ""
+        active = False
+        if ts_name is not None:
+            gap_min = int((now - ts_name[0]) / 60)
+            gap_txt = f"{gap_min} 分钟前"
+            active = gap_min <= ACTIVE_WINDOW_MIN
+        nick = names[uid] if uid in names else uid
+        label = f"{nick}（{zone_level_name(zone)}，{gap_txt or '很久没发言'}）"
+        if zone in (Zone.CLOSE, Zone.FAMILIAR):
+            if active:
+                warm.append(f"{label}。最近活跃的人可以点名关心、主动接话。")
+            else:
+                warm.append(f"{label}。TA 可能已经离开，不要假设 TA 在场，不要直接对 TA 说话。")
+        elif zone in (Zone.HOSTILE, Zone.COLD):
+            cold.append(label)
+    if not warm and not cold:
+        return ""
+    lines = ["\n\n[在场的人你有多熟]"]
+    if warm:
+        lines.append("- 熟：" + "；".join(warm))
+    if cold:
+        lines.append(f"- 不熟/有点烦：{'、'.join(cold)}。**不要点名**，也别主动搭话。")
+    return "\n".join(lines)
 
 
 async def run_heartbeat(
     event: Event,
-    history: List[Any],
+    history: List[MessageRecord],
     persona_name: str,
     extra_context: str = "",
 ) -> Optional[tuple[str, str, List[str]]]:
@@ -221,23 +318,21 @@ async def run_heartbeat(
         交给 ``emit_proactive_message`` 挂到主 session 的 ``linked_agents`` 上。
     """
     if not history:
-        logger.debug(t("🫀 [Heartbeat] 无历史记录，跳过"))
+        logger.debug(t("log.ai.heartbeat_history_skipping"))
         return None
 
     if not persona_name:
-        logger.warning(t("🫀 [Heartbeat] 无法获取角色名称，跳过"))
+        logger.warning(t("log.ai.heartbeat_unable_get_name_skip"))
         return None
 
     # 决策阶段只使用纯人设（角色扮演开始 + 角色资料），
-    # 避免完整的 system_prompt 中的工具调用规范、<SILENCE> 规则等执行层约束污染决策。
     persona_content = await load_persona(persona_name)
     if not persona_content:
-        logger.warning(t("🫀 [Heartbeat] 无法加载角色资料，跳过"))
+        logger.warning(t("log.ai.heartbeat_unable_load_profile_skip"))
         return None
 
-    # 决策阶段用压缩版人格（仅 Identity / Style / Tone / Presence 四要素），
-    # 节省每次心跳 ~70% 的 persona token；compact 提取失败则回退完整原文，
-    # 保证不会因正则未匹配丢人格描述。完整原文留给后续"生成发言"阶段使用。
+    # 决策阶段用压缩版人格（仅 Identity / Style / Tone / Presence 四要素）， 节省每次心跳 ~70% 的 persona token；
+    # compact 提取失败则回退完整原文
     compact_persona = extract_compact_persona(persona_content)
     decision_persona = compact_persona or persona_content
     persona_text = f"{ROLE_PLAYING_START}\n{persona_content}"
@@ -250,13 +345,17 @@ async def run_heartbeat(
     # 获取群组摘要缓存（如果启用）
     group_summary = await _get_group_summary_for_heartbeat(event.group_id or "")
 
-    # 在场主人名单：裸人格 system_prompt 不含主人信息，靠这段让巡检认出主人并以「主人」相称
-    masters_section = _build_masters_section(history)
+    # 在场主人名单：裸人格 system_prompt 不含主人信息，靠这段认出 masters；口头称呼见 persona.json
+    # 关系温度摘要紧随其后：主人是权限、档位是温度，两者正交
+    now_ts = time.time()
+    masters_section = _build_masters_section(history, now_ts) + await _build_zone_section(
+        history, event.bot_id or "", now_ts
+    )
 
     # C8：统一主动网关合并进来的语境（刚完成的定时任务结果等）
     proactive_merge_section = ""
     if extra_context:
-        proactive_merge_section = f"\n\n【你刚完成的事（可自然提及，不必生硬播报）】\n{extra_context}"
+        proactive_merge_section = f"\n\n[你刚完成的事（可自然提及，不必生硬播报）]\n{extra_context}"
 
     # C-5：把"近 1 小时我已主动发言 N 次"喂给决策 LLM，促其自我克制（与 C-3 硬上限互补）
     from gsuid_core.ai_core.heartbeat.dispatcher import get_dispatcher, make_target_key
@@ -271,13 +370,7 @@ async def run_heartbeat(
             "除非这次真的很有必要，否则更应该保持沉默，别刷存在感。）"
         )
 
-    # ----------------------------------------------------------------
-    # 阶段一：决策
-    # ----------------------------------------------------------------
-    # B-1：persona 进 system_prompt，逐轮变化的群况 + 决策指令进 user_message，
-    # 不再把同一大段（persona + history）作为 system + user 发送两遍。
-    # §10 新鲜度门：最后一条人类消息已冷（>15 分钟）时，决策与生成两阶段都
-    # 收到"不得接旧话茬"提示（生产事故：35 分钟后附和"说得对"且错认主人）。
+    # 阶段一：决策 B-1：persona 进 system_prompt，逐轮变化的群况 + 决策指令进 user_message
     staleness_section = build_staleness_section(history, time.time())
 
     decision_user = DECISION_USER_TEMPLATE.format(
@@ -291,7 +384,6 @@ async def run_heartbeat(
     )
 
     # 为决策子 agent 分配独立 session_id 并启用 SubAgent 日志，
-    # 让"为什么这一刻决定开口"事后可审计（见 §3.3 Heartbeat 改造）。
     target_for_sid: str = event.group_id or event.user_id or "unknown"
     ts_now: int = int(time.time())
     decision_session_id: str = f"heartbeat_decision_{persona_name}_{target_for_sid}_{ts_now}"
@@ -305,8 +397,7 @@ async def run_heartbeat(
         session_id=decision_session_id,
         is_subagent=True,
     )
-    # 巡检属自主花费：绑定 scope 使其 Token 计入对应会话额度，并经 budget_gate 在超额时
-    # 直接掐断（决策：硬拦截），让预算成为真正的总成本上限。
+    # 巡检属自主花费：绑定 scope 使其 Token 计入对应会话额度，并经 budget_gate 在超额时 直接掐断（决策：硬拦截），
     decision_agent.bind_budget_scope(event)
     # 用本地变量记住 logger 引用，避免多分支重复读取 _session_logger 的 None 守卫；
     # SubAgent 用完即关，否则 30 分钟巡检间隔会不断堆 logger 后台任务。
@@ -314,7 +405,7 @@ async def run_heartbeat(
     try:
         result: str = await decision_agent.run(user_message=decision_user, budget_gate=True)
     except Exception as e:
-        logger.exception(t("🫀 [Heartbeat] 决策阶段出错: {e}", e=e))
+        logger.exception(t("log.ai.heartbeat_fail_decision_stage", e=e))
         if decision_logger is not None:
             generator_log_files.append(str(decision_logger._file_path))
             decision_logger.close()
@@ -325,35 +416,37 @@ async def run_heartbeat(
         decision_logger.close()
 
     if not result:
-        logger.debug(t("🫀 [Heartbeat] 决策阶段无返回，跳过"))
+        logger.debug(t("log.ai.heartbeat_decision_stage_nothing_skip"))
         return None
 
     # 模型输出 <SILENCE> 或 <end_turn> 表示选择不发言，直接跳过
-    if result.strip() in SILENCE_MARKERS:
-        logger.debug(t("🫀 [Heartbeat] 模型输出沉默标记，保持沉默"))
+    if is_silence_marker(result.strip()):
+        logger.debug(t("log.ai.heartbeat_output_silence_remaining"))
         return None
 
     try:
         decision = extract_json_from_text(result)
     except (json.JSONDecodeError, ValueError) as e:
-        logger.warning(t("🫀 [Heartbeat] 决策结果 JSON 解析失败: {e}, raw={result}", e=e, result=repr(result)))
+        logger.warning(t("log.ai.heartbeat_parse_decision_result_fail", e=e, result=repr(result)))
         return None
 
     # 模型可能把决策对象包进数组（如 [{...}]），取首个 dict 归一化，非 dict 判为解析失败
     if isinstance(decision, list):
         decision = next((item for item in decision if isinstance(item, dict)), None)
     if not isinstance(decision, dict):
-        logger.warning(t("🫀 [Heartbeat] 决策结果不是预期的对象结构，跳过: raw={result}", result=repr(result)))
+        logger.warning(t("log.ai.heartbeat_decision_result_expected_skip", result=repr(result)))
         return None
     if "mood" not in decision or "should_speak" not in decision:
-        logger.warning(t("🫀 [Heartbeat] 决策对象缺少必要字段，跳过: raw={result}", result=repr(result)))
+        logger.warning(t("log.ai.heartbeat_decision_object_missing_skip", result=repr(result)))
         return None
 
     mood: str = decision["mood"]
     should_speak: bool = bool(decision["should_speak"])
     context_hook = decision["context_hook"] if "context_hook" in decision else ""
 
-    logger.debug(f"🫀 [Heartbeat] should_speak={should_speak} mood={mood!r} context_hook={context_hook!r}")
+    logger.debug(
+        t("log.heartbeat.speak_mood_context_hook_ok", should_speak=should_speak, mood=mood, context_hook=context_hook)
+    )
 
     try:
         statistics_manager.record_trigger(trigger_type="heartbeat")
@@ -362,25 +455,31 @@ async def run_heartbeat(
             should_speak=should_speak,
         )
     except Exception as e:
-        logger.warning(t("📊 [Heartbeat] 记录决策统计失败: {e}", e=e))
+        logger.warning(t("log.ai.heartbeat_record_decision_statistics", e=e))
 
     if not should_speak:
-        logger.debug(t("🫀 [Heartbeat] 🤫 保持沉默: {mood} ({event})", mood=mood, event=event))
+        logger.debug(t("log.ai.heartbeat_remaining_silent_mood", mood=mood, event=event))
         return None
 
-    logger.info(t("🫀 [Heartbeat] 💡 决定插话: {mood} ({event})", mood=mood, event=event))
+    # 可回应钩子门（4.11）：决定开口却给不出具体话头/由头 → 视为无的放矢的梦呓，
+    # 降级沉默（结构判定：context_hook 是决策 JSON 的必填项，空即无钩子）。
+    _hook = context_hook if isinstance(context_hook, str) else ""
+    if not _hook.strip():
+        logger.debug(t("log.ai.heartbeat_no_hook_silent", mood=mood))
+        return None
 
-    # ----------------------------------------------------------------
-    # 阶段二：生成发言
-    # ----------------------------------------------------------------
-    # B-1：发言阶段同样把人格放 system_prompt（用完整原文 persona_text），
-    # 群况 + 状态进 user_message。
+    logger.info(t("log.ai.heartbeat_decided_interject_mood", mood=mood, event=event))
+
+    # 阶段二：生成发言 B-1：发言阶段同样把人格放 system_prompt（用完整原文 persona_text）
+    from gsuid_core.ai_core.persona.settings import get_master_title
+
     message_user = PROACTIVE_MESSAGE_USER_TEMPLATE.format(
         history_context=history_context,
         mood=mood,
         proactive_merge_section=proactive_merge_section,
         masters_section=masters_section,
         staleness_section=staleness_section,
+        master_title=get_master_title(persona_name),
     )
 
     output_agent: GsCoreAIAgent = create_agent(
@@ -396,7 +495,7 @@ async def run_heartbeat(
     try:
         result = await output_agent.run(user_message=message_user, budget_gate=True)
     except Exception as e:
-        logger.exception(t("🫀 [Heartbeat] 生成阶段出错: {e}", e=e))
+        logger.exception(t("log.ai.heartbeat_fail_generation_stage", e=e))
         if output_logger is not None:
             generator_log_files.append(str(output_logger._file_path))
             output_logger.close()
@@ -407,17 +506,60 @@ async def run_heartbeat(
         output_logger.close()
 
     if not result or not result.strip():
-        logger.debug(t("🫀 [Heartbeat] 生成阶段无返回"))
+        logger.debug(t("log.ai.heartbeat_generation_stage_nothing"))
         return None
 
     message: str = _strip_message_quotes(result)
-    logger.info(t("🫀 [Heartbeat] 主动发言: {message}", message=repr(message)))
+    logger.info(t("log.ai.heartbeat_message_proactive", message=repr(message)))
     return mood, message, generator_log_files
+
+
+# 软门规则预筛：零 LLM 即可定夺的「必沉默」形态（省活跃群每条一次 LLM）
+_REACTIVE_SILENCE_RE = re.compile(
+    r"^[\s\W\d]*$"  # 纯空白/符号/数字
+    r"|^[哈呵嘿嗯啊哦喔噢呜]+[~～。.!！?？…\s]*$"  # 纯语气叠词
+    r"|^[。.!！?？…~～]+$"
+)
+# 明显接续：短句里带第二人称/闭类跟进——可零 LLM 放行。角色名由调用方传入，不写死。
+_REACTIVE_PASS_RE = re.compile(
+    r"(你|那[个么]|然后|接着|还有|改成|取消|多少|怎么样|为什么|为啥|啥意思)",
+    re.I,
+)
+
+
+def _reactive_gate_rule_prefilter(raw_text: str, persona_name: str = "") -> Optional[bool]:
+    """规则预筛：True=放行，False=沉默，None=交 LLM。
+
+    只处理高置信形态，避免关键词表膨胀；拿不准返回 None。
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return False
+    # 框架标注「@的不是你」：续聊软门不应接别人的话头
+    if "不是你" in text and "@" in text:
+        return False
+    body = text
+    if "--- 消息 ---" in text:
+        body = text.split("--- 消息 ---", 1)[-1].strip()
+    for _time_sep in ("[当前时间：", "[当前时间:", "【当前时间】"):
+        if _time_sep in body:
+            body = body.split(_time_sep, 1)[0]
+            break
+    body = body.strip()
+    if len(body) <= 1 or _REACTIVE_SILENCE_RE.match(body):
+        return False
+    if len(body) <= 24:
+        if _REACTIVE_PASS_RE.search(body):
+            return True
+        name = persona_name.strip()
+        if name and name in body:
+            return True
+    return None
 
 
 async def run_reactive_gate(
     event: Event,
-    history: List[Any],
+    history: List[MessageRecord],
     persona_name: Optional[str],
 ) -> bool:
     """免唤醒续聊·软触发沉默门。
@@ -431,9 +573,17 @@ async def run_reactive_gate(
     缺字段）一律按 **沉默（返回 False）** 处理——续聊场景"判不出明确指向你"就不该硬接。仅
     **真异常**（无历史 / 无人格 / LLM 调用崩溃 / 人格加载失败）才 **放行（返回 True）**，避免因
     基础设施故障误吞用户真实的追问。
+
+    先过规则预筛（零 LLM），仅模糊句才打轻量模型。
     """
     if not history or not persona_name:
         return True
+    # 规则预筛：纯感叹/空话直接沉默；明显接续短句直接放行
+    raw = event.raw_text if event.raw_text else (event.text or "")
+    pre = _reactive_gate_rule_prefilter(raw, persona_name or "")
+    if pre is not None:
+        logger.debug(t("log.ai.reactivegate_pre_rule_filter", pre=pre))
+        return pre
     try:
         persona_content = await load_persona(persona_name)
         if not persona_content:
@@ -474,28 +624,26 @@ async def run_reactive_gate(
 
         # agent.run 默认返回 str，但签名是 Union[str, Any]（output_type 时返模型实例）；
         # 本门未指定 output_type，用 isinstance 守卫而非依赖隐式 AttributeError 兜底。
-        # 模型给了输出却不是合法 str → 判不出指向，按默认沉默处理（非真异常，不放行）。
         if not isinstance(result, str):
-            logger.debug(t("🫧 [ReactiveGate] 返回非 str（{p0}），默认沉默", p0=type(result).__name__))
+            logger.debug(t("log.ai.reactivegate_non_str_defaulting", p0=type(result).__name__))
             return False
-        if not result or result.strip() in SILENCE_MARKERS:
+        if not result or is_silence_marker(result.strip()):
             return False
         # 捕获具体异常而非宽 except：模型吐了内容但不是合法 JSON（常因角色扮演"出戏"成台词），
-        # 续聊场景判不出明确指向你，按默认沉默处理——不再回落到放行。
         try:
             decision = extract_json_from_text(result)
         except (json.JSONDecodeError, ValueError) as e:
-            logger.debug(t("🫧 [ReactiveGate] 决策 JSON 解析失败，默认沉默: {e}, raw={p0}", e=e, p0=repr(result[:80])))
+            logger.debug(t("log.ai.reactivegate_parse_decision_json_fail", e=e, p0=repr(result[:80])))
             return False
         if isinstance(decision, list):
             decision = next((item for item in decision if isinstance(item, dict)), None)
         if not isinstance(decision, dict) or "should_speak" not in decision:
-            logger.debug(t("🫧 [ReactiveGate] 决策缺合法 should_speak，默认沉默"))
+            logger.debug(t("log.heartbeat.reactive_decision_missing"))
             return False
         should = bool(decision["should_speak"])
         reason = decision["reason"] if "reason" in decision else None
-        logger.debug(f"🫧 [ReactiveGate] should_speak={should} reason={reason!r}")
+        logger.debug(t("log.heartbeat.reactive_decision", should=should, reason=reason))
         return should
     except Exception as e:
-        logger.debug(t("🫧 [ReactiveGate] 软触发沉默门出错，放行交主Agent兜底: {e}", e=e))
+        logger.debug(t("log.heartbeat.reactive_gate_error", e=e))
         return True

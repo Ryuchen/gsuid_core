@@ -15,11 +15,9 @@ Image Understand 公共 API 模块
 
 import time
 import hashlib
-from typing import Union, Literal, Optional
+from typing import Literal, Optional
 
 from pydantic_ai.messages import ImageUrl
-from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
-from pydantic_ai.models.anthropic import AnthropicModel
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
@@ -33,6 +31,7 @@ from gsuid_core.ai_core.mcp.utils import (
     prepare_source_for_mcp,
 )
 from gsuid_core.ai_core.configs.models import (
+    AnyModel,
     get_model_for_task,
     get_model_config_for_task,
 )
@@ -94,11 +93,13 @@ def _understand_cache_put(key: str, value: str) -> None:
 
 def _resolve_native_image_model(
     task_level: Literal["high", "low"],
-) -> Optional[Union[OpenAIChatModel, OpenAIResponsesModel, AnthropicModel]]:
+) -> AnyModel | None:
     """若指定级别的模型在 model_support 中声明了 image，则返回其原生模型实例。
 
     模型原生支持图片时，应直接用大模型的多模态能力（OpenAI / Anthropic 兼容请求）
     转述图片，无需再单独配置图片转述模型（MCP）。不支持时返回 None，交由 MCP 兜底。
+    返回类型扩大到 AnyModel（含 GoogleModel）：当前仅由调用方 if isinstance 区分
+    OpenAI/Anthropic 三家；gemini 多模态原生支持存在但本函数未直接走, 后续可扩展。
     """
     model_config = get_model_config_for_task(task_level)
     model_support = model_config.get_config("model_support").data
@@ -128,7 +129,7 @@ async def _understand_image_native(
             内存注册表时，把本次图片理解的 subagent 日志 link 到调用方 session 的
             linked_agents，便于 webconsole 下钻（"附到调用方 session"策略）。
     """
-    from gsuid_core.ai_core.utils import _normalize_image_url
+    from gsuid_core.ai_core.utils import materialize_image_url
     from gsuid_core.ai_core.gs_agent import create_agent
     from gsuid_core.ai_core.session_registry import get_ai_session_registry
 
@@ -148,7 +149,7 @@ async def _understand_image_native(
     )
     try:
         result = await agent.run(
-            [prompt, ImageUrl(url=_normalize_image_url(image_url))],
+            [prompt, ImageUrl(url=await materialize_image_url(image_url, strict=True))],
             return_mode="return",
         )
         return str(result).strip()
@@ -173,6 +174,7 @@ async def understand_image(
     prompt: str | None = None,
     task_level: Literal["high", "low"] = "high",
     parent_session_id: Optional[str] = None,
+    persona_name: Optional[str] = None,
 ) -> str:
     """
     统一的图片理解接口
@@ -203,18 +205,24 @@ async def understand_image(
     """
     if not prompt:
         prompt = "请详细描述这张图片的内容，包括主要对象、场景、文字、颜色等信息。"
+        if persona_name:
+            from gsuid_core.ai_core.persona.appearance import load_appearance_line
+
+            appearance = load_appearance_line(persona_name)
+            if appearance:
+                prompt += f" 如果图中出现与以下角色形象高度一致的人物，请特别指出：{appearance}"
 
     # O-C 缓存：同图短期内复用同一段描述（按来源字符串 URL/DataURI 哈希、忽略 prompt，见 N-1）
     cache_key = _img_cache_key(image_url)
     cached = _understand_cache_get(cache_key)
     if cached:
-        logger.debug(t("🖼️ [ImageUnderstand] 命中图片理解缓存，跳过重复解析"))
+        logger.debug(t("log.ai.imgund_hit_image_understanding_skip"))
         return cached
 
     # 优先：当前模型原生支持图片时，直接走大模型多模态，无需配置转述模型(MCP)
     native_model = _resolve_native_image_model(task_level)
     if native_model is not None:
-        logger.debug(t("🖼️ [ImageUnderstand] 当前模型原生支持图片，使用大模型多模态能力转述"))
+        logger.debug(t("log.ai.imgund_natively_supports_images"))
         desc = await _understand_image_native(
             image_url,
             prompt,
@@ -253,5 +261,5 @@ async def understand_image(
                 cleanup_tempfile(image_source, "🖼️ [ImageUnderstand]")
 
     # 未知 provider
-    logger.warning(t("🖼️ [ImageUnderstand] 未知的提供方 '{provider}'，仅支持 MCP", provider=provider))
+    logger.warning(t("log.ai.imgund_provider_mcp_supported", provider=provider))
     raise RuntimeError(t("Image Understand 不支持该提供方: {provider}", provider=provider))

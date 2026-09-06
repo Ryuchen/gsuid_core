@@ -26,6 +26,10 @@ class ToolContext:
     # 渐进式工具暴露：find_tools 本轮命中的工具名集合，RetrievableToolset 每 step 读它
     # 解析成可调用工具。作用域为单次 run（ToolContext 每轮新建），轮末自然丢弃。
     dynamic_tool_names: Set[str] = field(default_factory=set)
+    # 主人格交互轮：能力代理专属工具名。find_tools / RetrievableToolset 均不得回灌。
+    blocked_tool_names: Set[str] = field(default_factory=set)
+    # True：允许工具路径对用户会话出站（主人格）。能力代理 / 子 Agent 恒 False。
+    allow_user_outbound: bool = True
 
 
 class KnowledgeBase(TypedDict):
@@ -37,6 +41,7 @@ class KnowledgeBase(TypedDict):
     content: str
     tags: List[str]
     source: NotRequired[str]  # 知识来源: 由框架自动设置, "plugin" 或 "manual"
+    entity: NotRequired[str]  # 这篇知识归属的正式名；挂载优先用，不靠标题切词
 
 
 class KnowledgePoint(KnowledgeBase):
@@ -54,6 +59,7 @@ class ManualKnowledgeBase(TypedDict):
     content: str
     tags: List[str]
     source: str  # 固定为 "manual"
+    entity: NotRequired[str]
 
 
 class ManualKnowledgeUpdate(TypedDict, total=False):
@@ -111,14 +117,8 @@ class ToolDef(TypedDict):
     function: FunctionDef
 
 
-# ─────────────────────────────────────────────
 # AI 会话日志序列化结构
-#
 # 这三个 TypedDict 是 ``AISessionLogger`` 落盘格式的唯一类型来源
-# （对应 session_logger.py 的 ``_add_entry`` / ``link_agent`` / ``_build_data``）。
-# webconsole 的日志 API 读取磁盘 JSON 与内存 logger 时复用它们，
-# 使全部字段可追踪到实时类型，无需 getattr / dict.get 兜底。
-# ─────────────────────────────────────────────
 
 
 class SessionLogEntry(TypedDict):
@@ -180,6 +180,11 @@ class ToolBase:
     check_func: Any  # 可选的权限检查函数
     context_tags: List[str]  # 语境标签，用于语境工具池自动加载
     capability_domain: Optional[str]  # C3-d 能力域，用于聚合成自然语言能力清单
+    covers: List[str]  # 数据/能力覆盖面陈述，进向量检索文本，供召回与 roster 聚合
+    aliases: List[str]  # 领域内同义表述（须带领域前缀，如「领域A·能力X」）
+    schema_brief: str  # 下发 schema 用简述；检索仍用 description 全文
+    category: str  # 注册分类；花名册按此跳过主人格调不到的族
+    hide_from_main: bool  # visible_to_capability_only：主人格花名册/速览不列
 
     def __init__(
         self,
@@ -190,6 +195,11 @@ class ToolBase:
         check_func: Any = None,
         context_tags: Optional[List[str]] = None,
         capability_domain: Optional[str] = None,
+        covers: Optional[List[str]] = None,
+        aliases: Optional[List[str]] = None,
+        schema_brief: str = "",
+        category: str = "",
+        hide_from_main: bool = False,
     ):
         self.name = name
         self.description = description
@@ -198,3 +208,22 @@ class ToolBase:
         self.check_func = check_func
         self.context_tags = context_tags or []
         self.capability_domain = capability_domain
+        self.covers = covers or []
+        self.aliases = aliases or []
+        self.schema_brief = schema_brief or description
+        self.category = category
+        self.hide_from_main = hide_from_main
+
+    @property
+    def retrieval_text(self) -> str:
+        """向量检索入库文本：name + description + covers + aliases。
+
+        docstring 只是「函数行为」，covers/aliases 才承载「数据域 / 同义问法」，
+        四者拼接才是完整检索面（见 plans 2026-08-11 方案一）。
+        """
+        parts: List[str] = [self.name, self.description]
+        if self.covers:
+            parts.append("覆盖：" + "、".join(self.covers))
+        if self.aliases:
+            parts.append("又叫：" + "、".join(self.aliases))
+        return "\n".join(p for p in parts if p.strip())

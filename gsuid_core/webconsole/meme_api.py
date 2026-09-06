@@ -73,6 +73,7 @@ _RESERVED_MEME_IDS = frozenset(
         "export",
         "import",
         "batch_delete",
+        "purge",
         "purge_rejected",
         "batch_retag_pending",
     }
@@ -96,6 +97,34 @@ class MemeBatchDeleteRequest(BaseModel):
     """批量删除表情包请求"""
 
     meme_ids: List[str] = Field(..., min_length=1, description="要删除的表情包 ID 列表")
+
+
+class MemePurgeRequest(BaseModel):
+    """按条件批量清空表情包请求。
+
+    必须 ``confirm=true``。全库清空还须 ``purge_all=true``（与过滤字段互斥）。
+    """
+
+    confirm: bool = Field(..., description="必须为 true，确认执行不可逆清空")
+    purge_all: bool = Field(
+        False,
+        description="为 true 时清空库内全部；与 status/folder/persona_hint 互斥",
+    )
+    status: Optional[str] = Field(
+        None,
+        max_length=32,
+        description="按状态过滤：pending/tagged/manual/pending_manual/rejected",
+    )
+    folder: Optional[str] = Field(
+        None,
+        max_length=128,
+        description="按文件夹过滤，如 common / persona_xxx",
+    )
+    persona_hint: Optional[str] = Field(
+        None,
+        max_length=64,
+        description="按人格过滤（与 folder 互斥，folder 优先）；底层换算为对应 folder",
+    )
 
 
 class MemeBatchExportRequest(BaseModel):
@@ -253,7 +282,7 @@ async def get_meme_personas(
     返回按表情包数量降序、人格名升序排列的列表：
     [
         {"persona_hint": "common", "count": 300, "folder": "common"},
-        {"persona_hint": "早柚",   "count": 100, "folder": "persona_早柚"},
+        {"persona_hint": "示例人格",   "count": 100, "folder": "persona_示例人格"},
         ...
     ]
 
@@ -337,7 +366,16 @@ async def get_meme_image(
                 media_type="text/plain",
             )
 
-        file_path = get_memes_base_path() / record.file_path
+        from gsuid_core.utils.path_safety import PathEscapeError, safe_join
+
+        try:
+            file_path = safe_join(get_memes_base_path(), record.file_path)
+        except PathEscapeError:
+            return StreamingResponse(
+                io.BytesIO(b"file not found"),
+                status_code=404,
+                media_type="text/plain",
+            )
         image_data = await _read_file(file_path)
         if not image_data:
             return StreamingResponse(
@@ -700,53 +738,129 @@ async def batch_delete_memes(
 
 
 # ─────────────────────────────────────────────
-# 10b. 清除所有已拒绝的表情包
+# 10b. 按条件批量清空表情包（支持全部 / 按状态 / 文件夹 / 人格）
 # ─────────────────────────────────────────────
 
 
-@app.post("/api/meme/purge_rejected", summary="b. 清除所有已拒绝的表情包", tags=MEME)
+@app.post("/api/meme/purge", summary="b. 按条件批量清空表情包", tags=MEME)
+async def purge_memes(
+    req: MemePurgeRequest,
+    _: Dict[str, Any] = Depends(require_auth),
+) -> Dict[str, Any]:
+    """
+    按可选条件批量清空表情包（源文件 + 数据库记录 + Qdrant 向量）。
+
+    - ``confirm`` 必须为 true
+    - 全库清空：``purge_all=true`` 且不得带过滤字段
+    - 条件清空：至少提供 ``status`` / ``folder`` / ``persona_hint`` 之一
+    - 面向数万条规模：后端分批删除，避免前端逐页勾选
+
+    Returns:
+        status: 0 成功，1 部分失败 / 参数错误
+        data: purged_count + failed
+    """
+    if not req.confirm:
+        return {
+            "status": 1,
+            "msg": "必须设置 confirm=true 才能执行清空",
+            "data": None,
+        }
+
+    if req.status is not None and req.status not in _VALID_MEME_STATUSES:
+        return {
+            "status": 1,
+            "msg": f"非法 status: {req.status}，允许值: {', '.join(_VALID_MEME_STATUSES)}",
+            "data": None,
+        }
+
+    has_filter = req.status is not None or req.folder is not None or req.persona_hint is not None
+    if req.purge_all and has_filter:
+        return {
+            "status": 1,
+            "msg": "purge_all=true 时不得同时指定 status/folder/persona_hint",
+            "data": None,
+        }
+    if not req.purge_all and not has_filter:
+        return {
+            "status": 1,
+            "msg": "全库清空须 purge_all=true；条件清空须指定 status/folder/persona_hint 之一",
+            "data": None,
+        }
+
+    purge_status: Optional[str] = None
+    effective_folder: Optional[str] = None
+    if not req.purge_all:
+        purge_status = req.status
+        effective_folder = req.folder
+        if effective_folder is None and req.persona_hint is not None:
+            effective_folder = _folder_for_persona(req.persona_hint)
+
+    try:
+        purged_count, failed_items = await MemeLibrary.purge_memes(
+            status=purge_status,
+            folder=effective_folder,
+        )
+
+        if purged_count == 0 and not failed_items:
+            return {
+                "status": 0,
+                "msg": "没有匹配的表情包",
+                "data": {"purged_count": 0, "failed": []},
+            }
+
+        if not failed_items:
+            return {
+                "status": 0,
+                "msg": f"已清空 {purged_count} 个表情包",
+                "data": {"purged_count": purged_count, "failed": []},
+            }
+
+        return {
+            "status": 1,
+            "msg": f"清空完成：成功 {purged_count} 个，失败 {len(failed_items)} 个",
+            "data": {"purged_count": purged_count, "failed": failed_items},
+        }
+    except Exception as e:
+        return {"status": 1, "msg": f"清空失败: {e}", "data": None}
+
+
+# ─────────────────────────────────────────────
+# 10b2. 清除所有已拒绝的表情包（兼容旧前端）
+# ─────────────────────────────────────────────
+
+
+@app.post("/api/meme/purge_rejected", summary="b2. 清除所有已拒绝的表情包", tags=MEME)
 async def purge_rejected_memes(
     _: Dict[str, Any] = Depends(require_auth),
 ) -> Dict[str, Any]:
     """
-    批量删除所有状态为 rejected 的表情包（源文件+数据库记录+Qdrant 向量）
+    批量删除所有状态为 rejected 的表情包（源文件+数据库记录+Qdrant 向量）。
+
+    等价于 ``POST /api/meme/purge`` 且 ``status=rejected, confirm=true``。
+    保留此端点以兼容旧前端。
 
     Returns:
         status: 0成功，1部分失败
         data: 包含成功/失败详情
     """
     try:
-        # 获取所有 rejected 状态的记录（不分页）
-        records = await AiMemeRecord.get_all_by_status(status="rejected")
+        purged_count, failed_items = await MemeLibrary.purge_memes(status="rejected")
 
-        if not records:
+        if purged_count == 0 and not failed_items:
             return {"status": 0, "msg": "没有已拒绝的表情包", "data": {"purged_count": 0, "failed": []}}
-
-        success_ids: List[str] = []
-        failed_items: List[Dict[str, Any]] = []
-
-        for record in records:
-            try:
-                ok = await MemeLibrary.delete_meme(record.meme_id)
-                if ok:
-                    success_ids.append(record.meme_id)
-                else:
-                    failed_items.append({"meme_id": record.meme_id, "reason": "删除失败"})
-            except Exception as e:
-                failed_items.append({"meme_id": record.meme_id, "reason": str(e)})
 
         if not failed_items:
             return {
                 "status": 0,
-                "msg": f"已清除 {len(success_ids)} 个已拒绝的表情包",
-                "data": {"purged_count": len(success_ids), "failed": []},
+                "msg": f"已清除 {purged_count} 个已拒绝的表情包",
+                "data": {"purged_count": purged_count, "failed": []},
             }
-        else:
-            return {
-                "status": 1,
-                "msg": f"清除完成：成功 {len(success_ids)} 个，失败 {len(failed_items)} 个",
-                "data": {"purged_count": len(success_ids), "failed": failed_items},
-            }
+
+        return {
+            "status": 1,
+            "msg": f"清除完成：成功 {purged_count} 个，失败 {len(failed_items)} 个",
+            "data": {"purged_count": purged_count, "failed": failed_items},
+        }
     except Exception as e:
         return {"status": 1, "msg": f"清除失败: {e}", "data": None}
 
@@ -901,8 +1015,13 @@ async def export_memes(
             zf.writestr(MEME_METADATA_FILE, json.dumps(metadata, ensure_ascii=False, indent=2))
 
             # files/ - 写入源文件
+            from gsuid_core.utils.path_safety import PathEscapeError, safe_join
+
             for record in records:
-                file_path = base_path / record.file_path
+                try:
+                    file_path = safe_join(base_path, record.file_path)
+                except PathEscapeError:
+                    continue
                 if file_path.exists():
                     file_data = file_path.read_bytes()
                     # ZIP 内路径: files/{meme_id}.{ext}
@@ -1046,13 +1165,25 @@ async def import_memes(
                     # 避免“原导出处为 persona_A、却以 persona_B 导入”的不一致场景。
                     folder = target_folder
 
-                    # 保存文件到目标文件夹
-                    target_folder_path = base_path / folder
+                    from gsuid_core.utils.path_safety import PathEscapeError, safe_join, is_safe_filename
+
+                    try:
+                        target_folder_path = safe_join(base_path, folder)
+                    except PathEscapeError:
+                        failed_items.append({"meme_id": meme_id, "reason": "非法目标文件夹"})
+                        continue
                     target_folder_path.mkdir(parents=True, exist_ok=True)
 
-                    # 确定文件扩展名
                     ext = Path(file_name).suffix or ".jpg"
-                    target_file_path = target_folder_path / f"{meme_id}{ext}"
+                    dest_name = f"{meme_id}{ext}"
+                    if not is_safe_filename(dest_name):
+                        failed_items.append({"meme_id": meme_id, "reason": "非法文件名"})
+                        continue
+                    try:
+                        target_file_path = safe_join(target_folder_path, dest_name)
+                    except PathEscapeError:
+                        failed_items.append({"meme_id": meme_id, "reason": "非法目标路径"})
+                        continue
                     target_file_path.write_bytes(image_data)
 
                     relative_path = f"{folder}/{meme_id}{ext}"

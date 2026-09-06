@@ -158,7 +158,7 @@ async def record_violation(
     )
     logger.warning(
         t(
-            "📋 [Kanban] 工作区越界 task={task_id} root={root_task_id}: {p0}",
+            "log.ai.kanban_workspace_boundary_violation",
             task_id=task_id,
             root_task_id=root_task_id,
             p0=detail[:200],
@@ -342,7 +342,7 @@ async def put_artifact(
             return None
         # 安全闸刀：登记的文件必须落在 workspace 内（避免登记越界路径，绕过沙盒）
         if not _is_inside(src, workspace):
-            logger.warning(t("📋 [Kanban] artifact_put 拒绝登记越界文件: {src} 不在 workspace 内", src=src))
+            logger.warning(t("log.ai.kanban_artifact_put_refused_register", src=src))
             return None
         suffix = src.suffix.lower()
         resolved_mime = mime or _EXT_TO_MIME.get(suffix, "application/octet-stream")
@@ -358,6 +358,7 @@ async def put_artifact(
             expires_at=datetime.now() + timedelta(days=DEFAULT_TTL_DAYS),
         )
         await AIAgentArtifact.batch_insert_data([art])
+        await _remember_and_index_artifact(art, plan_ctx, payload="")
         return art
 
     # ── 模式 2 / 3：inline 文本 / 大文本落盘 ──
@@ -388,4 +389,55 @@ async def put_artifact(
         art.payload_path = str(target)
         art.size_bytes = target.stat().st_size
     await AIAgentArtifact.batch_insert_data([art])
+    await _remember_and_index_artifact(art, plan_ctx, payload=payload)
     return art
+
+
+async def _remember_and_index_artifact(
+    art: AIAgentArtifact,
+    plan_ctx: PlanRunContext,
+    payload: str,
+) -> None:
+    """产物登记后写认知节点，并异步建向量索引。"""
+    import asyncio
+
+    from gsuid_core.ai_core.cognition.types import CogKind
+    from gsuid_core.ai_core.cognition.remember import MemoryWrite, remember
+
+    try:
+        task = await AIAgentTask.get_by_id(plan_ctx.root_task_id or art.root_task_id)
+        owner = (task.owner_user_id if task is not None else "") or ""
+        scope_key = (task.scope_key if task is not None else "") or ""
+        as_of = datetime.now().strftime("%Y-%m-%d")
+        await remember(
+            MemoryWrite(
+                kind=CogKind.ARTIFACT,
+                ref=art.id,
+                scope_key=scope_key,
+                owner_user_id=owner,
+                title=art.from_profile or art.artifact_kind,
+                summary=(art.summary or "")[:200],
+                as_of=as_of,
+                source="artifact",
+                handle=art.id,
+            )
+        )
+        if not owner:
+            return
+
+        async def _index() -> None:
+            from gsuid_core.ai_core.planning.artifact_index import index_artifact
+
+            await index_artifact(
+                art_id=art.id,
+                summary=art.summary or "",
+                text=payload[:800],
+                owner_user_id=owner,
+                scope_key=task.group_id if task is not None and task.group_id else scope_key,
+                date_str=as_of,
+                profile=art.from_profile or "",
+            )
+
+        asyncio.create_task(_index())
+    except Exception as e:
+        logger.debug(t("log.ai.cognition_node_sync_fail", kind="artifact", ref=art.id, e=e))

@@ -105,7 +105,7 @@ def message_list_to_str(messages: list[Message]) -> str:
         elif m.type == "file":
             s.append("[文件]")
         elif m.type == "node":
-            s.append("[节点]")
+            s.append("[合并转发]")
     return "\n".join(s)
 
 
@@ -292,7 +292,9 @@ class _Bot:
             if isinstance(message, str):
                 # 检查是否是 base64 图片
                 if message.startswith("base64://"):
-                    content = "[图片]"
+                    from gsuid_core.ai_core.outbound import get_outbound_image_label
+
+                    content = get_outbound_image_label() or "[图片]"
                     metadata["type"] = "base64_image"
                 else:
                     content = message
@@ -318,35 +320,47 @@ class _Bot:
                 content = " ".join(text_parts)
                 if image_count > 0:
                     metadata["image_count"] = image_count
+                    from gsuid_core.ai_core.outbound import get_outbound_image_label
+
+                    label = get_outbound_image_label()
+                    if label:
+                        content = f"{content} {label}".strip() if content else label
+                    elif not content:
+                        content = "[图片]"
             elif isinstance(message, Message):
                 if message.type == "text":
                     content = str(message.data)
                 elif message.type == "image":
-                    content = "[图片]"
+                    from gsuid_core.ai_core.outbound import get_outbound_image_label
+
+                    content = get_outbound_image_label() or "[图片]"
                     metadata["type"] = "image"
                 else:
                     content = f"[{message.type}]"
 
             # 构造 Event 对象用于记录历史（WS_BOT_ID 即 self.bot_id）
             if content and _hist_user_id:
-                ev = Event(
-                    bot_id=bot_id,
-                    bot_self_id=bot_self_id,
-                    user_type=target_type,
-                    group_id=_hist_group_id,
-                    user_id=_hist_user_id,
-                    WS_BOT_ID=self.bot_id,
-                )
-                # 显式 merge：调用方传入的 extra_metadata 覆盖默认推断的 type/image_count
-                if extra_metadata:
-                    metadata.update(extra_metadata)
-                history_manager.add_message(
-                    event=ev,
-                    role="assistant",
-                    content=content,
-                    user_name="AI",
-                    metadata=metadata,
-                )
+                from gsuid_core.ai_core.utils import is_silence_marker
+
+                if not is_silence_marker(content):
+                    ev = Event(
+                        bot_id=bot_id,
+                        bot_self_id=bot_self_id,
+                        user_type=target_type,
+                        group_id=_hist_group_id,
+                        user_id=_hist_user_id,
+                        WS_BOT_ID=self.bot_id,
+                    )
+                    # 显式 merge：调用方传入的 extra_metadata 覆盖默认推断的 type/image_count
+                    if extra_metadata:
+                        metadata.update(extra_metadata)
+                    history_manager.add_message(
+                        event=ev,
+                        role="assistant",
+                        content=content,
+                        user_name="AI",
+                        metadata=metadata,
+                    )
         except Exception as e:
             logger.debug(t("log.bot.record_history_fail", error=e))
 
@@ -481,7 +495,14 @@ class _Bot:
                         pass  # Observer 失败不应影响主流程
                 # ============================================
 
-                logger.info(t("log.bot.send_to", bot_id=bot_id, target_type=target_type, target_id=target_id))
+                logger.info(
+                    t(
+                        "log.bot.sendmsgto_id_target_type_send",
+                        bot_id=bot_id,
+                        target_type=target_type,
+                        target_id=target_id,
+                    )
+                )
                 body = msgjson.encode(send)
                 # 通过发送队列串行化 WebSocket 发送，避免多任务并发写入
                 # 闭包不捕获 ws，执行时动态读取 self.bot，重连后自动使用新 ws
@@ -578,7 +599,7 @@ class _Bot:
         )
         logger.info(
             t(
-                "log.bot.ban_to",
+                "log.bot.banuserto_id_target_type",
                 bot_id=bot_id,
                 target_type=target_type,
                 target_id=target_id,
@@ -730,6 +751,34 @@ class Bot:
         self.mutiply_resp: List[Event] = []
         # 当前用户语言缓存（懒解析，一次事件内复用），见 get_lang()
         self._lang: Optional[str] = None
+
+    def reset_text_stream(self) -> None:
+        """出站流式：新模型请求前清对齐缓冲。默认无缓冲。"""
+        return
+
+    def enqueue_text_delta(self, piece: str) -> None:
+        """出站流式：可见文本增量。默认丢弃，等完整 TextPart。"""
+        return
+
+    async def flush_text_delta(self) -> None:
+        """出站流式：把合批残余推出去。默认无操作。"""
+        return
+
+    def take_unsent_suffix(self, text: str) -> str | None:
+        """闸门通过后：None=已全部出站；否则未出站后缀或全文。默认返回全文。"""
+        return text
+
+    def discard_streamed_preview(self, text: str = "") -> None:
+        """闸门拒绝：丢掉已推预览的对齐缓冲。默认无缓冲。"""
+        return
+
+    async def commit_streamed_history(
+        self,
+        text: str,
+        extra_metadata: Optional[Dict[str, object]] = None,
+    ) -> None:
+        """增量已出站：只记 history，不再 send。默认无操作。"""
+        return
 
     async def get_lang(self) -> str:
         """当前用户语言：用户自定义 > 全局 LANGUAGE；结果缓存到本 Bot 实例。"""

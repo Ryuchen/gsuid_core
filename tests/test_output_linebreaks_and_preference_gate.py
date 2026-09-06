@@ -181,7 +181,7 @@ def test_code_block_is_kept_as_text_not_rendered(_md_image_cfg) -> None:
 def test_bold_headers_and_numbered_list_render_as_image(_md_image_cfg) -> None:
     """agent 研报常用「整行粗体小标题 / 编号建议」而非表格或 # 标题——也必须命中出图。
 
-    还原 session ...644256 里药明康德那条被拆成 ~8 段的回复（有粗体小标题 + 编号列表，无表格）。
+    还原某研报会话里药明康德那条被拆成 ~8 段的回复（有粗体小标题 + 编号列表，无表格）。
     """
     _md_image_cfg(min_chars=80)
     report = (
@@ -221,15 +221,14 @@ def test_leaked_res_handle_is_stripped() -> None:
 
 
 def test_all_real_prefixes_are_stripped() -> None:
-    """前缀须与 RM/artifact 实际生成对齐：img_/aud_/vid_（RM）、res_（artifact）。
-
-    锁死回归：曾误写成 rec_/video_（并漏掉 vid_），导致视频句柄漏给用户。
-    """
+    """前缀须与 RM/artifact/委派对齐：img_/aud_/vid_、res_、dlg_（含带连字符 UUID）。"""
     for prefix, raw in (
         ("res_", "看这个 `res_abc123def456` 好吧"),
         ("img_", "图在 img_00ff8821 里"),
         ("aud_", "音频 aud_deadbeef 听"),
         ("vid_", "视频 vid_0a1b2c3d 看"),
+        ("dlg_", "后台任务 dlg_0123456789ab 查一下"),
+        ("dlg_", "后台任务 dlg_550e8400-e29b-41d4-a716-446655440000 查一下"),
     ):
         out = _strip_resource_handles(raw)
         assert prefix not in out, f"漏了前缀 {prefix}: {raw!r} -> {out!r}"
@@ -270,8 +269,10 @@ def _patch_artifact(monkeypatch, art) -> AsyncMock:
 
 def test_handle_always_stripped_from_returned_text(monkeypatch) -> None:
     """铁律：无论能否补发，返回文本里绝不残留 res_/img_ 句柄。"""
+    from typing import Any
+
     _patch_artifact(monkeypatch, None)  # 解析不到
-    bot = _FakeBot()
+    bot: Any = _FakeBot()
     out = asyncio.run(_resolve_and_deliver_leaked_handles("详细的放那里面了 res_deb5b2e0d2a4 自己看吧 我去睡了", bot))
     assert "res_deb5b2e0d2a4" not in out and "res_" not in out
     assert bot.sent == []  # 解析不到 → 不补发
@@ -279,8 +280,10 @@ def test_handle_always_stripped_from_returned_text(monkeypatch) -> None:
 
 def test_long_relayed_text_only_strips_no_redelivery(monkeypatch) -> None:
     """正文已够长（模型其实已把结论讲清楚）→ 只抹句柄，绝不重复补发资源。"""
+    from typing import Any
+
     mock = _patch_artifact(monkeypatch, _FakeArtifact(payload_inline="重复内容"))
-    bot = _FakeBot()
+    bot: Any = _FakeBot()
     long_body = "药明康德昨天收盘 131.36，离主人定的 135 还差 3 块多。" * 6  # ≥120 字
     out = asyncio.run(_resolve_and_deliver_leaked_handles(long_body + " res_abc12345", bot))
     assert "res_abc12345" not in out
@@ -290,10 +293,12 @@ def test_long_relayed_text_only_strips_no_redelivery(monkeypatch) -> None:
 
 def test_lazy_pointer_to_image_artifact_delivers_image(monkeypatch, tmp_path) -> None:
     """短指路 + 图片 artifact → 把图发出去，剩下的短句成为图注（不再是断链引用）。"""
+    from typing import Any
+
     img = tmp_path / "report.png"
     img.write_bytes(b"\x89PNG\r\n\x1a\nfake-image-bytes")
     _patch_artifact(monkeypatch, _FakeArtifact(payload_path=str(img), mime="image/png"))
-    bot = _FakeBot()
+    bot: Any = _FakeBot()
     out = asyncio.run(_resolve_and_deliver_leaked_handles("都画好了 res_deadbeef01 自己看吧", bot))
     assert "res_deadbeef01" not in out
     assert len(bot.sent) == 1 and getattr(bot.sent[0], "type", None) == "image", "应把图片补发出去"
@@ -301,9 +306,11 @@ def test_lazy_pointer_to_image_artifact_delivers_image(monkeypatch, tmp_path) ->
 
 def test_lazy_pointer_to_text_artifact_inlines_content(monkeypatch) -> None:
     """短指路 + 纯文本 artifact → 把内容并进正文（走后续管线出图），让'自己看'有实物。"""
+    from typing import Any
+
     report = "药明康德 603259 分析：昨收 131.36，离 135 仅 2.8%，三个超买信号亮起，135 是布林上轨压力位。"
     _patch_artifact(monkeypatch, _FakeArtifact(payload_inline=report))
-    bot = _FakeBot()
+    bot: Any = _FakeBot()
     out = asyncio.run(_resolve_and_deliver_leaked_handles("详细的放那里面了 res_cafe1234 自己看吧", bot))
     assert "res_cafe1234" not in out
     assert report in out, "文本 artifact 内容应并进正文"
@@ -335,8 +342,18 @@ def test_preference_injection_is_not_gated_off_by_chitchat_intent() -> None:
 
 
 def test_chitchat_turn_still_passes_empty_contexts_not_none() -> None:
-    """闲聊轮必须传**空 list**（只留 general/纠错），而不是 None（= 不过滤，全量注入）。"""
-    src = _src("gsuid_core/ai_core/handle_ai.py")
+    """闲聊/旁观不预灌 dual_route 正文；偏好入口仍恒开、禁止按意图整轮关偏好。"""
+    kit = _src("gsuid_core/ai_core/kits/memory/kit.py")
+    facade = _src("gsuid_core/ai_core/cognition/facade.py")
 
-    assert "_pref_contexts: list[str] = []" in src, "闲聊轮的 preference_contexts 不是空 list"
-    assert "_pref_inject = True" in src, "偏好注入没有恒开"
+    assert "should_prefetch_memory" in kit
+    retrieve_src = kit.split("async def retrieve", 1)[1].split("async def _prefetch", 1)[0]
+    assert "inject_memory_slice" not in retrieve_src
+    assert "dual_route_retrieve" in retrieve_src
+    assert "format_retrieved_memory" in retrieve_src
+    assert "_format_memory_catalog" in kit
+    assert "mem.episodes" in kit
+    assert 'pref["polarity"]' in kit
+    assert "inject_preferences=True" in facade, "偏好注入没有恒开"
+    for src in (kit, facade, _src("gsuid_core/ai_core/handle_ai.py")):
+        assert "inject_preferences=intent" not in src.replace(" ", "")

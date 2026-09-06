@@ -17,7 +17,8 @@ from typing_extensions import ParamSpec, Concatenate
 from sqlmodel import Field, SQLModel, col, and_, delete, select, update
 from sqlalchemy import MetaData, exc, text, event, inspect, create_engine
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.engine import Connection
+from sqlalchemy.pool import NullPool
+from sqlalchemy.engine import Engine, Connection
 from sqlalchemy.schema import CreateTable
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -25,9 +26,6 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,  # type: ignore
     create_async_engine,
 )
-
-# from sqlalchemy.pool import NullPool
-# from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.sql.expression import func, null, true
 
@@ -76,6 +74,7 @@ server_engine = None
 _db_init_lock = asyncio.Lock()
 _db_initialized = False
 sqlite_semaphore = None
+sqlite_read_semaphore = None
 
 if _db_type == "sqlite":
     sync_url = "sqlite:///"
@@ -101,7 +100,7 @@ else:
 
 
 async def init_database():
-    global _db_initialized, engine, finally_url, async_maker, sqlite_semaphore
+    global _db_initialized, engine, finally_url, async_maker, sqlite_semaphore, sqlite_read_semaphore
 
     if _db_initialized:
         return
@@ -110,14 +109,20 @@ async def init_database():
         if _db_initialized:
             return
 
-        logger.info(i18n_t("📀 [数据库] 开始初始化..."))
+        logger.info(i18n_t("log.database.init_start"))
 
         try:
             if _db_type == "sqlite":
+                # ⚠️ SQLAlchemy 2.0 对「文件型」sqlite+aiosqlite 的默认池是
+                # AsyncAdaptedQueuePool(size=5, max_overflow=10, timeout=30)，
+                # 并不是历史文档里写的 NullPool。生成任务 / 协作等业务高并发下
+                # 很容易打满 15 槽 → QueuePool timeout 雪崩(2026-07 线上事故)。
+                # SQLite 单写者本就串行，用 QueuePool 只会让连接在等锁时占着槽。
+                # 显式 NullPool：每次 checkout 新建连接，并发上限交给下方 semaphore。
                 db_config.update(
                     {
                         "connect_args": {"check_same_thread": False},
-                        # 'poolclass': StaticPool,
+                        "poolclass": NullPool,
                     }
                 )
                 engine = create_async_engine(f"{base_url}{db_url}", **db_config)
@@ -128,11 +133,15 @@ async def init_database():
                     cursor = dbapi_connection.cursor()
                     cursor.execute("PRAGMA journal_mode=WAL")
                     cursor.execute("PRAGMA synchronous=NORMAL")
-                    cursor.execute("PRAGMA busy_timeout=5000")
+                    # 5s 太短：大图落盘/大 BLOB 快照写时其它连接会立刻 OperationalError
+                    # 再被 with_session 重试放大；15s 给写者一点喘息。
+                    cursor.execute("PRAGMA busy_timeout=15000")
                     cursor.close()
-                    # logger.debug("PRAGMAs set for new connection.")
 
-                sqlite_semaphore = asyncio.Semaphore(20)
+                # 并发 session 上限：原先 20 > QueuePool 的 15，信号量比池还松。
+                # NullPool 下信号量才是真正闸门；写 8 / 读 24 分开，避免大写占槽堵住读请求。
+                sqlite_semaphore = asyncio.Semaphore(8)
+                sqlite_read_semaphore = asyncio.Semaphore(24)
             else:
                 db_config.update(
                     {
@@ -142,8 +151,8 @@ async def init_database():
                         "isolation_level": "AUTOCOMMIT",
                     }
                 )
+                server_engine: Engine | None = None
                 try:
-                    server_engine = None
                     if _db_type == "mysql":
                         server_engine = create_engine(f"{sync_url}{db_url}", **db_config)
 
@@ -152,10 +161,10 @@ async def init_database():
                             t2 = "CHARACTER SET utf8mb4 COLLATE "
                             t3 = "utf8mb4_unicode_ci"
                             conn.execute(text(t1 + t2 + t3))
-                            logger.success(i18n_t("[MySQL] 数据库 {db_name} 创建成功或已存在!", db_name=db_name))
+                            logger.success(i18n_t("log.database.mysql_ok_create_database_db_name", db_name=db_name))
                     elif _db_type == "postgresql":
+                        server_engine = create_engine(f"{sync_url}{db_url}", **db_config)
                         try:
-                            server_engine = create_engine(f"{sync_url}{db_url}", **db_config)
                             with server_engine.connect() as conn:
                                 t = f"CREATE DATABASE {db_name} WITH ENCODING "
                                 t2 = "'UTF8' LC_COLLATE 'en_US.UTF-8' LC_CTYPE "
@@ -164,11 +173,13 @@ async def init_database():
                         except exc.ProgrammingError as e:
                             if "already exists" in str(e) or "已经存在" in str(e):
                                 pass
-                        logger.success(i18n_t("[PostgreSQL] 数据库 {db_name} 创建成功或已存在!", db_name=db_name))
+                            else:
+                                raise
+                        logger.success(i18n_t("log.database.postgresql_db_name_created", db_name=db_name))
                 finally:
                     if server_engine:
                         server_engine.dispose()
-                        logger.info(i18n_t("[数据库] 临时数据库连接已释放!"))
+                        logger.info(i18n_t("log.database.temporary_connection"))
 
                 # db_config['poolclass'] = NullPool
                 finally_url = f"{base_url}{db_url}{db_name}"
@@ -183,20 +194,44 @@ async def init_database():
 
             _db_initialized = True
         except Exception as e:  # noqa: E722
-            logger.exception(i18n_t("[GsCore] [数据库] 连接失败: {e}", e=e))
+            logger.exception(i18n_t("log.database.gscore_connection", e=e))
             raise ValueError(i18n_t("[GsCore] [数据库] [{base_url}] 连接失败, 请检查配置文件!", base_url=base_url))
 
 
-def with_session(
+def _is_pool_timeout(err: BaseException) -> bool:
+    """连接池耗尽 / checkout 超时：重试只会让等待雪崩，必须立即失败。"""
+    if isinstance(err, (TimeoutError, asyncio.TimeoutError)):
+        return True
+    # sqlalchemy.exc.TimeoutError 在多数版本是 builtins.TimeoutError 子类；
+    # 保险起见再按文案识别 QueuePool 报错。
+    msg = str(err)
+    return "QueuePool limit" in msg or "connection timed out" in msg
+
+
+def _is_transient_db_error(err: BaseException) -> bool:
+    """仅对 SQLite 锁竞争 / 瞬时 I/O 做有限重试。"""
+    if not isinstance(err, OperationalError):
+        return False
+    msg = str(err).lower()
+    if "unable to open database file" in msg:
+        return False
+    return "database is locked" in msg or "database table is locked" in msg or "busy" in msg or "disk i/o error" in msg
+
+
+def _session_wrapper(
     func: Callable[Concatenate[Any, AsyncSession, P], Awaitable[R]],
+    *,
+    read_only: bool,
 ) -> Callable[Concatenate[Any, P], Awaitable[R]]:
     @wraps(func)
     async def wrapper(self, *args: P.args, **kwargs: P.kwargs):
         max_retries = 3
+        last_err: BaseException | None = None
         for attempt in range(max_retries):
             try:
-                if sqlite_semaphore:
-                    async with sqlite_semaphore:
+                sem = sqlite_read_semaphore if read_only else sqlite_semaphore
+                if sem:
+                    async with sem:
                         async with async_maker() as session:
                             data = await func(self, session, *args, **kwargs)
                             await session.commit()
@@ -206,17 +241,50 @@ def with_session(
                         data = await func(self, session, *args, **kwargs)
                         await session.commit()
                         return data
-            except OperationalError as e:
-                if "unable to open database file" in str(e):
-                    logger.error(i18n_t("[数据库] 数据库无法打开，停止重试"))
-                    break
-                logger.warning(i18n_t("[数据库] 第 {p0} 次重试失败: {e}", p0=attempt + 1, e=e))
-                await asyncio.sleep(0.5 * (2**attempt))  # 指数退避
             except Exception as e:
-                logger.exception(i18n_t("[数据库] 第 {p0} 次重试失败: {e}", p0=attempt + 1, e=e))
-                await asyncio.sleep(0.5 * (2**attempt))
+                last_err = e
+                if _is_pool_timeout(e):
+                    logger.error(
+                        i18n_t(
+                            "log.database.connect_timeout_stop",
+                            e=e,
+                        )
+                    )
+                    raise
+                if isinstance(e, OperationalError) and "unable to open database file" in str(e):
+                    logger.error(i18n_t("log.database.stop_retry"))
+                    raise
+                if _is_transient_db_error(e) and attempt < max_retries - 1:
+                    logger.warning(i18n_t("log.database.retry_fail_2", p0=attempt + 1, e=e))
+                    await asyncio.sleep(0.5 * (2**attempt))
+                    continue
+                # 业务异常 / 不可恢复：直接抛，禁止静默 return None
+                if attempt >= max_retries - 1 and _is_transient_db_error(e):
+                    logger.error(
+                        i18n_t("log.database.retry_fail", e=e),
+                        exc_info=True,
+                    )
+                raise
+
+        # 理论上到不了这里；兜底保证不返回 None
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError(i18n_t("[数据库] with_session 未知失败"))
 
     return wrapper  # type: ignore
+
+
+def with_session(
+    func: Callable[Concatenate[Any, AsyncSession, P], Awaitable[R]],
+) -> Callable[Concatenate[Any, P], Awaitable[R]]:
+    return _session_wrapper(func, read_only=False)
+
+
+def with_read_session(
+    func: Callable[Concatenate[Any, AsyncSession, P], Awaitable[R]],
+) -> Callable[Concatenate[Any, P], Awaitable[R]]:
+    """SELECT 走独立读槽，不跟大写抢 sqlite_semaphore。WAL 下可读。"""
+    return _session_wrapper(func, read_only=True)
 
 
 async def get_all_table_ddl(engine: AsyncEngine) -> Dict[str, str]:
@@ -394,6 +462,12 @@ class BaseIDModel(SQLModel):
                     假设传入`None`会返回`uid`，而传入`sr`会返回`sr_uid`
                     特殊的, 传入`gs`也会返回`uid`!
 
+                    注意: 仅接受「模型上真实存在的游戏 UID 列」对应短名。
+                    米游社账号维度（``account``）等非游戏 UID 标识不可传入，
+                    否则会在校验阶段抛出 ``ValueError``，避免拼出
+                    ``account_uid`` 后在 ``getattr`` 处变成难排查的
+                    ``AttributeError``。
+
         🚀使用范例:
 
             `await GsUser.get_gameid_name('sr')`
@@ -402,13 +476,22 @@ class BaseIDModel(SQLModel):
 
             🔸`str`: 游戏uid对应列名，默认为`uid`
         """
-        if game_name == "gs":
-            game_name = None
-
-        if game_name:
-            return f"{game_name}_uid"
+        if not game_name or game_name == "gs":
+            col_name = "uid"
         else:
-            return "uid"
+            col_name = f"{game_name}_uid"
+
+        # 入口统一校验：所有 getattr(cls, get_gameid_name(...)) 依赖此保证
+        if not hasattr(cls, col_name):
+            raise ValueError(
+                f"{cls.__name__} 不存在字段 {col_name!r} "
+                f"(game_name={game_name!r})；"
+                f"game_name 只能是模型上真实存在的游戏 UID 列短名"
+                f"（如 None/'gs'/'sr'/'zzz'/'bb'/'bbb'/'wd'），"
+                f"米游社账号维度请用 mys_id 等字段查询，"
+                f"不要传 game_name='account'"
+            )
+        return col_name
 
     @classmethod
     @with_session
@@ -446,7 +529,7 @@ class BaseIDModel(SQLModel):
             🔸`int`: 如为1则删除成功，否则删除失败(数据不存在)
         """
         row_data = await cls.select_rows(**data)
-        logger.trace(i18n_t("[GsCore数据库] 即将删除{row_data}", row_data=row_data))
+        logger.trace(i18n_t("log.database.gscore_db_delete_row_data", row_data=row_data))
         if row_data:
             for row in row_data:
                 await session.delete(row)
@@ -486,7 +569,7 @@ class BaseIDModel(SQLModel):
             stmt = stmt.distinct()
         result = await session.execute(stmt)
         data = result.scalars().all()
-        logger.trace(i18n_t("[GsCore数据库] 选择 {data}", data=data))
+        logger.trace(i18n_t("log.database.gscore_data_selected", data=data))
         return data
 
     @classmethod
@@ -1443,7 +1526,11 @@ class User(BaseModel):
 
     @classmethod
     @with_session
-    async def get_all_user(cls: Type[T_User], session: AsyncSession, without_error: bool = True):
+    async def get_all_user(
+        cls: Type[T_User],
+        session: AsyncSession,
+        without_error: bool = True,
+    ) -> Sequence[T_User]:
         """📝简单介绍:
 
             基础`User`类的扩展方法, 获取到全部的数据列表
@@ -1569,7 +1656,7 @@ class User(BaseModel):
         🚀使用范例:
 
             `await GsUser.get_random_cookie(
-            uid, GsCache, {'region': server}, 'sr' if self.is_sr else None
+            uid, GsCache, {'region': server}, game_name='sr'
         )`
 
         ✅返回值:

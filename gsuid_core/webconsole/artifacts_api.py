@@ -7,16 +7,19 @@
 
 from typing import Any, Dict, Optional
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 
 from fastapi import Query, Depends
 from sqlmodel import col
 from sqlalchemy import delete
 from fastapi.responses import FileResponse
 
+from gsuid_core.i18n import t
+from gsuid_core.utils.path_safety import PathEscapeError, ensure_under_any
 from gsuid_core.webconsole.app_app import app
 from gsuid_core.webconsole.web_api import require_auth
 from gsuid_core.ai_core.planning.models import AIAgentArtifact
+from gsuid_core.ai_core.planning.workspace import ARTIFACT_ROOT
 from gsuid_core.utils.database.base_models import async_maker
 
 from ._api_tags import ARTIFACTS
@@ -46,18 +49,62 @@ async def list_artifacts(
     _: Dict[str, Any] = Depends(require_auth),
     root_task_id: Optional[str] = Query(None),
     task_id: Optional[str] = Query(None),
+    scope: Optional[str] = Query(None, description="传 `all` 走全局浏览分支"),
+    limit: int = Query(500, ge=1, le=2000),
+    include_expired: bool = Query(False),
 ) -> Dict[str, Any]:
+    """列出 Artifact。三种调用方式：
+    - `?task_id=<task_id>`：列出某 task 自己的 artifacts
+    - `?root_task_id=<root_id>`：列出某 root 树下的所有 artifacts
+    - `?scope=all`：全局按时间倒序浏览（`/ai-artifacts` 页用）
+    其余无参调用保持原契约：返回 status=1 要求提供过滤条件。
+    `include_expired=False`：仅列未过期；`=True`：列全部。
+    """
     if task_id:
         items = await AIAgentArtifact.list_for_task(task_id)
+        items = items[:limit]
     elif root_task_id:
         items = await AIAgentArtifact.list_for_root(root_task_id)
+        items = items[:limit]
+    elif scope == "all":
+        # 全局浏览分支：按 created_at 倒序拉最近 N 条
+        from sqlmodel import select
+
+        from gsuid_core.utils.database.base_models import async_maker
+
+        async with async_maker() as session:
+            stmt = select(AIAgentArtifact).order_by(col(AIAgentArtifact.created_at).desc()).limit(limit)
+            rows = (await session.execute(stmt)).scalars().all()
+        items = list(rows)
     else:
-        return {"status": 1, "msg": "必须提供 root_task_id 或 task_id", "data": None}
+        return {"status": 1, "msg": t("msg.webconsole.artifact.require_filter"), "data": None}
+
+    if not include_expired:
+        now = datetime.now(timezone.utc)
+
+        def _is_fresh(it: AIAgentArtifact) -> bool:
+            e = it.expires_at
+            if e is None:
+                return True
+            # DB 驱动返回的 datetime 默认是 offset-naive（无 tzinfo），
+            # 与 offset-aware 的 `now` 直接比较会抛 TypeError。
+            # 统一按 UTC 处理：naive 视为 UTC、aware 保持原 tz。
+            if e.tzinfo is None:
+                e = e.replace(tzinfo=timezone.utc)
+            return e > now
+
+        items = [it for it in items if _is_fresh(it)]
+
     return {
         "status": 0,
         "msg": "ok",
         "data": {"items": [_artifact_dict(a) for a in items], "count": len(items)},
     }
+
+
+def _is_image_mime(mime: str) -> bool:
+    m = (mime or "").strip().lower()
+    return m.startswith("image/")
 
 
 @app.get("/api/ai/artifacts/{res_id}", summary="详情 + 预览", tags=ARTIFACTS)
@@ -67,15 +114,43 @@ async def get_artifact_detail(
 ) -> Dict[str, Any]:
     art = await AIAgentArtifact.get_by_id(res_id)
     if art is None:
-        return {"status": 1, "msg": f"artifact {res_id} 不存在", "data": None}
+        return {"status": 1, "msg": t("msg.webconsole.artifact.not_found", res_id=res_id), "data": None}
+    detail = _artifact_dict(art)
+    mime = (art.mime or "").strip()
+    # 图片：禁止当文本预览（会出 �PNG 乱码）；前端用 raw 端点拉 blob 展示
+    if _is_image_mime(mime):
+        detail["payload_kind"] = "image"
+        detail["payload_preview"] = None
+        detail["raw_url"] = f"/api/ai/artifacts/{res_id}/raw" if art.payload_path else None
+        return {"status": 0, "msg": "ok", "data": detail}
+
     payload_preview: Optional[str] = art.payload_inline
     if not payload_preview and art.payload_path:
         try:
-            payload_preview = Path(art.payload_path).read_text(encoding="utf-8", errors="replace")[:8000]
-        except OSError:
-            payload_preview = None
-    detail = _artifact_dict(art)
+            p: Path | None = ensure_under_any(Path(art.payload_path), (ARTIFACT_ROOT,))
+        except PathEscapeError:
+            p = None
+        # 无 mime 时用魔数防二进制误读
+        if p is not None and p.exists() and p.is_file():
+            try:
+                head = p.read_bytes()[:8]
+                if head.startswith(b"\x89PNG") or head[:3] == b"\xff\xd8\xff" or head[:4] == b"GIF8":
+                    detail["payload_kind"] = "image"
+                    detail["payload_preview"] = None
+                    detail["raw_url"] = f"/api/ai/artifacts/{res_id}/raw"
+                    if not mime:
+                        detail["mime"] = (
+                            "image/png"
+                            if head.startswith(b"\x89PNG")
+                            else ("image/gif" if head[:4] == b"GIF8" else "image/jpeg")
+                        )
+                    return {"status": 0, "msg": "ok", "data": detail}
+                payload_preview = p.read_text(encoding="utf-8", errors="replace")[:8000]
+            except OSError:
+                payload_preview = None
+    detail["payload_kind"] = "text"
     detail["payload_preview"] = payload_preview
+    detail["raw_url"] = f"/api/ai/artifacts/{res_id}/raw" if art.payload_path else None
     return {"status": 0, "msg": "ok", "data": detail}
 
 
@@ -86,10 +161,13 @@ async def download_artifact_raw(
 ):
     art = await AIAgentArtifact.get_by_id(res_id)
     if art is None or not art.payload_path:
-        return {"status": 1, "msg": "无可下载的 payload_path", "data": None}
-    p = Path(art.payload_path)
-    if not p.exists():
-        return {"status": 1, "msg": "落盘文件不存在", "data": None}
+        return {"status": 1, "msg": t("msg.webconsole.artifact.no_payload_path"), "data": None}
+    try:
+        p = ensure_under_any(Path(art.payload_path), (ARTIFACT_ROOT,))
+    except PathEscapeError:
+        return {"status": 1, "msg": t("msg.webconsole.artifact.file_not_found"), "data": None}
+    if not p.exists() or not p.is_file():
+        return {"status": 1, "msg": t("msg.webconsole.artifact.file_not_found"), "data": None}
     return FileResponse(p, media_type=art.mime or "application/octet-stream")
 
 
@@ -100,14 +178,14 @@ async def delete_artifact(
 ) -> Dict[str, Any]:
     art = await AIAgentArtifact.get_by_id(res_id)
     if art is None:
-        return {"status": 1, "msg": "不存在", "data": None}
+        return {"status": 1, "msg": t("msg.webconsole.artifact.not_found", res_id=res_id), "data": None}
     # 文件落盘的尝试删除
     if art.payload_path:
         try:
-            p = Path(art.payload_path)
-            if p.exists():
+            p = ensure_under_any(Path(art.payload_path), (ARTIFACT_ROOT,))
+            if p.exists() and p.is_file():
                 p.unlink()
-        except OSError:
+        except (OSError, PathEscapeError):
             pass
     async with async_maker() as session:
         await session.execute(delete(AIAgentArtifact).where(col(AIAgentArtifact.id) == res_id))
@@ -123,7 +201,7 @@ async def extend_artifact_ttl(
 ) -> Dict[str, Any]:
     art = await AIAgentArtifact.get_by_id(res_id)
     if art is None:
-        return {"status": 1, "msg": "不存在", "data": None}
+        return {"status": 1, "msg": t("msg.webconsole.artifact.not_found", res_id=res_id), "data": None}
     new_expire = datetime.now() + timedelta(days=days)
     await AIAgentArtifact.update_data_by_data(select_data={"id": res_id}, update_data={"expires_at": new_expire})
     return {"status": 0, "msg": "ok", "data": {"res_id": res_id, "expires_at": new_expire.isoformat()}}

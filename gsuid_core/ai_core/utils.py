@@ -3,7 +3,7 @@ import re
 import json
 import base64
 import asyncio
-from typing import Any, Set, Dict, List, Tuple, Union, Literal, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Set, Dict, List, Tuple, Union, Literal, Optional, Protocol, Sequence
 
 import httpx
 from PIL import Image
@@ -37,6 +37,9 @@ from gsuid_core.ai_core.const import (
 from gsuid_core.utils.image.convert import convert_img
 from gsuid_core.utils.resource_manager import RM
 
+if TYPE_CHECKING:
+    from gsuid_core.ai_core.content_guard import GuardFlags
+
 # 表情包标记正则：兼容全角/半角冒号，以及前后任意数量的反引号包裹
 # 例如：<meme: 困>  `<meme：困>`  ``<meme: 开心>``
 MEME_TAG_PATTERN = re.compile(
@@ -56,12 +59,144 @@ SILENCE_MARKERS: frozenset[str] = frozenset(
     }
 )
 
+# 协议标签（开/闭/自闭合）。代码块内字面量不剥，避免教学回复被当成沉默。
+_PROTOCOL_TAG_RE = re.compile(
+    r"<\s*/?\s*(?:silence|end_turn|no_tool_call)\s*/?\s*>"
+    r"|\[\s*silence\s*\]",
+    re.IGNORECASE,
+)
+_PROTOCOL_CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)
+_BARE_SILENCE_RE = re.compile(r"^\s*silence\s*$", re.IGNORECASE)
+_PROTOCOL_EMPTYISH_RE = re.compile(r"^[\s\-–—.,，。！？!?、；;：:\u3000·•…]*$")
+# 截断残片：ILENCE> / SILENCE> / <SILENCE（完整标签仍走协议剥离）
+_SILENCE_FRAGMENT_RE = re.compile(
+    r"^\s*(?:ilence>|silence>?|<silence/?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def remainder_after_protocol_tags(text: str) -> str:
+    """剥掉协议标签，返回剩余台词。代码围栏/行内代码内的字面量保留。"""
+    if not text:
+        return ""
+    held: list[str] = []
+
+    def _hold(m: re.Match[str]) -> str:
+        held.append(m.group(0))
+        return f"\x00{len(held) - 1}\x00"
+
+    protected = _PROTOCOL_CODE_SPAN_RE.sub(_hold, text)
+    stripped = _PROTOCOL_TAG_RE.sub("", protected)
+    for i, chunk in enumerate(held):
+        stripped = stripped.replace(f"\x00{i}\x00", chunk)
+    return stripped
+
+
+def is_silence_marker(text: str) -> bool:
+    """整段是否沉默：裸 SILENCE、协议标签、或剥标签后只剩空白/标点。
+
+    从未含协议标签的纯标点（…… / ... / 。）是可见台词，不是沉默。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _BARE_SILENCE_RE.match(raw) is not None:
+        return True
+    if _SILENCE_FRAGMENT_RE.match(raw) is not None:
+        return True
+    leftover = remainder_after_protocol_tags(raw).strip()
+    if leftover == raw:
+        return False
+    if not leftover:
+        return True
+    return _PROTOCOL_EMPTYISH_RE.match(leftover) is not None
+
+
+_PROTOCOL_TAG_NAMES: tuple[str, ...] = ("silence", "end_turn", "no_tool_call")
+_PROTOCOL_COMPLETE_COMPACT: tuple[str, ...] = (
+    *(form for name in _PROTOCOL_TAG_NAMES for form in (f"<{name}>", f"<{name}/>", f"</{name}>", f"</{name}/>")),
+    "[silence]",
+)
+
+
+def _is_protocol_hold(text: str) -> bool:
+    """完整标签的真前缀才 hold。单独 ``[`` / ``<``、名字后跟正文都不是。"""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    compact = re.sub(r"\s+", "", raw).lower()
+    if len(compact) < 2:
+        return False
+    if compact in _PROTOCOL_COMPLETE_COMPACT:
+        return False
+    return any(tag.startswith(compact) for tag in _PROTOCOL_COMPLETE_COMPACT)
+
+
+def split_protocol_hold(buf: str, *, force: bool = False) -> tuple[str, str]:
+    """从流式缓冲切出可见文本；完整协议标签丢掉，未闭合开标签留 hold。
+
+    ``force=True``（流结束）时未闭合协议开标签也丢掉，避免 ``<SILENCE`` 漏成正文。
+    """
+    if not buf:
+        return "", ""
+    # 未闭合 <SILENCE 是 hold 前缀，不能当残片丢掉，否则下一分片 `>` 会漏出去
+    if is_silence_marker(buf) and not _is_protocol_hold(buf):
+        return "", ""
+    spans = [(m.start(), m.end()) for m in _PROTOCOL_CODE_SPAN_RE.finditer(buf)]
+    hold_at: int | None = None
+    for i, ch in enumerate(buf):
+        if ch not in "<[":
+            continue
+        if any(start <= i < end for start, end in spans):
+            continue
+        rest = buf[i:]
+        if _PROTOCOL_TAG_RE.match(rest) is not None or _is_protocol_hold(rest) or is_silence_marker(rest):
+            hold_at = i
+            break
+    if hold_at is None:
+        return buf, ""
+    visible = buf[:hold_at]
+    rest = buf[hold_at:]
+    matched = _PROTOCOL_TAG_RE.match(rest)
+    if matched is not None:
+        more_vis, hold = split_protocol_hold(rest[matched.end() :], force=force)
+        return visible + more_vis, hold
+    if is_silence_marker(rest) and not _is_protocol_hold(rest):
+        return visible, ""
+    if force and _is_protocol_hold(rest):
+        return visible, ""
+    if not _is_protocol_hold(rest):
+        more_vis, hold = split_protocol_hold(rest[1:], force=force)
+        return visible + rest[:1] + more_vis, hold
+    return visible, rest
+
+
 # run 失败返回值协议：生产端(gs_agent)与全部消费端(handle_ai/executor/sanitize)引用
 # 同一组常量做前缀/子串判断，文案微调不再让嗅探点静默失效（评审修复 E11）。
 ERROR_RESULT_PREFIX = "执行出错"
 ERROR_CONTENT_REJECTED = "内容被模型安全策略拒绝"
 ERROR_TIMEOUT_TEXT = "请求超时"
 NO_RESULT_TEXT = "Agent 执行完成，但未返回有效结果"
+
+_CONTROL_BLOCK_RE = re.compile(r"<control\b[^>]*>.*?</control>", re.DOTALL | re.IGNORECASE)
+_MAX_ITER_LEAK_RE = re.compile(r"⚠️\s*已达最大思考轮数[^\n]*(?:\n中间产物[^\n]*)?")
+_INTERNAL_CHANNEL_RE = re.compile(
+    r"（这条是内部通道，不向用户解释。）|"
+    r"本段是框架内部通道，不是群友发言：不要向用户解释、道歉或复述本段。"
+)
+
+
+def strip_framework_user_leaks(text: str) -> str:
+    """剥进用户可见正文的控制信封 / 超轮数 / 内部通道。空则调用方当沉默。"""
+    if not text:
+        return text
+    out = _CONTROL_BLOCK_RE.sub("", text)
+    out = _MAX_ITER_LEAK_RE.sub("", out)
+    out = _INTERNAL_CHANNEL_RE.sub("", out)
+    if NO_RESULT_TEXT in out:
+        out = out.replace(NO_RESULT_TEXT, "")
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    return "\n".join(lines).strip()
 
 
 def has_model_visible_content(ev: Event) -> bool:
@@ -71,12 +206,10 @@ def has_model_visible_content(ev: Event) -> bool:
     """
     if ev.text and ev.text.strip():
         return True
-    return bool(ev.image_id_list or ev.audio_id or ev.audio_id_list or ev.file)
+    return bool(ev.image_id_list or ev.audio_id or ev.audio_id_list or ev.video_id_list or ev.file or ev.node)
 
 
-# 工具调用标记残留正则（弱模型 / 兼容网关把工具调用当普通文本输出），
-# 详见 _strip_tool_call_artifacts 的 docstring。
-# 成对块：含内部 JSON 参数整体删除
+# 工具调用标记残留正则（弱模型 / 兼容网关把工具调用当普通文本输出）， 详见 _strip_tool_call_artifacts 的 docstring。
 _TOOL_CALL_BLOCK_PATTERN = re.compile(
     r"<\s*tool_calls?\s*>.*?<\s*/\s*tool_calls?\s*>",
     re.IGNORECASE | re.DOTALL,
@@ -162,14 +295,17 @@ def _strip_special_control_tokens(text: str) -> str:
     for pat in _SPECIAL_TOKEN_PATTERNS:
         cleaned = pat.sub("", cleaned)
     if cleaned != text:
-        logger.warning(i18n_t("[send] 剥离模型私有控制 token 残留（len {p0} → {p1}）", p0=len(text), p1=len(cleaned)))
+        logger.warning(i18n_t("log.ai.send_stripped_residual_private_ok", p0=len(text), p1=len(cleaned)))
     return cleaned
 
 
-# 内部资源句柄（纯内部寻址 ID，绝不该进正文；允许前后包反引号）。前缀须与实际生成对齐：
-# resource_manager.py 出 img_/aud_/vid_（8 位 hex）、models.py 出 res_（12 位 hex）。
-_RESOURCE_HANDLE_RE = re.compile(r"`*\b(?:res|img|aud|vid)_[0-9a-fA-F]{6,}\b`*")
-_RESOURCE_HANDLE_HINTS = ("res_", "img_", "aud_", "vid_")
+# 内部资源句柄（纯内部寻址 ID，绝不该进正文；
+# hex）、models.py 出 res_（12 位 hex）。
+_RESOURCE_HANDLE_RE = re.compile(
+    r"`*\b(?:res|img|aud|vid)_[0-9a-fA-F]{6,}\b`*"
+    r"|`*\bdlg_[0-9a-fA-F-]{8,}\b`*"
+)
+_RESOURCE_HANDLE_HINTS = ("res_", "img_", "aud_", "vid_", "dlg_")
 
 
 def _strip_resource_handles(text: str) -> str:
@@ -186,7 +322,7 @@ def _strip_resource_handles(text: str) -> str:
         return text
     cleaned = _RESOURCE_HANDLE_RE.sub("", text)
     if cleaned != text:
-        logger.warning(i18n_t("[send] 剥离泄漏的内部资源句柄（res_/img_ 等），避免向用户暴露内部 ID"))
+        logger.warning(i18n_t("log.ai.send_stripped_leaked_internal"))
     return cleaned
 
 
@@ -242,16 +378,16 @@ async def _resolve_and_deliver_leaked_handles(
                     p = Path(art.payload_path)
                     if p.exists():
                         await bot.send(MessageSegment.image(p.read_bytes()), extra_metadata=extra_metadata)
-                        logger.info(i18n_t("[send] 泄漏句柄 {h} 已解析为图片补发", h=h))
+                        logger.info(i18n_t("log.ai.send_leaked_handle_was_resolved", h=h))
                 elif art.payload_inline and art.payload_inline.strip():
                     inline_texts.append(art.payload_inline.strip())
                 # 非图片落盘文件：不当图片发（会坏），仅抹句柄
             elif h.startswith("img_"):
                 await bot.send(MessageSegment.image(await RM.get(h)), extra_metadata=extra_metadata)
-                logger.info(i18n_t("[send] 泄漏句柄 {h} 已解析为图片补发", h=h))
+                logger.info(i18n_t("log.ai.send_leaked_handle_was_resolved", h=h))
             # aud_/vid_：极少见于泄漏，仅抹句柄不补发（避免过度耦合）
         except Exception as e:
-            logger.debug(i18n_t("[send] 泄漏句柄 {h} 无法解析，仅抹除: {e}", h=h, e=e))
+            logger.debug(i18n_t("log.ai.send_leaked_handle_could_not", h=h, e=e))
 
     if inline_texts:
         # 把文本 artifact 内容并进正文，交给后续管线（够长自动出图），让"…自己看…"有实际内容
@@ -315,7 +451,7 @@ def extract_json_from_text(raw_text: str) -> dict | list:
 
     # 过滤已知的非 JSON 特殊标记（如模型输出的 <SILENCE>）
     stripped = raw_text.strip()
-    if stripped in SILENCE_MARKERS:
+    if is_silence_marker(stripped):
         raise ValueError(f"Special marker '{stripped}' is not valid JSON")
 
     # 上游 agent 出错时会返回 "执行出错: ..." 之类的字符串，这里提前拦截
@@ -328,8 +464,8 @@ def extract_json_from_text(raw_text: str) -> dict | list:
     if not cleaned:
         raise ValueError("JSON extraction yielded empty content after stripping fences")
 
-    # 候选串：① 从散文里配平切出的第一个完整 JSON；② 去围栏后的整段。先 span 后整段，
-    # 让 span 优先剥掉模型在 JSON 前后写的解释/寒暄；两者都试以兼容纯 JSON 与夹带散文两种返回。
+    # 候选串：① 从散文里配平切出的第一个完整 JSON；
+    # 两者都试以兼容纯 JSON 与夹带散文两种返回。
     span = _find_json_span(cleaned)
     candidates = [c for c in (span, cleaned) if c]
 
@@ -356,18 +492,16 @@ def extract_json_from_text(raw_text: str) -> dict | list:
     raise ValueError(f"Failed to parse JSON from text: {stripped[:120]!r}")
 
 
-async def handle_tool_result(bot: Optional[Bot], result: Any, max_length: int = 4000) -> str:
-    """
-    序列化工具执行结果, 当函数返回Message对象时调用Bot.send方法发送, 并将序列化后的字符串返回方便AI识别。
+# 病理级硬顶；主人格长文控长走 FileOS，勿在此用 4k 砍刀污染落盘真身
+_TOOL_RESULT_SAFETY_MAX_CHARS = 2_000_000
 
-    Args:
-        bot: Bot 对象
-        result: 工具函数返回的结果
-        max_length: 最大返回长度，超长会被截断
 
-    Returns:
-        序列化的字符串
-    """
+async def handle_tool_result(
+    bot: Optional[Bot],
+    result: Any,
+    max_length: int = _TOOL_RESULT_SAFETY_MAX_CHARS,
+) -> str:
+    """序列化工具返回；Message 会尝试 send。默认仅病理级长度硬顶。"""
     if isinstance(result, Message):
         a = "生成内容成功!"
         if bot is not None:
@@ -408,27 +542,40 @@ async def handle_tool_result(bot: Optional[Bot], result: Any, max_length: int = 
     else:
         res_str = str(result)
 
-    # 截断过长的返回值，防止 Token 爆炸
+    # 【读窗口】分页体永不砍，避免 offset 续读丢页
     if len(res_str) > max_length:
+        if "【读窗口】" in res_str[:800] or "…[分页 " in res_str or "\n[分页 " in res_str:
+            return res_str
         return res_str[:max_length] + f"\n...[系统截断: 省略后 {len(res_str) - max_length} 字符]"
     return res_str
+
+
+def _file_to_data_uri(path: str) -> str:
+    with open(path, "rb") as fh:
+        data = fh.read()
+    mime = _guess_image_mime(path)
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 
 def _normalize_image_url(raw: str) -> str:
     """将各种图片格式统一转为可消费的 URL（HTTP 或 DataURI）
 
     Args:
-        raw: 原始图片标识，支持 http/https URL、base64:// 前缀、data:image/ 前缀、裸 base64
+        raw: 原始图片标识，支持 http/https URL、本地文件路径、
+            base64:// 前缀、data:image/ 前缀、裸 base64
 
     Returns:
         标准化的图片 URL
     """
-    if raw.startswith(("http", "https")):
+    if raw.startswith(("http://", "https://")):
         return raw
     if raw.startswith("base64://"):
-        return f"data:image/png;base64,{raw[10:]}"
+        return f"data:image/png;base64,{raw.removeprefix('base64://')}"
     if raw.startswith("data:image/"):
         return raw
+    # 只对带图片后缀的短路径读盘，避免对裸 base64 做 isfile
+    if len(raw) <= 4096 and raw.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")) and os.path.isfile(raw):
+        return _file_to_data_uri(raw)
     return f"data:image/png;base64,{raw}"
 
 
@@ -458,16 +605,23 @@ async def materialize_image_url(raw: str, *, strict: bool = False) -> str:
     - http(s) URL：下载 → ``data:<mime>;base64,<...>``；下载失败时回退原 URL
       （不致命，行为不差于改动前）。
       当 ``strict=True`` 时下载失败会抛出异常而非静默回退，供调用方显式处理。
+    - 本地文件路径：读字节 → ``data:<mime>;base64,<...>``；读失败时同上。
     - base64:// / data:image/ / 裸 base64：交给 :func:`_normalize_image_url`
       处理即可，本就不会过期，无需下载。
 
     Args:
         raw: 原始图片标识。
-        strict: 是否严格模式。为 True 时下载失败抛出 RuntimeError，
-                为 False（默认）时下载失败回退原始 URL。
+        strict: 是否严格模式。为 True 时下载/读盘失败抛出 RuntimeError，
+                为 False（默认）时失败回退原始标识。
     """
     if not raw.startswith(("http://", "https://")):
-        return _normalize_image_url(raw)
+        try:
+            return _normalize_image_url(raw)
+        except OSError as e:
+            if strict:
+                raise RuntimeError(i18n_t("本地图片读取失败，无法物化为 base64: {p0} ({e})", p0=raw[:120], e=e)) from e
+            logger.warning(i18n_t("log.ai.gscoreai_convert_local_image_fail", e=e))
+            return raw
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -478,14 +632,12 @@ async def materialize_image_url(raw: str, *, strict: bool = False) -> str:
         if not mime.startswith("image/"):
             mime = _guess_image_mime(raw)
         b64 = base64.b64encode(data).decode("ascii")
-        logger.debug(
-            i18n_t("🖼️ [GsCoreAI] 远程图片已物化为 base64 DataURI ({mime}, {p0} bytes)", mime=mime, p0=len(data))
-        )
+        logger.debug(i18n_t("log.ai.gscoreai_remote_image_materialized", mime=mime, p0=len(data)))
         return f"data:{mime};base64,{b64}"
     except Exception as e:
         if strict:
             raise RuntimeError(i18n_t("远程图片下载失败，无法物化为 base64: {p0} ({e})", p0=raw[:120], e=e)) from e
-        logger.warning(i18n_t("🖼️ [GsCoreAI] 远程图片转 base64 失败，回退原始 URL: {e}", e=e))
+        logger.warning(i18n_t("log.ai.gscoreai_convert_remote_image_fail", e=e))
         return raw
 
 
@@ -544,47 +696,37 @@ def _is_master_user(user_id: str) -> bool:
 
 
 def _build_relationship_description(
-    favorability: Optional[int],
     user_name: Optional[str],
     user_id: str,
 ) -> str:
-    """将好感度转换为有温度的关系描述，而非机械的区间标签。
+    """构建说话者标识（群聊必需）。
 
     群聊场景下整个群共用一个 session，多人轮流发言。因此说话者描述里
     **必须显式带上用户ID**，否则昵称重复或为"我"这类无意义值时，
     Agent 无法区分到底是谁在说话。
+
+    关系温度（熟/不熟）由 ``assemble_dynamic_context`` 的 ``relationship`` 块统一注入，
+    此处不重复，避免同一信息双写浪费 token。主人标记保留（权限正交，不可省略）。
     """
-    # 说话者标识：始终包含用户ID，昵称仅作辅助
+    # 说话者标识：始终包含用户ID，昵称仅作辅助（与 history 块同一形状，便于模型对齐）
     if user_name and user_name.strip() and user_name.strip() != str(user_id):
         speaker = f"{user_name.strip()}(用户ID:{user_id})"
     else:
         speaker = f"用户ID:{user_id}"
 
-    # 主人用户：显著高亮，提示角色以最高信任度对待
+    # 主人：只标身份与优先级，不再写「直接…」——是否直连由 is_tome 时注入的
+    # DIRECT_MARKER 单独表达，避免与寻址标记语义叠床架屋。
     if _is_master_user(user_id):
-        return f"【⚡ 你的主人】{speaker} 直接找你说话了。对主人：完全信任，认真对待，有求必应（合规范围内）。"
-
-    if favorability is None:
-        return f"{speaker} 找你说话了。"
-
-    if favorability < 0:
-        return f"{speaker} 又来了。"
-    elif favorability < 20:
-        return f"{speaker} 来找你了，你们不太熟。"
-    elif favorability < 50:
-        return f"{speaker} 找你说话，见过几次面的那种。"
-    elif favorability < 75:
-        return f"{speaker} 找你了，算是熟人了。"
-    else:
-        return f"{speaker} 找你说话了，你们挺熟的。"
+        return f"[⚡主人] {speaker}"
+    return speaker
 
 
 async def prepare_content_payload(
     ev: Event,
     task_level: Literal["high", "low"] = "high",
-    favorability: Optional[int] = None,
-    favorability_zone: Optional[str] = None,
-) -> Sequence[UserContent]:
+    *,
+    quoted_tome: bool = False,
+) -> Tuple[Sequence[UserContent], "GuardFlags"]:
     """
     准备消息内容列表给AI看, 包含文本、图片ID、文件内容、事件对象
 
@@ -598,12 +740,12 @@ async def prepare_content_payload(
     Args:
         ev: 事件对象
         task_level: 任务级别
-        favorability: 当前用户好感度 (可选)
-        favorability_zone: 好感度区间描述 (可选)
 
     Returns:
-        content payload 列表（惰性模式仅含文本；直接模式可能含 ImageUrl）
+        ``(content payload, 输入守卫命中标记)``。标记透传给 ⑩ 结算判负向信号，
+        不再像历史实现那样把三个探测器的 bool 丢掉。
     """
+    from gsuid_core.ai_core.content_guard import GuardFlags
     from gsuid_core.ai_core.configs.ai_config import ai_config
 
     # 惰性图片投喂开关：群聊图片多时, 默认只透传图片ID, 由 AI 按需 read_image 读图,
@@ -617,34 +759,59 @@ async def prepare_content_payload(
     if ev.sender:
         nickname = ev.sender.get("nickname") or ev.sender.get("card") or None
 
-    # 叙事性关系描述（Bug-01 + Prompt-2.2: 替代数字+区间标签）
-    relationship_desc = _build_relationship_description(favorability, nickname, str(ev.user_id))
+    # 说话者标识（群聊共享 session 时必须带 ID）
+    relationship_desc = _build_relationship_description(nickname, str(ev.user_id))
     current_turn_header = f"{relationship_desc}\n"
 
     # @状态：只在被@时才注入（潜在-01: 修正 is_at_me → is_tome）。
     # 标注文案唯一定义在 interaction_scaffold（C-3 寻址门按字面匹配它，别在此写字面量）
-    from gsuid_core.ai_core.interaction_scaffold import DIRECT_MARKER, AT_OTHER_MARKER
+    from gsuid_core.ai_core.interaction_scaffold import (
+        DIRECT_MARKER,
+        AT_OTHER_MARKER,
+        QUOTE_TOME_MARKER,
+    )
 
     is_at_me = getattr(ev, "is_tome", False) or (ev.user_type == "direct")
     if is_at_me:
-        current_turn_header += f"{DIRECT_MARKER}\n"
+        # 引用 bot 仍是 is_tome，但不要写成「直接找你」逼模型必回。
+        current_turn_header += f"{QUOTE_TOME_MARKER if quoted_tome else DIRECT_MARKER}\n"
 
     current_turn_header += "--- 消息 ---\n"
 
     text = current_turn_header
+    guard_flags = GuardFlags()
     if not ev.text:
         text += "用户没有发送文本内容。"
     else:
         # 输入侧安全标注（§B.3-2）：伪造工具返回降权。只加标注、不改原意；
         # 受 content_guard_enable 开关控制。低俗/钓鱼防线在 system prompt 合规层。
         body = ev.text.strip()
-        from gsuid_core.ai_core.configs.ai_config import ai_config
-
         if ai_config.get_config("content_guard_enable").data:
-            from gsuid_core.ai_core.content_guard import annotate_untrusted_message
+            from gsuid_core.ai_core.content_guard import annotate_untrusted_message_ex
 
-            body = annotate_untrusted_message(body)
+            body, guard_flags = annotate_untrusted_message_ex(body)
         text += body
+
+    if ev.reply:
+        text += f"\n--- 引用消息 ---\n{ev.reply}\n"
+        from gsuid_core.ai_core.outbound import resolve_quote
+
+        hit = await resolve_quote(ev)
+        if hit is not None:
+            text += f"{hit.line}\n"
+    from gsuid_core.ai_core.outbound import ownership_hint
+
+    own = await ownership_hint(ev)
+    if own:
+        text += f"{own}\n"
+
+    if ev.node is not None:
+        from gsuid_core.models import format_node_preview
+
+        preview = format_node_preview(ev.node)
+        text += "\n--- 合并转发 ---\n"
+        if not ev.reply or preview not in str(ev.reply):
+            text += f"{preview}\n"
 
     # 预处理, 将用户发送的文本/AT/图片ID/音频ID等信息整合到一个字符串中, 方便AI处理
     if ev.image_id_list:
@@ -664,6 +831,19 @@ async def prepare_content_payload(
     for i in getattr(ev, "audio_id_list", []):
         text += f"\n--- 用户上传音频ID: {i} ---\n"
 
+    # 视频始终惰性：只透传 ID。未声明 video 时不指引 read_video（工具也不会挂）
+    if ev.video_id_list:
+        from gsuid_core.ai_core.configs.models import get_model_config_for_task
+
+        _support = get_model_config_for_task(task_level).get_config("model_support").data
+        if "video" in _support:
+            text += "\n--- 用户发送了视频(未展开, 需要查看内容时调用 read_video(视频ID)) ---"
+            for i in ev.video_id_list:
+                text += f"\n视频ID: {i}"
+            text += "\n"
+        else:
+            text += "\n--- 用户发送了视频(当前模型无法查看视频内容) ---\n"
+
     # @Bot 自己在入库层已转成 is_tome（见 handler.msg_process），at_list 里只会有
     # 别的用户——显式标注，防止模型把"@某人+提问"误读成在叫自己。
     for at in ev.at_list:
@@ -671,17 +851,12 @@ async def prepare_content_payload(
 
     content_payload.append(text)
 
-    # 惰性模式：图片只以 ID 形式存在（已在上方文本注明），不把本体喂进多模态上下文，
-    # 由 AI 调用 read_image 按需读取。直接跳过下方的图片物化。
+    # 惰性模式：图片只以 ID 形式存在（已在上方文本注明），不把本体喂进多模态上下文， 由 AI 调用 read_image 按需读取。
     if lazy_image_read:
-        return content_payload
+        return content_payload, guard_flags
 
     # Fix-07: 收到消息时立即物化远程图片 URL，避免过期后写入历史。
     # 远程 URL（如 QQ 带 rkey 的临时链接）会在短时间内过期；一旦以原始
-    # URL 形式存入 message_history，后续每轮重发都会让推理端 400/500。
-    # 物化产物是 DataURI —— Gemini/Anthropic 的 ImageUrl(data:) 会被 pydantic-ai
-    # download_item 的 SSRF 防护拒掉（Only http/https），须按 provider 选
-    # BinaryContent / ImageUrl（同 read_image 直投，2026-07-17 画布事故）。
     from gsuid_core.ai_core.configs.models import get_config_name_for_task, parse_provider_config_name
     from gsuid_core.ai_core.buildin_tools.image_reader import _to_tool_image_content
 
@@ -695,19 +870,20 @@ async def prepare_content_payload(
             try:
                 url = await materialize_image_url(i, strict=True)
             except Exception as e:
-                logger.warning(
-                    i18n_t("🖼️ [GsCoreAI] 图片物化失败（URL 可能已过期），跳过图片: {p0} ({e})", p0=i[:120], e=e)
-                )
+                logger.warning(i18n_t("log.ai.gscoreai_image_materialization_url_fail", p0=i[:120], e=e))
                 continue
-            injected = _to_tool_image_content(url, provider=provider)
+            injected, inject_err = _to_tool_image_content(url, provider=provider)
             if injected:
                 content_payload.extend(injected)
             else:
-                logger.warning(i18n_t("无法处理图片ID: {i}", i=i))
+                if inject_err:
+                    logger.warning(i18n_t("log.ai.unable_process_image_id_err", i=i, e=inject_err))
+                else:
+                    logger.warning(i18n_t("log.ai.unable_process_image_id", i=i))
         else:
-            logger.warning(i18n_t("无法处理图片ID: {i}", i=i))
+            logger.warning(i18n_t("log.ai.unable_process_image_id", i=i))
 
-    return content_payload
+    return content_payload, guard_flags
 
 
 def _looks_like_tool_table(text: str) -> bool:
@@ -763,9 +939,6 @@ def _strip_persona_markdown(text: str) -> str:
     if _looks_like_tool_table(text):
         return text
     text = re.sub(r"\*{1,3}([^*\n]+)\*{1,3}", r"\1", text)  # **x** / *x* → x
-    # 整行舞台旁白：整行仅一个 （…） 且括号内 ≥4 字（小说式动作/神态描写），连换行一起删。
-    # 阈值 4 放过 （笑）（误）（脸红） 这类真·口语 tone，只清"（眼睛弯成月牙）"式叙事旁白。
-    text = re.sub(r"(?m)^[ \t]*[（(][^（）()]{4,}[）)][ \t]*\n?", "", text)
     text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.M)  # 标题
     text = re.sub(r"^\s{0,3}[-*>]\s+", "", text, flags=re.M)  # 列表 / 引用
     return text
@@ -776,7 +949,7 @@ _MD_HEADER_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+\S")
 _MD_HR_RE = re.compile(r"(?m)^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$")
 # markdown 表格行（一行含 ≥3 个竖线，即 ≥2 个单元格）
 _MD_TABLE_ROW_RE = re.compile(r"\|.*\|.*\|")
-# 整行粗体小标题（如 ``**一、技术面**`` / ``**当前价：**``）——agent 研报常用它代替 # 标题
+# 整行粗体小标题（如 ``**一、概况**`` / ``**当前值：**``）——agent 长报告常用它代替 # 标题
 _MD_BOLD_HEADER_RE = re.compile(r"(?m)^\s{0,3}\*\*[^*\n]{1,40}\*\*[：:]?\s*$")
 # 编号列表项（1. / 1、 / 1) 开头）、无序列表项（- / * / • 开头，后须跟空格+内容）
 _MD_NUM_LIST_RE = re.compile(r"(?m)^\s{0,3}\d+[.、)]\s+\S")
@@ -798,7 +971,7 @@ def _should_render_markdown_image(text: str) -> bool:
     """判断一段 AI 输出是否是"结构化长 markdown 文档"，值得整篇渲染成一张图片下发。
 
     动机：``send_chat_result`` 默认按空行（``\\n\\n``）把文本拆成多条消息逐条下发——这本是
-    人格"连发 2-3 条短消息"的能力，但 agent 产出的长研报 / 报告（多标题 + 表格 + 分隔线）
+    人格"连发 2-3 条短消息"的能力，但 agent 产出的长报告（多标题 + 表格 + 分隔线）
     会因此被拆成几十条刷屏，且 IM 不渲染 markdown，用户看到的是满屏字面 ``**`` / ``|``。
 
     判定**刻意保守**，只在"确实是文档"时命中，绝不误伤日常连发短句：
@@ -807,7 +980,7 @@ def _should_render_markdown_image(text: str) -> bool:
       - 且含明确结构信号：**表格** / ≥2 个 ATX 标题 / ≥2 个整行粗体小标题 /
         编号列表≥2 项 / 无序列表≥3 项 /（水平分割线 且 ≥1 个标题）。
     仅靠"多个空行段落"绝不命中——纯口语连发短句没有表格 / 标题 / 列表。
-    （agent 研报常用 ``**粗体小标题** + 编号建议`` 而非 markdown 表格/# 标题，故一并纳入。）
+    （agent 长报告常用 ``**粗体小标题** + 编号建议`` 而非 markdown 表格/# 标题，故一并纳入。）
     代码块**不**触发出图：用户往往要复制代码，保留文本行为（见 ``_has_markdown_table``）。
     """
     from gsuid_core.ai_core.configs.ai_config import ai_config
@@ -843,24 +1016,24 @@ def _should_render_markdown_image(text: str) -> bool:
     return False
 
 
-# <report> 制品块：persona 台词与"资料内容"两通道分离的输出契约（§1 OOC 制品化）。
-# 块内是中性口吻 markdown，渲染成"资料图片"发出；块外才是角色台词。
-# title 同时接受双/单引号（LLM 引号漂移高发，评审修复 E2）：g1=双引号 title，g2=单引号，g3=body。
+# 遗留 <report> 兼容：协议已废止（主路径应 create_subagent(render_agent)）。
+# 仍剥标签并把 body 当制品出图，避免旧会话/漏网模型把字面标签刷进 IM。
 _REPORT_BLOCK_RE = re.compile(
     r"<report(?:\s+title=(?:\"([^\"\n]*)\"|'([^'\n]*)'))?\s*>(.*?)</report\s*>",
     re.S | re.I,
 )
-
-# 孤儿 report 标签（未闭合/嵌套残留）：内容保留走长 markdown 兜底，字面标签串不下发给用户
 _REPORT_TAG_ORPHAN_RE = re.compile(r"</?report(?:\s[^>\n]*)?>", re.I)
+
+# LLM API 错误消息安全网（proactive 等绕过 handle_ai 错误分类的路径兜底）
+_ERROR_OUTPUT_RE = re.compile(r"执行出错[:：]|status_code:\s*\d{3}|Traceback|rate_limit|APIError|TimeoutError")
 
 
 def _report_block_title(match: "re.Match[str]") -> str:
     return ((match.group(1) or match.group(2)) or "").strip()
 
 
-# 制品图片统一脚注：数据时点提醒 + 免责声明（§3 合规垫层——不依赖任何用户偏好记忆）
-_REPORT_FOOTER_TEMPLATE = "\n\n---\n\n> 🤖 AI 生成资料 · 数据可能滞后 · 仅供参考，不构成投资等任何决策建议 · {ts}"
+# 制品图片统一脚注：标明生成来源与渲染入口，方便溯源（非法律免责声明）
+_REPORT_FOOTER_TEMPLATE = "\n\n---\n\n> 本图由 Agent 自主生成 · ``render_md_to_bytes`` 渲染 · {ts}"
 
 
 def _report_footer() -> str:
@@ -869,13 +1042,207 @@ def _report_footer() -> str:
     return _REPORT_FOOTER_TEMPLATE.format(ts=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
 
 
-def _extract_report_blocks(text: str) -> Tuple[str, List[Tuple[str, str]]]:
-    """分离 ``<report>`` 制品块与角色台词正文。
+# 结构化数据两通道（内容形态检测，不认包装名 / 不认域关键词）
+# 流程：闭合 fence → 未闭合 fence → 段落密度 → 裸 JSON 配平。
 
-    Returns:
-        (剩余台词文本, [(title, markdown), ...])。未闭合的 report 标签不匹配，
-        内容留在正文里走既有"长 markdown 出图"兜底，不会丢内容。
+_FENCED_CODE_BLOCK_RE = re.compile(r"```(\w*)[ \t]*\r?\n?(.*?)```", re.S)
+# 任意未闭合 fence（截断输出）：位置先验同闭合 fence，仍看 body 是否结构化
+_OPEN_FENCE_RE = re.compile(r"```(\w*)[ \t]*\r?\n([\s\S]+)$")
+_STRUCTURED_BLOCK_MIN_CHARS = 80
+_TABLE_CHARS = frozenset("─│┌┐└┘├┤┬┴┼╔╗╚╝║═")
+_DENSITY_THRESHOLD = 0.30
+
+
+def _parse_json_dict(body: str) -> Optional[dict]:
+    """尝试把文本解析为 dict（含 repair）；失败返回 None。"""
+    stripped = body.strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        data = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        try:
+            data = json.loads(repair_json(stripped))
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _is_structured_content(body: str, *, min_keys: int = 3) -> bool:
+    """body 是否呈数据形态（可解析 JSON dict / 制表线 / 多行 key:value）。"""
+    stripped = body.strip()
+    data = _parse_json_dict(stripped)
+    if data is not None and len(data) >= min_keys:
+        return True
+    if body.count("─") >= 3 or body.count("│") >= 3:
+        return True
+    kv_lines = [ln for ln in body.split("\n") if re.match(r"^\s*\S+[:：]\s*\S", ln)]
+    if len(kv_lines) >= 4:
+        return True
+    return False
+
+
+def _structural_density(paragraph: str) -> float:
+    """段落结构化密度 0~1：JSON 字符 / 制表线 / kv 行 / 数字行占比，无域词表。"""
+    if not paragraph or len(paragraph) < 40:
+        return 0.0
+    # 已是合法 JSON dict → 最高先验（可执行代码极少是纯 dict 字面量段落）
+    data = _parse_json_dict(paragraph)
+    if data is not None and len(data) >= 2:
+        return 1.0
+    lines = paragraph.split("\n")
+    total_chars = len(paragraph)
+    score = 0.0
+    json_chars = sum(1 for c in paragraph if c in '{}":,')
+    if total_chars > 0:
+        json_ratio = json_chars / total_chars
+        if json_ratio > 0.08:
+            score += min(json_ratio * 3, 0.4)
+    table_chars = sum(1 for c in paragraph if c in _TABLE_CHARS)
+    if total_chars > 0:
+        table_ratio = table_chars / total_chars
+        if table_ratio > 0.03:
+            score += min(table_ratio * 5, 0.4)
+    kv_lines = sum(1 for ln in lines if re.match(r"^\s*\S+[:：]\s*\S", ln))
+    if len(lines) >= 3:
+        kv_ratio = kv_lines / len(lines)
+        if kv_ratio > 0.5:
+            score += min(kv_ratio * 0.4, 0.3)
+    if len(lines) >= 5:
+        digit_lines = sum(1 for ln in lines if re.search(r"\d+\.?\d*", ln))
+        if digit_lines / len(lines) > 0.5:
+            score += 0.15
+    return score
+
+
+def _infer_block_title(body: str) -> str:
+    """从数据形态推断标题：优先短字符串值，否则首行，否则默认。"""
+    stripped = body.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```\w*\s*", "", stripped).strip()
+    data = _parse_json_dict(stripped)
+    if data is not None:
+        for v in data.values():
+            if isinstance(v, str) and 0 < len(v.strip()) <= 40:
+                return v.strip()
+        for k in data:
+            if isinstance(k, str) and k:
+                return k[:40]
+    first_line = stripped.split("\n")[0].strip()
+    if first_line and first_line not in "{[" and len(first_line) <= 40:
+        return first_line
+    return "分析资料"
+
+
+def _fence_body_is_data(body: str) -> bool:
+    """围栏内 body 是否应进制品通道。
+
+    围栏是位置先验（模型把数据装进 fence 时 lang 名不可信），阈值比裸文本更松：
+    JSON ≥2 键即可；或密度/制表线达标。
     """
+    if not body.strip():
+        return False
+    if _is_structured_content(body, min_keys=2):
+        return True
+    if len(body) >= _STRUCTURED_BLOCK_MIN_CHARS and _structural_density(body) >= _DENSITY_THRESHOLD:
+        return True
+    return False
+
+
+def _extract_embedded_structured_blocks(
+    text: str,
+) -> Tuple[str, List[Tuple[str, str]]]:
+    """按内容形态抽出数据块，与包装名无关（```report / 裸 JSON / 制表线均可）。"""
+    reports: List[Tuple[str, str]] = []
+
+    def _try_extract_fence(match: "re.Match[str]") -> str:
+        body = match.group(2).strip()
+        if not _fence_body_is_data(body):
+            return match.group(0)
+        reports.append((_infer_block_title(body), body))
+        return ""
+
+    remaining = _FENCED_CODE_BLOCK_RE.sub(_try_extract_fence, text)
+
+    def _open_fence_data_and_tail(body: str) -> Optional[Tuple[str, str]]:
+        """未闭合 fence：只切数据前缀，尾部台词回 speech。无数据形态则 None。"""
+        stripped = body.strip()
+        if not stripped:
+            return None
+        span = _find_json_span(stripped)
+        if span is not None and _fence_body_is_data(span):
+            idx = body.find(span)
+            if idx < 0:
+                idx = 0
+            tail = body[idx + len(span) :]
+            return span, tail
+        # 空白分段：首段是表/kv 数据、尾段低密度台词
+        parts = re.split(r"\n\s*\n", body, maxsplit=1)
+        if len(parts) == 2 and _fence_body_is_data(parts[0]) and _structural_density(parts[1]) < 0.25:
+            return parts[0].strip(), parts[1]
+        if _fence_body_is_data(body):
+            return stripped, ""
+        return None
+
+    def _try_open_fence(match: "re.Match[str]") -> str:
+        body = match.group(2)
+        # 体内还有闭合围栏 → 已由 _FENCED_CODE_BLOCK_RE 处理，勿当截断 fence 再切
+        if "```" in body:
+            return match.group(0)
+        split = _open_fence_data_and_tail(body)
+        if split is None:
+            return match.group(0)
+        data_part, tail = split
+        reports.append((_infer_block_title(data_part), data_part))
+        return tail
+
+    remaining = _OPEN_FENCE_RE.sub(_try_open_fence, remaining)
+
+    paragraphs = re.split(r"(\n\s*\n)", remaining)
+    kept_parts: List[str] = []
+    for part in paragraphs:
+        stripped = part.strip()
+        if not stripped or part.isspace():
+            kept_parts.append(part)
+            continue
+        density = _structural_density(stripped)
+        json_hit = _is_structured_content(stripped, min_keys=3) and stripped.startswith("{")
+        if (
+            density >= 0.5
+            or (density >= _DENSITY_THRESHOLD and len(stripped) >= _STRUCTURED_BLOCK_MIN_CHARS)
+            or (json_hit and len(stripped) >= _STRUCTURED_BLOCK_MIN_CHARS)
+        ):
+            reports.append((_infer_block_title(stripped), stripped))
+        else:
+            kept_parts.append(part)
+
+    remaining = "".join(kept_parts)
+
+    span = _find_json_span(remaining)
+    if span is not None and len(span) >= _STRUCTURED_BLOCK_MIN_CHARS:
+        data = _parse_json_dict(span)
+        if data is not None and len(data) >= 3:
+            reports.append((_infer_block_title(span), span))
+            remaining = remaining.replace(span, "").strip()
+
+    return remaining.strip(), reports
+
+
+def _split_speech_and_artifacts(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """发送/入史共用的两通道分离：内容形态结构化块 + 遗留 XML report 兼容。
+
+    主契约已是委派 ``render_agent`` 出图；此处只做呈现层兜底，
+    避免模型把表格/JSON/旧 ``<report>`` 当台词刷屏。
+    """
+    speech, xml_blocks = _extract_legacy_report_blocks(text)
+    speech, embedded = _extract_embedded_structured_blocks(speech)
+    return speech, embedded + xml_blocks
+
+
+def _extract_legacy_report_blocks(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """遗留：剥 ``<report>`` 标签，body 进制品图通道（协议已废止，仅兼容漏网）。"""
     reports: List[Tuple[str, str]] = []
 
     def _collect(match: "re.Match[str]") -> str:
@@ -890,27 +1257,43 @@ def _extract_report_blocks(text: str) -> Tuple[str, List[Tuple[str, str]]]:
     return remaining.strip(), reports
 
 
+# 旧名别名（测试 / 外部若仍 import）
+_extract_report_blocks = _extract_legacy_report_blocks
+
+
 async def _send_report_images(
     reports: List[Tuple[str, str]],
     bot: Bot,
     extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """把 report 制品块逐个渲染为中性资料图片发出；渲染失败降级为原文文本。"""
+    """制品通道出图：结构化块 / 遗留 report body → markdown 资料图。
+
+    主路径应已由 ``render_agent`` 出图；此处是呈现层兜底。
+    """
+    from pathlib import Path
+
     from gsuid_core.utils.html_render import render_md_to_bytes
     from gsuid_core.ai_core.configs.ai_config import ai_config
 
     max_width: int = ai_config.get_config("markdown_image_max_width").data
+    css_path = str(Path(__file__).resolve().parent.parent / "utils" / "html_render" / "markdown_dark.css")
     for title, body in reports:
         md = f"# {title}\n\n{body}" if title else body
         md = f"{md}{_report_footer()}"
         try:
-            image_bytes = await render_md_to_bytes(md=md, max_width=int(max_width), image_format="jpeg")
+            image_bytes = await render_md_to_bytes(
+                md=md,
+                css_path=css_path,
+                max_width=int(max_width),
+                image_format="png",
+                dark=False,
+            )
         except Exception as e:
-            logger.warning(i18n_t("[send_chat_result] report 制品渲染失败，降级为文本: {e}", e=e))
+            logger.warning(i18n_t("log.ai.send_chat_result_render_report_artifact_fail", e=e))
             await bot.send(MessageSegment.text(md), extra_metadata=extra_metadata)
             continue
         await bot.send(MessageSegment.image(image_bytes), extra_metadata=extra_metadata)
-        logger.info(i18n_t("[send_chat_result] report 制品已渲染为资料图片 ({p0} bytes)", p0=len(image_bytes)))
+        logger.info(i18n_t("log.ai.send_chat_result_report_artifact", p0=len(image_bytes)))
 
 
 async def _try_render_markdown_image(
@@ -928,18 +1311,22 @@ async def _try_render_markdown_image(
 
     max_width: int = ai_config.get_config("markdown_image_max_width").data
     try:
+        from pathlib import Path
+
+        css_path = str(Path(__file__).resolve().parent.parent / "utils" / "html_render" / "markdown_dark.css")
         image_bytes = await render_md_to_bytes(
-            # 未走 <report> 契约的长研报兜底同样带脚注（数据时点 + 免责，§3 合规垫层）
             md=f"{md}{_report_footer()}",
+            css_path=css_path,
             max_width=int(max_width),
-            image_format="jpeg",
+            image_format="png",
+            dark=False,
         )
     except Exception as e:
-        logger.warning(i18n_t("[send_chat_result] 长 markdown 出图失败，降级为文本拆条: {e}", e=e))
+        logger.warning(i18n_t("log.ai.send_chat_result_render_long_markdown_fail", e=e))
         return False
 
     await bot.send(MessageSegment.image(image_bytes), extra_metadata=extra_metadata)
-    logger.info(i18n_t("[send_chat_result] 长 markdown 已整篇渲染为图片下发 ({p0} bytes)", p0=len(image_bytes)))
+    logger.info(i18n_t("log.ai.send_chat_result_long_markdown_rendered", p0=len(image_bytes)))
     return True
 
 
@@ -949,44 +1336,73 @@ async def send_chat_result(
     ev: Event | None = None,
     extra_metadata: Optional[Dict[str, Any]] = None,
     ooc_check: bool = True,
+    at_user_id: str | None = None,
 ) -> None:
     """
     解析并发送聊天结果，支持：
     - 按换行分割多条消息
     - @用户ID 语法 → MessageSegment.at(user_id)
+    - at_user_id：框架强制前置 @（任务交付回灌等，不依赖模型自觉）
     - <meme: 情绪> 标记（可带反引号）→ 触发表情包发送（需传入 ev）
     - extra_metadata：透传到 ``Bot.send`` 的 ``extra_metadata``，最终落到
       ``message_history`` 记录上（如主动消息的 ``proactive=True / source / reason``）
-    - ooc_check：出戏防火墙开关。gs_agent 的"重说"产物已走过一次反馈闭环，
-      传 False 放行（§D.4：提醒一次后放行，误杀只值一次重生成）
+    - ooc_check：出戏防火墙开关。gs_agent 自判产物已走过系统提醒，传 False 放行
     """
     if not text:
         return
 
     # 过滤模型输出的特殊控制标记（如 <end_turn>），避免发送给用户
     _trimmed = text.strip()
-    if _trimmed in SILENCE_MARKERS:
-        logger.debug(i18n_t("[send_chat_result] 跳过特殊标记: {_trimmed}", _trimmed=repr(_trimmed)))
+    if is_silence_marker(_trimmed):
+        logger.debug(i18n_t("log.ai.send_chat_result_special_trimmed_skip", _trimmed=repr(_trimmed)))
         return
+    _speech = remainder_after_protocol_tags(_trimmed).strip()
+    if not _speech:
+        return
+    _speech = strip_framework_user_leaks(_speech)
+    if not _speech:
+        return
+    text = _speech
+
+    # 拦截 LLM API 错误消息（429/超时等），角色化替换后下发
+    if _ERROR_OUTPUT_RE.search(text):
+        logger.warning(i18n_t("log.ai.send_chat_result_intercepted_fail", text=text[:100]))
+        text = "脑子转不动了，等下再说。"
 
     # 最终边界守卫：剥离泄漏到文本里的工具调用标记残留（详见 _strip_tool_call_artifacts）
-    # 与模型私有的回合/角色分隔特殊 token（如 MiniMax 的 ]<]minimax[>[，详见
-    # _strip_special_control_tokens）。覆盖兜底总结 / 主动消息 / 子 Agent 转述等
-    # 所有经本函数下发的路径。
+    # MiniMax 的 ]<]minimax[>[，详见
     text = _strip_tool_call_artifacts(text)
     text = _strip_special_control_tokens(text)
     # 泄漏进正文的资源句柄（res_/img_ 等）：尽量补发所指资源、否则抹除（详见函数）。
     # 放在拆条/出图之前，让文本与出图两条路径都拿到干净正文。
     text = await _resolve_and_deliver_leaked_handles(text, bot, extra_metadata)
-    # 必须在按 \n\n 拆多条之前做：<br> 会让"连发多条短消息"的拆分完全失效
+    # 两通道分离（§1）：数据形态进制品图，剩余才是角色台词。不认包装格式名。
+    text, report_blocks = _split_speech_and_artifacts(text)
+
+    # 出站兜底：非法尖括号（含 <br>）须在拆条前处理；主路径应已 gate 打回
+    from gsuid_core.ai_core.angle_bracket_guard import (
+        find_illegal_angle_tags,
+        sanitize_illegal_angle_tags,
+    )
+
+    _ab_leaks = find_illegal_angle_tags(text)
+    if _ab_leaks:
+        logger.warning(
+            i18n_t(
+                "log.ai.send_chat_result_sanitize_residual_tags",
+                tags=_ab_leaks[:4],
+                preview=repr(text[:80]),
+            )
+        )
+        text = sanitize_illegal_angle_tags(text)
+        if not text.strip() and not report_blocks:
+            return
+
+    # <br> 漏网已在 sanitize 落成换行；再统一其它 HTML 换行写法
     text = _normalize_html_linebreaks(text)
 
-    # <report> 制品块两通道分离（§1 OOC 制品化）：块内容渲染为中性资料图片，
-    # 块外才是角色台词，走后续净化/拆条。台词发完后统一补发资料图。
-    text, report_blocks = _extract_report_blocks(text)
-
     # Trace 日志：记录原始输出
-    logger.trace(i18n_t("[Meme] 原始输出: {text}", text=repr(text)))
+    logger.trace(i18n_t("log.ai.meme_text_raw_output", text=repr(text)))
 
     # 解析表情包标记
     meme_tags: list[str] = MEME_TAG_PATTERN.findall(text)
@@ -997,16 +1413,16 @@ async def send_chat_result(
     # 闲聊/人格回复剥离 markdown 与 *动作* 旁白（工具表格/代码块自动豁免，见该函数）。
     clean_text: str = _strip_persona_markdown(md_source)
 
-    # 清理标记残留的多余空格/标点。只压"空格/制表符"、保留换行——原 \s{2,} 会把
-    # \n\n 也压成空格，导致下方 re.split(r"\n\s*\n") 切不出多条，"连发多条短句"退化成一整段。
+    # 清理标记残留的多余空格/标点。只压"空格/制表符"、保留换行——原 \s{2,} 会把 \n\n 也压成空格
+    # 导致下方 re.split(r"\n\s*\n") 切不出多条 "连发多条短句"退化成一整段。
     clean_text = re.sub(r"[ \t]{2,}", " ", clean_text)
     clean_text = re.sub(r"^[，。！？\s]+|[，。！？\s]+$", "", clean_text)
 
-    # 出戏防火墙末端兜底（§D.4）：无重说通道的调用方（proactive / 兜底总结等）命中即替换；
-    # gs_agent 主循环自带"提醒→重说→放行"闭环，重说产物以 ooc_check=False 经过此处。
+    # 无提醒通道（proactive 等）命中即替换；主循环自判产物走 ooc_check=False。
     _ooc_replaced = False
     if (clean_text or report_blocks) and ooc_check:
-        from gsuid_core.ai_core.output_firewall import PERSONA_FALLBACK_TEXT, check_ooc, is_enabled
+        from gsuid_core.ai_core.output_firewall import check_ooc, is_enabled, fallback_ooc_text
+        from gsuid_core.ai_core.persona.settings import persona_name_from_event
 
         if is_enabled():
             # 短答门需要来话上下文：身份追问下的超短直答才算泄露（见 check_ooc docstring）
@@ -1015,15 +1431,14 @@ async def send_chat_result(
             if _hit is not None:
                 logger.warning(
                     i18n_t(
-                        "[OutputFirewall] send_chat_result 命中出戏红线 {p0}: {p1}，已兜底替换",
+                        "log.ai.firewall_result_hit_ooc_red",
                         p0=_hit.category,
                         p1=_hit.matched,
                     )
                 )
-                clean_text = PERSONA_FALLBACK_TEXT
+                clean_text = fallback_ooc_text(persona_name_from_event(ev))
                 _ooc_replaced = True
-            # report 块与台词同权过末端防火墙：制品通道不能成为资金红线/出戏红线的
-            # 旁路（评审修复 F3），命中的块整块丢弃（proactive 路径无重说通道）。
+            # report 块与台词同权过末端防火墙：制品通道不能成为资金红线/出戏红线的 旁路（评审修复 F3），
             if report_blocks:
                 _kept_blocks: List[Tuple[str, str]] = []
                 for _r_title, _r_body in report_blocks:
@@ -1033,7 +1448,7 @@ async def send_chat_result(
                     else:
                         logger.warning(
                             i18n_t(
-                                "[OutputFirewall] report 制品块命中红线 {p0}: {p1}，整块拦截不发",
+                                "log.ai.firewall_report_artifact_block",
                                 p0=_r_hit.category,
                                 p1=_r_hit.matched,
                             )
@@ -1048,11 +1463,7 @@ async def send_chat_result(
             await _send_meme_from_tag(meme_tags[0].strip(), bot, ev)
 
     # Trace 日志：记录解析结果
-    logger.trace(
-        i18n_t(
-            "[Meme] 解析标记: {meme_tags}, 清理后文本: {clean_text}", meme_tags=meme_tags, clean_text=repr(clean_text)
-        )
-    )
+    logger.trace(i18n_t("log.ai.meme_parsed_tags_cleaned", meme_tags=meme_tags, clean_text=repr(clean_text)))
 
     if not clean_text:
         # 没有台词也要把资料图/表情包发出去（模型可能只产出 report 块）
@@ -1066,14 +1477,34 @@ async def send_chat_result(
             await _send_trailing_artifacts()
             return
 
-    # 按换行分割为多条消息
-    blocks = re.split(r"\n\s*\n", clean_text)
+    # 按空行分割为多条消息；人格连发上限 2 条（真人不会刷 5～7 段）
+    # 超出部分并入最后一条，避免 IM 刷屏。
+    _PERSONA_MAX_BUBBLES = 2
+    blocks = [b for b in re.split(r"\n\s*\n", clean_text) if b.strip()]
+    if len(blocks) > _PERSONA_MAX_BUBBLES:
+        head = blocks[: _PERSONA_MAX_BUBBLES - 1]
+        tail = "\n".join(b.strip() for b in blocks[_PERSONA_MAX_BUBBLES - 1 :])
+        blocks = [*head, tail]
+        logger.debug(i18n_t("log.ai.persona_bubbles_clamped", p0=_PERSONA_MAX_BUBBLES))
+    _force_at = (at_user_id or "").strip()
+    _at_done = False
 
     for block in blocks:
         if not block.strip():
             continue
 
         segments = _parse_at_segments(block)
+        _has_force_in_block = any(s.type == "at" and str(s.data or "") == _force_at for s in segments)
+        if _force_at and not _at_done:
+            if not _has_force_in_block:
+                segments = [MessageSegment.at(_force_at), *segments]
+            _at_done = True
+        elif _at_done:
+            # 后续块去掉全部 at，避免刷屏；块若只剩 at 则整块跳过
+            kept = [s for s in segments if s.type != "at"]
+            if not kept:
+                continue
+            segments = kept
 
         # 计算纯文本长度
         plain_text = re.sub(r"@\d+", "", block)
@@ -1084,7 +1515,7 @@ async def send_chat_result(
 
         await bot.send(segments, extra_metadata=extra_metadata)
 
-    # 台词发完补发资料图（<report> 制品），再发表情包
+    # 台词发完补发资料图（制品通道兜底），再发表情包
     await _send_trailing_artifacts()
 
 
@@ -1113,16 +1544,16 @@ async def _send_meme_from_tag(mood: str, bot: Bot, ev: Event) -> None:
 
         file_path = get_memes_base_path() / record.file_path
         if not file_path.exists():
-            logger.debug(i18n_t("[Meme] 表情包文件不存在: {file_path}", file_path=file_path))
+            logger.debug(i18n_t("log.ai.meme_file_exist_path", file_path=file_path))
             return
 
         image_data = await _read_file(file_path)
         img_b64 = await convert_img(image_data)
         await bot.send(MessageSegment.image(img_b64))
         await AiMemeRecord.record_usage(record.meme_id, ev.group_id or "")
-        logger.info(i18n_t("[Meme] 标记触发表情包: {p0} (mood={mood})", p0=record.meme_id, mood=mood))
+        logger.info(i18n_t("log.ai.meme_tag_triggered_mood", p0=record.meme_id, mood=mood))
     except Exception as e:
-        logger.debug(i18n_t("[Meme] 标记发送失败: {e}", e=e))
+        logger.debug(i18n_t("log.ai.meme_tag_fail", e=e))
 
 
 def _parse_at_segments(text: str) -> list[Message]:
@@ -1164,11 +1595,8 @@ def _parse_at_segments(text: str) -> list[Message]:
     return segments
 
 
-# ======================================================================
 # GsCoreAIAgent 运行期的无状态消息/历史工具
 # 从 gs_agent.py 抽出：纯函数，只依赖 pydantic_ai 消息类型与 const 常量，不触碰
-# Agent 实例状态，便于复用与单测。gs_agent 按原名 import 回去使用。
-# ======================================================================
 
 
 def _is_non_retryable_model_error(e: BaseException) -> bool:
@@ -1252,12 +1680,140 @@ def _truncate_message_for_log(msg: Any, max_base64_len: int = 100) -> Any:
     return msg
 
 
+def _collect_tool_call_return_ids(messages: Sequence[ModelMessage]) -> tuple[Set[str], Set[str]]:
+    """扫描消息序列，收集 ToolCall / ToolReturn(含 Retry) 的 tool_call_id 集合。"""
+    call_ids: Set[str] = set()
+    return_ids: Set[str] = set()
+    for msg in messages:
+        if isinstance(msg, ModelResponse):
+            for part in msg.parts:
+                if isinstance(part, ToolCallPart):
+                    call_ids.add(part.tool_call_id)
+        elif isinstance(msg, ModelRequest):
+            for part in msg.parts:
+                if isinstance(part, ToolReturnPart):
+                    return_ids.add(part.tool_call_id)
+                elif isinstance(part, RetryPromptPart) and part.tool_name is not None:
+                    return_ids.add(part.tool_call_id)
+    return call_ids, return_ids
+
+
+def _has_orphan_tool_returns(messages: Sequence[ModelMessage]) -> bool:
+    """保留集里是否存在「有 return 无 call」的断裂配对。"""
+    call_ids, return_ids = _collect_tool_call_return_ids(messages)
+    return bool(return_ids - call_ids)
+
+
+def _truncate_history_keep_prefix(
+    history: List[ModelMessage],
+    max_keep: int,
+    *,
+    prefix_ratio: float = 0.35,
+) -> List[ModelMessage]:
+    """前缀稳定截断：永不丢头部，只裁中段，保留近期尾部。
+
+    Provider 前缀缓存依赖 message_history **从左起**字节不变。旧策略
+    ``history[-n:]`` 每轮砍头 → 整段前缀失效。本函数保证
+    ``history[:prefix_n]`` 在历次 compact 间对象序列不变，只丢掉
+    ``prefix_n .. tail_start`` 的中段。
+
+    工具配对：若尾部有孤立 ToolReturn，向左吞并中段直至配对完整；
+    仍无法配对则放弃裁剪、原样返回（安全阀）。
+    """
+    if len(history) <= max_keep:
+        return history
+    if max_keep <= 1:
+        return list(history[-1:])
+
+    prefix_n = max(2, int(max_keep * prefix_ratio))
+    prefix_n = min(prefix_n, max_keep - 1)
+    tail_budget = max_keep - prefix_n
+    tail_start = len(history) - tail_budget
+
+    # 尾段向左扩展以补齐工具 call/return；绝不侵入 prefix（保头）
+    while tail_start > prefix_n:
+        retained = history[:prefix_n] + history[tail_start:]
+        if not _has_orphan_tool_returns(retained):
+            logger.debug(
+                i18n_t(
+                    "log.ai.safe_truncation_history_cutoff",
+                    p0=len(history),
+                    p1=len(retained),
+                    truncate_index=tail_start,
+                )
+            )
+            return retained
+        tail_start -= 1
+
+    # tail 已顶到 prefix：无法在保头前提下安全裁中段
+    if not _has_orphan_tool_returns(history):
+        logger.warning(i18n_t("log.ai.cannot_safely_truncate_history", p0=len(history)))
+    return history
+
+
+def _extractive_middle_summary(dropped: Sequence[ModelMessage]) -> str:
+    """被裁中段的抽取摘要。LLM 蒸馏失败时的摊还重写材料。"""
+    bits: list[str] = []
+    used = 0
+    for msg in dropped:
+        chunk = ""
+        if isinstance(msg, ModelResponse):
+            for part in msg.parts:
+                if isinstance(part, TextPart) and part.content.strip():
+                    chunk = part.content.strip()[:80]
+                    break
+        elif isinstance(msg, ModelRequest):
+            for part in msg.parts:
+                if isinstance(part, UserPromptPart) and isinstance(part.content, str):
+                    body = part.content.strip()
+                    if _is_framework_prompt_content(body):
+                        continue
+                    chunk = body[:80]
+                    break
+        if not chunk:
+            continue
+        bits.append(chunk)
+        used += len(chunk)
+        if used >= 400:
+            break
+    if not bits:
+        return ""
+    body = " / ".join(bits)[:400]
+    return f"（更早对话摘要：{body}）"
+
+
+def compact_session_history(
+    history: List[ModelMessage],
+    max_history: int,
+    *,
+    trim_ratio: float = 0.6,
+) -> tuple[List[ModelMessage], bool]:
+    """会话 history 高低水位 compact（保头裁中段 + 孤儿清理）。
+
+    Returns:
+        (new_history, did_truncate) — did_truncate 表示因超水位主动丢过中段。
+    """
+    if max_history <= 0:
+        return [], True
+    before = len(history)
+    if before <= max_history:
+        return _drop_orphan_tool_results(history), False
+    low_target = max(1, int(max_history * trim_ratio))
+    trimmed = _truncate_history_keep_prefix(history, low_target)
+    cleaned = _drop_orphan_tool_results(trimmed)
+    return cleaned, len(cleaned) < before
+
+
 def _truncate_history_with_tool_safety(
     history: List[ModelMessage],
     max_history: int,
 ) -> List[ModelMessage]:
     """
     安全截断 history，确保保留的消息中 ToolCallPart 和 ToolReturnPart 完全配对。
+
+    .. deprecated::
+        主会话请用 ``_truncate_history_keep_prefix``（保头裁中段，前缀缓存友好）。
+        本函数仍为「保留尾部」语义，供需要旧行为的调用方。
 
     问题：如果简单地从末尾截断 history，可能导致 ToolReturnPart 被保留
     但其对应的 ToolCallPart 被丢弃（在被截断的前半部分），从而在下一轮请求时出现
@@ -1286,35 +1842,14 @@ def _truncate_history_with_tool_safety(
     while truncate_index > 0:
         truncated = history[truncate_index:]
 
-        # 收集截断结果中所有 ToolCallPart 的 tool_call_id
-        retained_call_ids: Set[str] = set()
-        # 收集截断结果中所有 ToolReturnPart 的 tool_call_id
-        retained_return_ids: Set[str] = set()
-
-        for msg in truncated:
-            if isinstance(msg, ModelResponse):
-                for part in msg.parts:
-                    if isinstance(part, ToolCallPart):
-                        retained_call_ids.add(part.tool_call_id)
-            elif isinstance(msg, ModelRequest):
-                for part in msg.parts:
-                    if isinstance(part, ToolReturnPart):
-                        retained_return_ids.add(part.tool_call_id)
-                    # RetryPromptPart 也是"工具结果型"消息：工具参数校验失败时
-                    # 由 PydanticAI 生成，同样带 tool_call_id、必须有配对的
-                    # ToolCallPart。tool_name 为 None 时是输出校验重试，不绑定
-                    # 具体工具调用，不计入。
-                    elif isinstance(part, RetryPromptPart) and part.tool_name is not None:
-                        retained_return_ids.add(part.tool_call_id)
-
-        # 找出截断结果中的孤立 return（有 return 但没有对应的 call）
-        orphaned = retained_return_ids - retained_call_ids
+        call_ids, return_ids = _collect_tool_call_return_ids(truncated)
+        orphaned = return_ids - call_ids
 
         if not orphaned:
             # 所有保留的 return 都有对应的 call，截断安全
             logger.debug(
                 i18n_t(
-                    "🧠 [GsCoreAIAgent] 安全截断 history: {p0} -> {p1} (截断点: {truncate_index})",
+                    "log.ai.safe_truncation_history_cutoff",
                     p0=len(history),
                     p1=len(truncated),
                     truncate_index=truncate_index,
@@ -1342,13 +1877,13 @@ def _truncate_history_with_tool_safety(
         new_truncate_index = max(0, min_orphaned_idx - 2)
         if new_truncate_index >= truncate_index:
             # 安全阀：如果无法继续前移，直接保留全部历史
-            logger.warning(i18n_t("🧠 [GsCoreAIAgent] 无法安全截断 history，保留全部 {p0} 条", p0=len(history)))
+            logger.warning(i18n_t("log.ai.cannot_safely_truncate_history", p0=len(history)))
             return history
 
         truncate_index = new_truncate_index
 
     # truncate_index == 0，保留全部历史
-    logger.debug(i18n_t("🧠 [GsCoreAIAgent] 安全截断 history: {p0} -> {p0} (保留全部)", p0=len(history)))
+    logger.debug(i18n_t("log.ai.safe_truncation_history_kept", p0=len(history)))
     return history
 
 
@@ -1373,22 +1908,17 @@ def _drop_orphan_tool_results(history: List[ModelMessage]) -> List[ModelMessage]
         if isinstance(msg, ModelRequest):
             kept_parts = []
             for part in msg.parts:
-                # 复用同一个 isinstance 守卫：进入分支时 part 类型已被 mypy/Pyright
-                # 收窄为 ToolReturnPart / RetryPromptPart，两者都有 tool_call_id，
-                # 不需要 getattr 兜底（LLM.md §1.4）。
+                # 复用同一个 isinstance 守卫：进入分支时 part 类型已被 mypy/Pyright 收窄为 ToolReturnPart /
+                # 两者都有 tool_call_id
                 if isinstance(part, ToolReturnPart) and part.tool_call_id not in call_ids:
-                    logger.warning(
-                        i18n_t("🧠 [GsCoreAIAgent] 丢弃孤儿 ToolReturnPart: tool_call_id={p0}", p0=part.tool_call_id)
-                    )
+                    logger.warning(i18n_t("log.ai.dropping_orphan_toolreturnpart_call", p0=part.tool_call_id))
                     continue
                 if (
                     isinstance(part, RetryPromptPart)
                     and part.tool_name is not None
                     and part.tool_call_id not in call_ids
                 ):
-                    logger.warning(
-                        i18n_t("🧠 [GsCoreAIAgent] 丢弃孤儿 RetryPromptPart: tool_call_id={p0}", p0=part.tool_call_id)
-                    )
+                    logger.warning(i18n_t("log.ai.dropping_orphan_retrypromptpart_call", p0=part.tool_call_id))
                     continue
                 kept_parts.append(part)
             if kept_parts:
@@ -1433,26 +1963,73 @@ def _strip_remote_images_from_history(history: List[ModelMessage]) -> int:
 
 
 # §25(5) 工具返回入史上限：本轮模型已消费过完整返回，持久历史里只需可引用的摘要。
-# web_search/stock_financials 等大返回原文滚进历史是 run 内 token 近似 O(N²) 的来源。
-_TOOL_RETURN_HISTORY_MAX = 4000
-_TOOL_RETURN_HEAD = 3200
-_TOOL_RETURN_TAIL = 400
+# web_search 等大返回原文滚进历史是 run 内 token 近似 O(N²) 的来源。
+# 入史截断：能力代理轮内看完整返回；入史可略长以免追问丢字段
+_TOOL_RETURN_HISTORY_MAX = 12_000
+_TOOL_RETURN_HEAD = 9_000
+_TOOL_RETURN_TAIL = 1_500
+
+# 主人格当轮折叠 JSON 时的摘要上限（仅 Chat/Agent/Plan）
+_PROFESSIONAL_TOOL_SUMMARY_MAX = 300
+
+
+def _looks_like_structured_data(content: str) -> bool:
+    """内容是否为高密度结构化数据（JSON dict、字段多、数值占比高）。
+
+    基于内容结构判断，不依赖工具名——任何返回结构化数据的工具
+    都会被检测到，无需维护工具名白名单。
+    """
+    stripped = content.strip()
+    if not stripped.startswith("{"):
+        return False
+    try:
+        data = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict) or len(data) < 5:
+        return False
+    numeric = sum(1 for v in data.values() if isinstance(v, (int, float)))
+    return numeric / len(data) > 0.4
+
+
+def _summarize_structured_data(content: str) -> str:
+    """结构化数据通用摘要：保留头部关键信息，省略其余。"""
+    if len(content) <= _PROFESSIONAL_TOOL_SUMMARY_MAX:
+        return content
+    head = content[:200]
+    return f"{head}…[结构化数据已摘要，完整返回仅当前轮可见]…"
 
 
 def _truncate_tool_returns_in_history(messages: List[ModelMessage]) -> int:
-    """把将持久化的超长 ToolReturnPart 内容截断为「头 + 省略标记 + 尾」，返回截断数。
+    """把将持久化的 ToolReturnPart 内容截断/摘要，返回处理数。
 
-    只影响写入 self.history 的副本语义（原地改 part.content）；当前轮模型看到的
-    仍是完整返回。头尾保留让后续轮还能引用结论与末尾的状态行。
+    只影响写入 self.history 的副本语义（原地改 part.content）；
+    当前轮模型看到的仍是完整返回。
+
+    OOC 修复 5.2：两层处理——
+    1. 高密度结构化数据（基于内容检测，不依赖工具名）：
+       无论长度都摘要，切断专业语域对主人格上下文的污染。
+    2. 其他工具：超过 _TOOL_RETURN_HISTORY_MAX 做头+尾截断。
     """
     truncated = 0
     for msg in messages:
         if not isinstance(msg, ModelRequest):
             continue
         for part in msg.parts:
-            if not isinstance(part, ToolReturnPart) or not isinstance(part.content, str):
+            # v2.0 新增 ToolSearchReturnPart 等 part 类型， 那些的 content 不容许赋值 str。type(part) is
+            if type(part) is not ToolReturnPart or not isinstance(part.content, str):
                 continue
             content = part.content
+
+            # 层 1：结构化数据 → 基于内容检测，无论长度都摘要
+            if _looks_like_structured_data(content):
+                new_content = _summarize_structured_data(content)
+                if new_content != content:
+                    part.content = new_content
+                    truncated += 1
+                continue
+
+            # 层 2：其他工具 → 超长截断
             if len(content) <= _TOOL_RETURN_HISTORY_MAX:
                 continue
             omitted = len(content) - _TOOL_RETURN_HEAD - _TOOL_RETURN_TAIL
@@ -1463,69 +2040,307 @@ def _truncate_tool_returns_in_history(messages: List[ModelMessage]) -> int:
 
 
 def _compact_report_blocks_in_history(
-    messages: List[ModelMessage],
+    messages: Sequence[ModelMessage],
     sent_texts: Optional[Set[str]] = None,
 ) -> int:
-    """把将持久化的 assistant 文本里的 ``<report>`` 块替换为占位符，返回替换数。
+    """历史里抹掉结构化数据块，切断格式漂移正反馈。
 
-    资料图已发出，正文无需留在 self.history：既省 token，又切断"模型每轮看到
-    自己在念研报 → 研报腔固化为人格语气"的自我强化回路（§1 漂移固化）。
-    占位符保留标题，后续轮仍能引用"我刚发过什么资料"。
-
-    ``sent_texts``：本轮实际发送成功的原始文本集合（gs_agent._run_sent_texts）。
-    给定时只压缩「确实发出去过」的 part——被拦截/暂扣/发送失败的文本不得谎称
-    已发资料图（评审修复 E5）。
+    流程（两步分离，避免 E5 与「教坏模型」打架）：
+    1. **所有** assistant TextPart 都做两通道分离——数据块从历史删除，只留台词。
+       不依赖是否发送成功：未发出的 ```report 留在 history 一样会教模型再写。
+    2. ``sent_reports`` metadata **仅**在 part 原文属于 ``sent_texts`` 时写入
+       （用户侧「上一轮发了资料图」注释不得谎报；return 模式 / 暂扣未发不写）。
     """
-
-    def _placeholder(match: "re.Match[str]") -> str:
-        title = _report_block_title(match) or "分析资料"
-        return f"【已发资料图：{title}】"
-
     replaced = 0
     for msg in messages:
         if not isinstance(msg, ModelResponse):
             continue
+        sent_titles: List[str] = []
         for part in msg.parts:
-            if not isinstance(part, TextPart) or "<report" not in part.content.lower():
+            if not isinstance(part, TextPart):
                 continue
-            if sent_texts is not None and part.content.strip() not in sent_texts:
+            original = part.content
+            if not original or ("<" not in original and "```" not in original and "{" not in original):
                 continue
-            new_content = _REPORT_BLOCK_RE.sub(_placeholder, part.content)
-            if new_content != part.content:
-                part.content = new_content
-                replaced += 1
+            speech, blocks = _split_speech_and_artifacts(original)
+            if speech == original and not blocks:
+                continue
+            part.content = speech.strip()
+            replaced += 1
+            was_sent = sent_texts is None or original.strip() in sent_texts
+            if was_sent and blocks:
+                sent_titles.extend(title or "分析资料" for title, _ in blocks)
+        if sent_titles:
+            existing = msg.metadata or {}
+            existing["sent_reports"] = sent_titles
+            msg.metadata = existing
     return replaced
 
 
+_DELIVERY_INSTR = ("create_subagent", "send_message_by_ai", "禁止", "你是主人格", "长文尚未", "出图委派")
+
+
+def lean_delivery_frame(full: str) -> str:
+    """交付包入史瘦身：任务号 + 句柄 + 主题。不取说明书行。"""
+    s = (full or "").strip()
+    if not s:
+        return ""
+    ordinal = "?"
+    m_ord = re.search(r"任务#(\d+)", s)
+    if m_ord is not None:
+        ordinal = m_ord.group(1)
+    handles = re.findall(r"res_[0-9a-fA-F]{3,}", s)
+    handle = handles[0] if handles else "-"
+    topic = ""
+    m_title = re.search(r"任务#\d+「([^」]+)」", s)
+    if m_title is not None:
+        topic = m_title.group(1).strip()[:40]
+    if not topic:
+        for line in s.splitlines():
+            t = line.strip()
+            if re.match(r"res_[0-9a-fA-F]{3,}\s*\|", t):
+                bits = [p.strip() for p in t.split("|")]
+                if len(bits) >= 3 and bits[-1]:
+                    topic = bits[-1][:40]
+                    break
+    if not topic:
+        for line in s.splitlines():
+            t = line.strip()
+            if not t or t.startswith("[框架") or t.startswith("【子任务"):
+                continue
+            if t.startswith("产物") or t.startswith("💡") or t.startswith("你是主人格"):
+                continue
+            if any(h in t for h in _DELIVERY_INSTR):
+                continue
+            topic = t[:40]
+            break
+    tail = f"，{topic}" if topic else ""
+    return f"[框架·任务完成] 任务#{ordinal} 完成，句柄 {handle}{tail}"
+
+
+def _is_delivery_frame(content: str) -> bool:
+    s = content.lstrip()
+    return s.startswith("[框架·任务完成]") or s.startswith("【子任务交付")
+
+
+_EPHEMERAL_SYSTEM_PREFIXES: tuple[str, ...] = (
+    "（系统：",
+    "（系统提示：",
+    "（系统校验",
+)
+
+
+def _peel_ephemeral_system_lines(content: str) -> str:
+    """入史前剥（系统：）类 per-turn 提示，避免污染后续轮。"""
+    kept: list[str] = []
+    for ln in content.splitlines():
+        s = ln.strip()
+        if s.startswith(_EPHEMERAL_SYSTEM_PREFIXES):
+            continue
+        kept.append(ln)
+    return "\n".join(kept).rstrip("\n")
+
+
+def _hint_matches_strip(content: str, strip_hint_texts: Tuple[str, ...]) -> bool:
+    return any(content == h or (bool(h) and content.startswith(h)) for h in strip_hint_texts)
+
+
+def _relean_user_prompt_part(
+    part: UserPromptPart,
+    lean_content: Union[str, List[UserContent]],
+    strip_hint_texts: Tuple[str, ...],
+) -> UserPromptPart | None:
+    content = part.content
+    if isinstance(content, str):
+        if _is_framework_prompt_content(content):
+            if _is_delivery_frame(content):
+                lean = lean_content if isinstance(lean_content, str) and lean_content else lean_delivery_frame(content)
+                if lean:
+                    return UserPromptPart(content=lean)
+            return None
+        if _hint_matches_strip(content, strip_hint_texts):
+            return None
+        peeled = _peel_ephemeral_system_lines(content)
+        if not peeled.strip():
+            return None
+        if peeled != content:
+            return UserPromptPart(content=peeled)
+        return part
+    new_items: list[UserContent] = []
+    changed = False
+    for item in content:
+        if not isinstance(item, str):
+            new_items.append(item)
+            continue
+        if _is_framework_prompt_content(item) and not _is_delivery_frame(item):
+            changed = True
+            continue
+        if _hint_matches_strip(item, strip_hint_texts):
+            changed = True
+            continue
+        peeled = _peel_ephemeral_system_lines(item)
+        if not peeled.strip():
+            changed = True
+            continue
+        if peeled != item:
+            changed = True
+        new_items.append(peeled)
+    if not new_items:
+        return None
+    if changed:
+        return UserPromptPart(content=new_items)
+    return part
+
+
 def _relean_user_turn(
-    new_messages: List[ModelMessage],
+    new_messages: Sequence[ModelMessage],
     lean_content: Union[str, List[UserContent]],
     strip_hint_texts: Tuple[str, ...] = (),
 ) -> None:
-    """把本轮 new_messages 里的用户输入 turn 换成精简版（剥离 rag_context）。
-
-    每轮 ``final_user_message`` 含【历史对话】/记忆/群语境等 rag_context，若原样
-    ``extend`` 进 self.history，会在 max_history 窗口内逐轮累积同类快照——既膨胀
-    input，又冲淡缓存。存历史时只保留用户真实发言（当前轮仍给模型看完整上下文）。
-    改第一条 UserPromptPart（工具往返的 ToolReturnPart 不动）；``strip_hint_texts``
-    是框架 run 中途注入的提示常量（如 C-4 墙钟 nudge，挂在**后续** ModelRequest 上、
-    首条替换够不着）——按内容精确匹配从持久历史里剥掉，防提示噪声跨轮累积。
-    """
-    leaned = False
+    """剥校验注入；交付帧改成一行入史，其它框架块丢弃。"""
     for msg in new_messages:
         if not isinstance(msg, ModelRequest):
             continue
         kept_parts = []
         for part in msg.parts:
             if isinstance(part, UserPromptPart):
-                if not leaned:
-                    part.content = lean_content
-                    leaned = True
-                elif isinstance(part.content, str) and part.content in strip_hint_texts:
-                    continue
+                kept = _relean_user_prompt_part(part, lean_content, strip_hint_texts)
+                if kept is not None:
+                    kept_parts.append(kept)
+                continue
             kept_parts.append(part)
-        if len(kept_parts) != len(msg.parts):
-            msg.parts = kept_parts
+        msg.parts = kept_parts
+
+
+# 现役控制面走 <control> 信封（按类型判定身份）；本表只兜遗留文案。
+# 曾漏 `（系统校验·内部轮）`（表里只有全角冒号版），使框架指令穿成 user 发言。
+_LEGACY_FRAMEWORK_PREFIXES: tuple[str, ...] = (
+    "[框架·",
+    "[系统·",
+    "（系统校验",
+    "（系统：",
+    "（系统提示：",
+    "<control",
+)
+
+_USER_SPEECH_SHELL = "[用户发言]"
+
+
+def _is_framework_prompt_content(content: str) -> bool:
+    """框架/校验注入：不得当作真人发言进入 B 轨。"""
+    s = content.lstrip()
+    if s.startswith(_USER_SPEECH_SHELL):
+        s = s[len(_USER_SPEECH_SHELL) :].lstrip()
+    return s.startswith(_LEGACY_FRAMEWORK_PREFIXES)
+
+
+def _normalize_thinking_tags(thinking_tags: tuple[str, str]) -> tuple[str, str]:
+    """把 profile 里的裸标签名补成成对尖括号。
+
+    pydantic_ai 的 ``DEFAULT_THINKING_TAGS`` 是 ``('<think>', '</think>')``；
+    我们曾把缺省写成 ``('think', 'think')``。裸名直接 ``str.find`` 会命中英文
+    思考里的单词 think，把正文拆碎。已是 ``<…>`` / ``</…>`` 的原样返回。
+    """
+    start, end = thinking_tags
+    if start and not start.startswith("<"):
+        start = f"<{start}>"
+    if end and not end.startswith("<"):
+        end = f"</{end}>"
+    return (start, end)
+
+
+class ThinkTagSplitter:
+    """把流式 TextPartDelta 里的 ``<think>…</think>`` 拆成 (可见文本, 思考增量)。
+
+    标签可能跨 chunk 切开，所以要保留半截前缀。未闭合的思考不进可见文本。
+    """
+
+    __slots__ = ("start", "end", "in_think", "hold")
+
+    def __init__(self, start: str = "<think>", end: str = "</think>") -> None:
+        start, end = _normalize_thinking_tags((start, end))
+        self.start = start
+        self.end = end
+        self.in_think = False
+        self.hold = ""
+
+    def reset(self) -> None:
+        self.in_think = False
+        self.hold = ""
+
+    def feed(self, piece: str) -> tuple[str, str]:
+        if not piece:
+            return "", ""
+        s = self.hold + piece
+        self.hold = ""
+        visible: list[str] = []
+        thought: list[str] = []
+        i = 0
+        while i < len(s):
+            token = self.end if self.in_think else self.start
+            j = s.find(token, i)
+            if j < 0:
+                cut = _partial_token_suffix(s, i, token)
+                chunk = s[i:] if cut < 0 else s[i:cut]
+                if self.in_think:
+                    thought.append(chunk)
+                else:
+                    visible.append(chunk)
+                if cut >= 0:
+                    self.hold = s[cut:]
+                break
+            chunk = s[i:j]
+            if self.in_think:
+                thought.append(chunk)
+                self.in_think = False
+            else:
+                visible.append(chunk)
+                self.in_think = True
+            i = j + len(token)
+        return "".join(visible), "".join(thought)
+
+    def flush(self) -> tuple[str, str]:
+        leftover = self.hold
+        self.hold = ""
+        if not leftover:
+            return "", ""
+        if self.in_think:
+            return "", leftover
+        # 半截起始标签不是正文（与未闭合思考一致，不进气泡）
+        if self.start.startswith(leftover):
+            return "", ""
+        return leftover, ""
+
+
+def _partial_token_suffix(s: str, start: int, token: str) -> int:
+    """``s[start:]`` 若以 ``token`` 的真前缀结尾，返回截断下标，否则 -1。"""
+    tail = s[start:]
+    max_k = min(len(tail), len(token) - 1)
+    for k in range(max_k, 0, -1):
+        if token.startswith(tail[-k:]):
+            return len(s) - k
+    return -1
+
+
+def _dedupe_thinking_parts(parts: Sequence[ModelResponsePart]) -> List[ModelResponsePart]:
+    """同一响应里相同思考只留一份（先出现的优先，通常是原生 reasoning 字段）。
+
+    MiniMax 等兼容网关会同时给出 ``reasoning_content``（pydantic_ai 已做成
+    ThinkingPart）和 ``content`` 里再包一层 ``<think>…</think>``。流式路径下
+    标签常不单独成 SSE chunk，补拆后又得到一份相同 ThinkingPart。重复会：
+    session log 双记、history 回放双倍 token、thinking_segments 膨胀。
+    """
+    seen: Set[str] = set()
+    kept: List[ModelResponsePart] = []
+    for part in parts:
+        if isinstance(part, ThinkingPart):
+            key = part.content.strip()
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+        kept.append(part)
+    return kept
 
 
 def _split_embedded_thinking(
@@ -1540,8 +2355,10 @@ def _split_embedded_thinking(
     意图-行为一致性检测。这里按完整文本重新拆分，对齐非流式路径
     （openai 模型的 split_content_into_text_and_thinking）的行为。非 TextPart 与不含
     起始标签的 TextPart 原样透传。
+
+    拆完后按内容去重：网关常把同一段思考同时放进 reasoning 字段和 ``<think>`` 文本。
     """
-    start_tag, end_tag = thinking_tags
+    start_tag, end_tag = _normalize_thinking_tags(thinking_tags)
     result: List[ModelResponsePart] = []
     for part in parts:
         if not isinstance(part, TextPart) or start_tag not in part.content:
@@ -1558,13 +2375,13 @@ def _split_embedded_thinking(
                 think, content = content[:end_index], content[end_index + len(end_tag) :]
                 result.append(ThinkingPart(content=think))
             else:
-                # 缺少闭合标签：丢弃 <think> 起始标签，剩余内容按文本处理
-                result.append(TextPart(content=content))
+                # 缺少闭合标签：与 ThinkTagSplitter 一致，未闭合内容当思考
+                result.append(ThinkingPart(content=content))
                 content = ""
             start_index = content.find(start_tag)
         if content:
             result.append(TextPart(content=content))
-    return result
+    return _dedupe_thinking_parts(result)
 
 
 def _canonicalize_tool_call_args_in_parts(
@@ -1606,7 +2423,7 @@ def _canonicalize_tool_call_args_in_parts(
         if canonical != part.args:
             logger.warning(
                 i18n_t(
-                    "🧠 [GsCoreAIAgent] 工具 {p0} 参数含重复键，已规范化（原始 {p1} 字符 → {p2} 字符）",
+                    "log.ai.args_duplicate_keys_normalized",
                     p0=part.tool_name,
                     p1=len(part.args),
                     p2=len(canonical),
@@ -1625,25 +2442,27 @@ def _is_retryable_client_error(e: BaseException) -> bool:
     return isinstance(e, ModelHTTPError) and _is_non_retryable_model_error(e) and not _is_content_rejected(e)
 
 
-def sanitize_error_for_user(result_text: str) -> str:
+def sanitize_error_for_user(result_text: str, persona_name: str | None = None) -> str:
     """把 ``执行出错: <内部细节>`` 转成不泄漏内部细节的用户可见短文案。
 
     原始错误串含 provider body / model_name / tool_call_id 等内部信息，直接发进
     群聊既难看又泄漏实现；完整细节已由 log_error 落日志，用户侧只需要知道失败了。
     """
+    from gsuid_core.ai_core.persona.settings import get_persona_setting
+
     if result_text == NO_RESULT_TEXT:
-        return "这条消息我处理失败了，稍后再试一次吧"
+        return get_persona_setting(persona_name, "error_generic")
     if not result_text.startswith(ERROR_RESULT_PREFIX):
         return result_text
-    # 文案不得是整行（…）形态：_strip_persona_markdown 会把整行括号当舞台旁白删除（评审修复 F2）
+    # 用角色短句，不用整行（…）当失败文案（人设可能把括号当可见心声）
     if ERROR_CONTENT_REJECTED in result_text:
-        return "这条消息触发了内容安全策略，我没法处理"
+        return get_persona_setting(persona_name, "error_content_policy")
     if ERROR_TIMEOUT_TEXT in result_text:
-        return "刚才网络太慢处理超时了，稍后再试试吧"
-    return "这条消息我处理失败了，稍后再试一次吧"
+        return get_persona_setting(persona_name, "error_timeout")
+    return get_persona_setting(persona_name, "error_generic")
 
 
-# Agent 失败类型分类标签 —— 仅供 notify_master_of_agent_error 私聊主人时使用，
+# Agent 失败类型分类标签 —— 仅供 notify_master_of_agent_error 私聊主人时使用
 # 与 sanitize_error_for_user 共用同一组常量做嗅探，保证两处判断永远一致。
 _ERROR_TYPE_LABEL_NO_RESULT = "无有效结果"
 _ERROR_TYPE_LABEL_CONTENT = "内容安全"
@@ -1771,7 +2590,7 @@ async def _dispatch_master_dm(
         except Exception as e:
             logger.warning(
                 i18n_t(
-                    "{p0} 主人通知发送失败 ({master_id}): {e}",
+                    "log.ai.master_notification_id_fail",
                     p0=log_prefix,
                     master_id=master_id,
                     e=e,

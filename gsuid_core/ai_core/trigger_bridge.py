@@ -29,9 +29,8 @@ _AI_CALL_CONTEXT: contextvars.ContextVar[Optional[Dict[str, list]]] = contextvar
     "_AI_CALL_CONTEXT", default=None
 )
 
-# ─── MCP Trigger Registry ────────────────────────────────────────────────────
+# MCP Trigger Registry
 # 存储所有带 to_ai 的触发器的原始信息，供 MCP Server 模块使用
-# 格式: {tool_name: {func, keyword, to_ai_doc, sv, trigger_type}}
 _MCP_TRIGGER_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 
@@ -49,17 +48,16 @@ def ai_return(text: str) -> None:
 
         from gsuid_core.ai_core.trigger_bridge import ai_return
 
-        @sv.on_command("个股", to_ai=\"\"\"
-        查询指定股票或ETF的分时图/K线图。
+        @sv.on_command("天气", to_ai=\"\"\"
+        查询指定城市的天气。
         Args:
-            text: 股票代码或名称，多个以空格分隔，可选前缀 '日k'/'周k'/'月k'，
-                  例如 "证券ETF" 或 "日k 证券ETF 白酒ETF"
+            text: 城市名，例如 "上海" 或 "北京"
         \"\"\")
-        async def send_stock_img(bot: Bot, ev: Event):
+        async def send_weather(bot: Bot, ev: Event):
             content = ev.text.strip()
             if not content:
-                ai_return("请提供股票代码，例如：证券ETF")
-                return await bot.send("请后跟股票代码使用")
+                ai_return("请提供城市名，例如：上海")
+                return await bot.send("请后跟城市名使用")
             ...
     """
     ctx = _AI_CALL_CONTEXT.get()
@@ -71,6 +69,9 @@ def ai_return(text: str) -> None:
 
 
 class MockBot:
+    _real_bot: Bot
+    _ctx: Dict[str, Any]
+
     """
     AI 调用触发器时使用的代理 Bot。
 
@@ -315,6 +316,8 @@ def _register_trigger_as_ai_tool(
     to_ai_doc: str,
     sv: Any,
     trigger_type: str,
+    covers: list[str] | None = None,
+    aliases: list[str] | None = None,
 ) -> None:
     """
     将一个触发器函数包装为 AI 工具并注册到 _TOOL_REGISTRY["by_trigger"]。
@@ -336,6 +339,8 @@ def _register_trigger_as_ai_tool(
         to_ai_doc: AI 工具的 docstring
         sv: SV 实例
         trigger_type: 触发器类型（command/prefix/keyword/fullmatch/suffix/regex 等）
+        covers: 数据/能力覆盖面，进向量检索与 find_tools 单向命中
+        aliases: 带领域前缀的同义问法，进检索文本
     """
     # 检查AI是否启用，未启用则跳过触发器工具注册
     try:
@@ -359,8 +364,6 @@ def _register_trigger_as_ai_tool(
         assert ev is not None, "触发器 AI 工具调用时 ev 不能为 None"
 
         # 权限检查：AI 调用时也需要遵守与用户直接触发相同的权限限制
-        # user_pm: 0=master, 1=superuser, 2=群主/管理员, 3=普通用户
-        # pm: 要求的最低权限等级，数值越小权限越高
         # 注意：运行时读取 sv/plugins 的当前状态，而非注册时快照
         if not sv.plugins.enabled:
             return "❌ 该插件已禁用。"
@@ -411,9 +414,7 @@ def _register_trigger_as_ai_tool(
         try:
             await func(mock_bot, fake_ev)
         except Exception as e:
-            logger.exception(
-                t("🧠 [Trigger→AI] 触发器 [{primary_keyword}] 执行异常: {e}", primary_keyword=primary_keyword, e=e)
-            )
+            logger.exception(t("log.ai.trigger_ai_primary_keyword_fail", primary_keyword=primary_keyword, e=e))
             return f"❌ 执行命令 [{primary_keyword}] 时发生错误: {e}。请尝试其他方式或检查输入参数。"
         finally:
             _AI_CALL_CONTEXT.reset(token)
@@ -495,33 +496,46 @@ def _register_trigger_as_ai_tool(
             default="",
         ),
     ]
-    _ai_tool_wrapper.__signature__ = inspect.Signature(
-        parameters=new_params,
-        return_annotation=str,
+    # FunctionType 静态无 __signature__ 字段; 改 setattr 动态写入, pyright 不再标红
+    # （与 register.py 的 @ai_tools 装饰器同款写法保持一致）。
+    setattr(
+        _ai_tool_wrapper,
+        "__signature__",
+        inspect.Signature(
+            parameters=new_params,
+            return_annotation=str,
+        ),
     )
 
     # 注册到 PydanticAI Tool
     tool_obj = Tool(_ai_tool_wrapper, takes_ctx=True)
     plugin_name = _get_plugin_name_from_module(func.__module__)
+    from gsuid_core.ai_core.buildin_tools.find_tools_rank import covers_from_trigger_keywords
+
+    merged_covers = covers_from_trigger_keywords(keyword, covers)
 
     tool_base = ToolBase(
         name=tool_func_name,
         description=to_ai_doc,
         plugin=plugin_name,
         tool=tool_obj,
+        category="by_trigger",
+        covers=merged_covers,
+        aliases=aliases,
     )
 
     if "by_trigger" not in _TOOL_REGISTRY:
         _TOOL_REGISTRY["by_trigger"] = {}
 
     _TOOL_REGISTRY["by_trigger"][tool_func_name] = tool_base
+    from gsuid_core.logger import hl_plugin
+
     logger.debug(
         t(
-            "🧠 [Trigger→AI] 触发器 [{primary_keyword}] 的函数 [{tool_func_name}]"
-            " 已注册为 AI 工具 (分类: by_trigger, 插件: {plugin_name})",
+            "log.ai.trigger_ai_func_name_primary",
             primary_keyword=primary_keyword,
             tool_func_name=tool_func_name,
-            plugin_name=plugin_name,
+            plugin_name=hl_plugin(plugin_name),
         )
     )
 
@@ -534,4 +548,6 @@ def _register_trigger_as_ai_tool(
         "trigger_type": trigger_type,
         "plugin_name": plugin_name,
         "primary_keyword": primary_keyword,
+        "covers": list(merged_covers),
+        "aliases": list(aliases or []),
     }

@@ -31,7 +31,7 @@ GsCore WebConsole 提供基于 FastAPI 的 RESTful API，供前端 React 应用�
 7. [日志 API - /api/logs](./07-logs.md)
 8. [调度器 API - /api/scheduler](./08-scheduler.md)
 9. [仪表盘 API - /api/dashboard](./09-dashboard.md)
-10. [消息推送 API - /api/BatchPush](./10-batch-push.md)
+10. [消息推送 API - /api/BatchPush](./10-batch-push.md)（含 `push_bot_self_id` 与 `/targets`）
 11. [图片资源 API - /api/assets](./11-assets.md)
 12. [主题配置 API - /api/theme](./12-theme.md)
 13. [Persona API - /api/persona](./13-persona.md)
@@ -61,6 +61,8 @@ GsCore WebConsole 提供基于 FastAPI 的 RESTful API，供前端 React 应用�
 38. [AI 预算限制 API - /api/ai/budget](./41-ai-budget.md)
 39. [品牌信息 API - /api/brand](./42-brand.md)
 40. [插件商店 API - /api/plugin-store](./43-plugin-store.md)（含按 URL 安装）
+41. [HTTP 请求追踪 API - /api/http-traces](./45-http-traces.md)
+42. [插件页面 - /plugin-pages 与 /api/plugin-pages](./46-plugin-pages.md)
 
 ---
 

@@ -42,18 +42,11 @@ LegacyDispatcherSource = Literal["heartbeat", "task"]
 
 
 def _resolve_active_bot(event: Event) -> Optional["_Bot"]:
-    """从 ``gss.active_bot`` 解析底层 ``_Bot``，与 inspector 兜底逻辑同构。
-
-    优先 ``event.WS_BOT_ID``（最准确）；若 active_bot 完全为空则返回 None。
-    """
+    """只按 ``event.WS_BOT_ID`` 解析底层 ``_Bot``；缺失则返回 None。"""
     from gsuid_core.gss import gss
 
     if event.WS_BOT_ID and event.WS_BOT_ID in gss.active_bot:
         return gss.active_bot[event.WS_BOT_ID]
-
-    # 兜底：取任意一个可用 _Bot（与 inspector._get_bot_for_session 同样的最末兜底）
-    if gss.active_bot:
-        return next(iter(gss.active_bot.values()))
     return None
 
 
@@ -166,7 +159,7 @@ async def emit_proactive_message(
     if suppress_when_heartbeat_recent and dispatcher.should_suppress_heartbeat(target_key):
         logger.debug(
             t(
-                "[ProactiveEmitter] C8 抑制 source={source} target={target_key}（近期已有主动输出）",
+                "log.ai.proactiveemitter_c8_suppressed_source",
                 source=source,
                 target_key=target_key,
             )
@@ -179,7 +172,7 @@ async def emit_proactive_message(
         if _bot is None:
             logger.warning(
                 t(
-                    "[ProactiveEmitter] 无可用 Bot，主动消息发送失败 source={source} target={target_key}",
+                    "log.ai.proactiveemitter_available_bot_proactive_fail",
                     source=source,
                     target_key=target_key,
                 )
@@ -190,19 +183,55 @@ async def emit_proactive_message(
     # 3) 实际发送（metadata 通过 extra_metadata 透传到 message_history）。
     #    send_chat_result 的发送侧异常不在这里吞——所有调用 emit_proactive_message
     #    的入口（inspector / executor / kanban_executor / message_sender 工具）
-    #    都在更外层有错误捕获并能记录 source 上下文。LLM.md §1.1 禁止在中间层
+    #    都在更外层有错误捕获并能记录 source 上下文。AGENTS.md §1.1 禁止在中间层
     #    用 try/except 兜底。
     extra_metadata: Dict[str, Any] = {
         "proactive": True,
         "proactive_source": source,
         "trigger_reason": trigger_reason,
     }
-    await send_chat_result(bot, message, ev=event, extra_metadata=extra_metadata)
+    from gsuid_core.ai_core.output_gate import GateDecision, pre_send_gate
+    from gsuid_core.ai_core.output_firewall import fallback_ooc_text
+    from gsuid_core.ai_core.persona.settings import persona_name_from_event
+
+    pname = persona_name_from_event(event)
+    out_msg = message
+    if out_msg:
+        _bag: Dict[str, object] = {}
+        if pname:
+            _bag["persona_name"] = pname
+        _gr = pre_send_gate(out_msg, _bag, user_text="", channel="main")
+        if _gr.decision is GateDecision.FUSE:
+            logger.warning(t("log.ai.firewall_result_hit_ooc_red", p0="fuse", p1="proactive"))
+            return False
+        if _gr.decision is GateDecision.REWRITE:
+            logger.warning(
+                t(
+                    "log.ai.firewall_result_hit_ooc_red",
+                    p0=_gr.policy,
+                    p1=(_gr.ooc_hit.matched if _gr.ooc_hit is not None else ""),
+                )
+            )
+            out_msg = fallback_ooc_text(pname)
+        elif _gr.decision is GateDecision.FALLBACK:
+            out_msg = _gr.send_text or fallback_ooc_text(pname)
+    await send_chat_result(bot, out_msg, ev=event, extra_metadata=extra_metadata)
+    from gsuid_core.ai_core.outbound import record_outbound
+
+    await record_outbound(
+        ev=event,
+        session_id=event.session_id or "",
+        text=out_msg,
+        image_id="",
+        topic="",
+        target_user=str(event.user_id) if event.user_id else "",
+        target_name="",
+    )
 
     # 4) 同步到用户主 session（pydantic_ai 历史 + session_logger）
     await _sync_to_main_session(
         event=event,
-        message=message,
+        message=out_msg,
         source=source,
         trigger_reason=trigger_reason,
         generator_log_files=files,
@@ -212,12 +241,12 @@ async def emit_proactive_message(
     #    source 字段为兼容老 dispatcher 仍只接受 "heartbeat" / "task" 两种字面量，
     #    其它来源（kanban / tool）登记成 "task" 走"对 Heartbeat 抑制 + 不进合并语境"。
     legacy_source: LegacyDispatcherSource = "heartbeat" if source == "heartbeat" else "task"
-    summary: str = message if source == "scheduled_task" else ""
+    summary: str = out_msg if source == "scheduled_task" else ""
     dispatcher.register_send(target_key, legacy_source, summary)
 
     logger.info(
         t(
-            "[ProactiveEmitter] 已发送 source={source} target={target_key} reason={trigger_reason}",
+            "log.ai.proactiveemitter_source_target_key_send",
             source=source,
             target_key=target_key,
             trigger_reason=repr(trigger_reason),

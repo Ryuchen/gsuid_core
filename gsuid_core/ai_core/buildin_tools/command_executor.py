@@ -21,11 +21,8 @@ from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.check_func import check_pm
 from gsuid_core.ai_core.buildin_tools.visibility import visible_to_admin
 
-# Windows 平台兼容：core.py 强制把事件循环切换为 WindowsSelectorEventLoopPolicy
-# 以规避 ProactorEventLoop 关闭 socket 时的 InvalidStateError。代价是 Selector
-# 事件循环上 `asyncio.create_subprocess_exec` 会抛 NotImplementedError。
-# 解决方案：Windows 上把同步的 `subprocess.run` 派到独立线程 + asyncio.to_thread
-# 等待结果（不阻塞主事件循环）；POSIX 上仍走原生 asyncio 子进程链路。
+# Windows 分支是历史兜底：宿主曾切 SelectorEventLoop（不支持 asyncio 子进程）。
+# 现为 ProactorEventLoop，子进程已可用；分支保留无害，新代码勿照抄。见 dev §12.3。
 _IS_WINDOWS = platform.system() == "Windows"
 
 # 允许执行的安全命令白名单（基础命令）
@@ -324,7 +321,8 @@ def _get_safe_environment() -> dict:
     return safe_env
 
 
-@ai_tools(check_func=check_pm, visible_when=visible_to_admin)
+# 参数 timeout 最大 300s，外层包装需 ≥ 该上限，否则会被默认 60s 误杀。
+@ai_tools(check_func=check_pm, visible_when=visible_to_admin, timeout=300.0)
 async def execute_shell_command(
     ctx: RunContext[ToolContext],
     command: str,
@@ -334,7 +332,7 @@ async def execute_shell_command(
     max_output: int = MAX_OUTPUT_SIZE,
 ) -> str:
     """
-    执行系统命令（安全增强版）
+    在服务器上执行并返回系统命令结果（安全增强版）
 
     在服务器上执行指定的Shell命令，返回命令输出结果。
     注意：此工具权限较高，会验证使用者是否是管理员。
@@ -379,14 +377,14 @@ async def execute_shell_command(
     # 危险命令检测
     is_dangerous, reason = _is_dangerous_command(command)
     if is_dangerous:
-        logger.warning(t("🧠 [BuildinTools] 拒绝执行危险命令: {p0}... 原因: {reason}", p0=command[:100], reason=reason))
+        logger.warning(t("log.ai.buildintools_refused_execute_dangerous", p0=command[:100], reason=reason))
         return f"执行失败：{reason}"
 
     # 强制使用 shlex（移除 use_shlex=False 的选项以提高安全性）
     try:
         cmd_list = shlex.split(command)
     except ValueError as e:
-        logger.warning(t("🧠 [BuildinTools] 命令解析失败: {e}", e=e))
+        logger.warning(t("log.ai.buildintools_command_parsing", e=e))
         return f"执行失败：命令解析错误 - {str(e)}"
 
     if not cmd_list:
@@ -427,11 +425,9 @@ async def execute_shell_command(
 
         work_path = FILE_PATH
         work_path.mkdir(parents=True, exist_ok=True)
-        logger.warning(
-            t("🧠 [BuildinTools] 命令未指定 work_dir 且无任务上下文，兜底为 {work_path}", work_path=work_path)
-        )
+        logger.warning(t("log.ai.buildintools_command_work_dir", work_path=work_path))
 
-    logger.info(t("🧠 [BuildinTools] 执行命令: {p0}... 工作目录: {work_path}", p0=command[:100], work_path=work_path))
+    logger.info(t("log.ai.buildintools_command_working_directory", p0=command[:100], work_path=work_path))
 
     # 使用清理后的环境变量
     env = _get_safe_environment()
@@ -448,23 +444,23 @@ async def execute_shell_command(
 
     try:
         if _IS_WINDOWS:
-            # Windows + SelectorEventLoop 不支持 asyncio 子进程，派到线程跑同步版
+            # 历史兜底：现 Proactor 下 asyncio 子进程已可用，此分支仅为稳妥而保留
             stdout_bytes, returncode = await _run_subprocess_in_thread(
                 cmd_list, str(work_path), env, timeout, max_output
             )
         else:
             stdout_bytes, returncode = await _run_subprocess_async(cmd_list, str(work_path), env, timeout, max_output)
     except asyncio.TimeoutError:
-        logger.warning(t("🧠 [BuildinTools] 命令执行超时: {timeout}秒", timeout=timeout))
+        logger.warning(t("log.ai.buildintools_command_timeout", timeout=timeout))
         return f"执行失败：命令超时 (超过 {timeout} 秒)"
     except FileNotFoundError:
-        logger.warning(t("🧠 [BuildinTools] 命令未找到: {p0}", p0=cmd_list[0]))
+        logger.warning(t("log.ai.buildintools_command_found", p0=cmd_list[0]))
         return f"执行失败：命令未找到 '{cmd_list[0]}'"
     except PermissionError:
-        logger.warning(t("🧠 [BuildinTools] 权限不足: {p0}", p0=command[:100]))
+        logger.warning(t("log.ai.buildintools_insufficient_permissions", p0=command[:100]))
         return "执行失败：权限不足"
     except Exception as e:
-        logger.exception(t("🧠 [BuildinTools] 命令执行异常: {e}", e=e))
+        logger.exception(t("log.ai.buildintools_command_fail", e=e))
         return f"执行失败：{type(e).__name__}: {str(e)}"
 
     output = stdout_bytes.decode("utf-8", errors="replace").strip()
@@ -476,9 +472,9 @@ async def execute_shell_command(
         await _register_workspace_changes(work_path, pre_snapshot)
 
     if returncode == 0:
-        logger.info(t("🧠 [BuildinTools] 命令执行成功 (返回码: 0, 输出长度: {p0})", p0=len(stdout_bytes)))
+        logger.info(t("log.ai.buildintools_command_succeeded_return_ok", p0=len(stdout_bytes)))
         return output if output else "命令执行成功，无输出"
-    logger.warning(t("🧠 [BuildinTools] 命令执行完成 (返回码: {returncode})", returncode=returncode))
+    logger.warning(t("log.ai.buildintools_command_return_code_ok", returncode=returncode))
     return f"[返回码: {returncode}]\n{output}" if output else f"命令执行完成 (返回码: {returncode})"
 
 
@@ -507,7 +503,7 @@ async def _run_subprocess_async(
             try:
                 process.terminate()
             except Exception as kill_err:
-                logger.error(t("🧠 [BuildinTools] 强制终止失败: {kill_err}", kill_err=kill_err))
+                logger.error(t("log.ai.buildintools_forced_termination_kill_fail", kill_err=kill_err))
         raise
     if len(stdout) > max_output:
         stdout = stdout[:max_output]
@@ -523,10 +519,14 @@ async def _run_subprocess_in_thread(
 ) -> tuple[bytes, int]:
     """Windows 路径：把同步 subprocess.run 派到独立线程，主事件循环不阻塞。
 
-    SelectorEventLoop 不支持 asyncio 子进程，而切回 ProactorEventLoop 又会让
-    WS / FastAPI 在并发关闭时偶发抛 InvalidStateError（见 core.py
-    `_configure_windows_event_loop_policy` 的旁注）。所以 Windows 上选择"同步
-    subprocess + to_thread"——开销可接受、行为与异步版一致。
+    历史原因：宿主曾切 SelectorEventLoop（不支持 asyncio 子进程）以规避 Proactor
+    关 socket 的 InvalidStateError。现在 core.py 不设策略、Windows 跑
+    ProactorEventLoop（该异常改由 core.py 顶层 except 兜底），asyncio 子进程已可用，
+    本函数因此成为**冗余兜底**——行为与异步版一致，故保留不删。
+
+    新增工具请直接用 asyncio.create_subprocess_exec，不要照抄这个平台分支；
+    确需兜底就 except NotImplementedError（对策略变化免疫）。
+    详见 .agents/skills/gscore-development/references/12-developer-pitfalls.md §12.3。
     """
 
     def _runner() -> tuple[bytes, int]:
@@ -595,4 +595,4 @@ async def _register_workspace_changes(workspace: Path, before_snapshot: dict) ->
     except ImportError:
         return
     except Exception as e:
-        logger.debug(t("🧠 [BuildinTools] workspace 变更登记失败: {e}", e=e))
+        logger.debug(t("log.ai.buildintools_workspace_change_registration", e=e))

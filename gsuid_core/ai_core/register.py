@@ -1,6 +1,6 @@
 import asyncio
 import inspect
-from typing import Dict, List, Tuple, Union, TypeVar, Callable, Optional, Awaitable, cast, overload
+from typing import Dict, List, Tuple, Union, TypeVar, Callable, Optional, Awaitable, cast, overload, get_type_hints
 from pathlib import Path
 
 from pydantic_ai import RunContext, ToolReturn
@@ -11,8 +11,26 @@ from gsuid_core.logger import logger
 from gsuid_core.segment import Message
 from gsuid_core.ai_core.utils import handle_tool_result
 from gsuid_core.ai_core.models import ToolContext
+from gsuid_core.ai_core.tool_health import (
+    is_tool_frozen,
+    record_tool_failure,
+    record_tool_success,
+)
 
 from .models import ToolBase, ImageEntity, KnowledgeBase, KnowledgePoint, ManualKnowledgeBase, ManualKnowledgeUpdate
+
+_PARAM_ERROR_HINTS: Dict[str, str] = {
+    "render_chart_spec": '⚠️ 缺少 data。正确格式：data=[{"label":"A","value":1}, ...]',
+}
+
+
+def _param_error_hint(tool_name: str, raw_result: str) -> str:
+    if tool_name not in _PARAM_ERROR_HINTS:
+        return ""
+    if "缺少" in raw_result or "data" in raw_result.lower() or "格式" in raw_result:
+        return _PARAM_ERROR_HINTS[tool_name]
+    return ""
+
 
 # 工具函数返回契约：str/Message/bytes 经 handle_tool_result 序列化；
 # ToolReturn 原样透传 pydantic_ai（多模态内容注入会话，如 read_image 直投）
@@ -61,8 +79,8 @@ _MANUAL_ENTITIES: List[ManualKnowledgeBase] = []  # 手动添加的知识，不�
 _IMAGE_ENTITIES: List[ImageEntity] = []  # 来自插件注册的图片
 # 别名注册表（C2-d 分 scope 防跨域串味）：
 # 结构为 {scope: {别名: [正式名候选, ...]}}。
-# scope 默认 "global"（插件注册的通用别名）；插件可传业务 scope（如 "Genshin"）
-# 隔离同名别名（如"深渊"在不同游戏指代不同对象）。
+# scope 默认 "global"（插件注册的通用别名）；插件可传自己的业务 scope
+# 隔离同名别名（同一俗称在不同插件指不同对象）。
 # 值为 List 以天然支持一对多 / 多候选映射，供动态实体链接按上下文消歧（C2-e）。
 _ALIASES: Dict[str, Dict[str, List[str]]] = {}
 
@@ -93,9 +111,12 @@ def ai_tools(
     check_func: Optional[CheckFunc] = None,
     context_tags: Optional[List[str]] = None,
     capability_domain: Optional[str] = None,
+    covers: Optional[List[str]] = None,
+    aliases: Optional[List[str]] = None,
     visible_when: Optional[Callable[..., Union[bool, Awaitable[bool]]]] = None,
-    timeout: Optional[float] = 300.0,
+    timeout: Optional[float] = 60.0,
     approval: Optional[str] = None,
+    brief: str = "",
     **check_kwargs,
 ) -> Callable[[F], F] | F:
     """
@@ -109,11 +130,18 @@ def ai_tools(
             self/buildin/meta 为框架特权分类，仅核心代码可用；插件声明时会被
             自动重定向到 common 注册（见 _CORE_ONLY_CATEGORIES）。
         check_func: 可选的权限校验函数
-        context_tags: 可选的语境标签列表，如 ["原神", "游戏"]。
+        context_tags: 可选的语境标签列表，如 ["游戏", "资讯"]。
             声明后，框架会在匹配该语境的群聊中自动加载本工具（语境工具池）。
-        capability_domain: 可选的能力域名称，如 "原神数据"、"网络搜索"。
+        capability_domain: 可选的能力域名称，如 "网络搜索"、插件自定的域名。
             声明后，框架会按 domain 聚合成自然语言能力清单注入自我认知（C3-d），
             替代生硬的函数名罗列。未声明时按 category 兜底。
+        covers: 可选的数据/能力覆盖面陈述列表，如 ["某数据域的报价与时间序列"]。
+            会拼进向量检索文本（name+docstring+covers+aliases），是工具被跨措辞
+            召回的关键面；能力代理 roster 的「数据覆盖」行也由本字段聚合。
+            插件工具应如实声明能解析什么标的/数据域/时效，而非只写函数行为。
+        aliases: 可选的领域内同义表述列表，**必须带领域前缀**，如
+            ["领域A·能力X"]；禁止裸写通用词（"能力X"），否则与同名能力的其它插件
+            撞车。撞车时由语境标签+语义路由裁决。前缀由插件自己声明，不是框架词表。
         visible_when: 可选的"可见性谓词"（Phase 3 条件隐藏）。签名为
             ``(ctx: RunContext[ToolContext]) -> bool | Awaitable[bool]``。
             返回 False 时，本工具在**该 step**对模型隐藏（schema 都不下发），
@@ -121,9 +149,10 @@ def ai_tools(
             必须**廉价且为内存判定**（读 ev/bot/扩展字段即可，切忌每步查库/发网络）。
             与 check_func 的区别：check_func 在"已调用"后拦截执行并回错误文案；
             visible_when 在"是否展示"阶段决定模型能否看到该工具。判定抛异常时默认可见。
-        timeout: 工具调用的最大等待时间（秒），默认 300 秒（5 分钟）。
+        timeout: 工具调用的最大等待时间（秒），默认 60 秒。
             超时后工具返回错误字符串，agent 可继续而不会永久挂起。
             设为 None 表示不限制超时。
+            需长时间等待的工具（如 ask_user / 长命令 / 子代理）应显式声明更大值或 None。
         approval: 可选的强制审批级别（"user" / "master"）。声明后每次调用先过
             统一审批中心策略门：user 级可被「完全访问」豁免（照常留审计记录）、
             master 级永不可豁免；无有效放行 grant 时拦截并自动提交审批请求，
@@ -176,7 +205,11 @@ def ai_tools(
                 for name, param in check_sig.parameters.items():
                     # 获取类型注解的字符串表示
                     anno_str = str(param.annotation)
-                    if "Event" in anno_str:
+                    if "RunContext" in anno_str:
+                        check_call_kwargs[name] = ctx
+                    elif "ToolContext" in anno_str:
+                        check_call_kwargs[name] = ctx.deps
+                    elif "Event" in anno_str:
                         check_call_kwargs[name] = ctx.deps.ev
                     elif "Bot" in anno_str:
                         check_call_kwargs[name] = ctx.deps.bot
@@ -191,7 +224,7 @@ def ai_tools(
                 elif isinstance(check_result, Tuple):
                     is_passed, message = check_result[0], check_result[1]
                 else:
-                    logger.warning(t("🧠 [Register] @ai_tools 装饰器 check_func 存在问题, 请开发者检查..."))
+                    logger.warning(t("log.register.ai_tools_decorator_check"))
                     return "@ai_tools 装饰器 check_func 存在问题, 请开发者检查"
 
                 if not is_passed:
@@ -223,18 +256,57 @@ def ai_tools(
                 else:
                     return await fn(*args, **call_kwargs)
 
-            try:
-                raw_result = await asyncio.wait_for(_call(), timeout=timeout)
-            except asyncio.TimeoutError:
-                timeout_sec = int(timeout) if timeout is not None else 0
-                logger.warning(
-                    t(
-                        "🧠 [Register] 工具 [{p0}] 执行超时（>{timeout_sec}s），已中断",
-                        p0=fn.__name__,
-                        timeout_sec=timeout_sec,
+            # 工具健康度（方案九）：冻结期内短路执行；第 2 次附替代名。
+            if is_tool_frozen(fn.__name__):
+                from gsuid_core.ai_core.tool_health import frozen_tool_reply
+
+                need = ""
+                if ctx.deps.ev is not None:
+                    need = ctx.deps.ev.raw_text or ""
+                return await frozen_tool_reply(fn.__name__, ctx.deps.extra, need)
+
+            # create_task+wait_for：区分工具内部 TimeoutError 与外层包装取消
+            # （直接 wait_for(coro) 会把内部超时误记成包装默认秒数）
+            if timeout is None:
+                raw_result = await _call()
+            else:
+                _task = asyncio.create_task(_call())
+                try:
+                    raw_result = await asyncio.wait_for(_task, timeout=timeout)
+                except asyncio.TimeoutError:
+                    timeout_sec = int(timeout)
+                    record_tool_failure(fn.__name__, "timeout")
+                    if _task.done() and not _task.cancelled():
+                        inner_exc = _task.exception()
+                        logger.warning(
+                            t(
+                                "log.register.tool_inner_timeout",
+                                p0=fn.__name__,
+                                e=inner_exc,
+                            )
+                        )
+                        return (
+                            f"⚠️ 工具 {fn.__name__} 内部超时/失败"
+                            f"（{type(inner_exc).__name__ if inner_exc else 'TimeoutError'}:"
+                            f" {inner_exc}），请稍后重试或换个方式"
+                        )
+                    logger.warning(
+                        t(
+                            "log.register.timeout_sec_aborted",
+                            p0=fn.__name__,
+                            timeout_sec=timeout_sec,
+                        )
                     )
-                )
-                return f"⚠️ 工具 {fn.__name__} 执行超时（超过 {timeout_sec} 秒），请稍后重试或换个方式"
+                    return f"⚠️ 工具 {fn.__name__} 执行超时（超过 {timeout_sec} 秒），请稍后重试或换个方式"
+
+            # 健康度记账（方案九）：❌ 开头视为失败信号，其余视为成功（成功清零连败）
+            if isinstance(raw_result, str) and raw_result.startswith("❌"):
+                record_tool_failure(fn.__name__, raw_result)
+                hint = _param_error_hint(fn.__name__, raw_result)
+                if hint:
+                    raw_result = f"{raw_result}\n{hint}"
+            else:
+                record_tool_success(fn.__name__)
 
             # ToolReturn 原样透传给 pydantic_ai（多模态内容注入会话，如 read_image 直投图片）。
             # 走 handle_tool_result 会被兜底 str() 成 dataclass repr——模型只会看到裸 base64 文本
@@ -251,8 +323,9 @@ def ai_tools(
         wrapped_tool.__qualname__ = fn.__qualname__
         wrapped_tool.__module__ = fn.__module__  # 确保 typing.get_type_hints 能找到正确的上下文变量
 
-        # 将原函数的注解复制过来，并补上正确的 ctx 注解
-        annotations: Dict[str, object] = getattr(fn, "__annotations__", {}).copy()
+        # 注解必须在**原函数模块**命名空间解析成真实类型再交给 pydantic-ai；留字符串会在
+        # wrapped_tool.__globals__（register 模块）求值，工具签名里的 Any/自定义名将 NameError。
+        annotations: Dict[str, object] = get_type_hints(fn)
         annotations["ctx"] = RunContext[ToolContext]
         for injected_name in injected_params.keys():
             annotations.pop(injected_name, None)
@@ -288,29 +361,38 @@ def ai_tools(
                     if inspect.isawaitable(res):
                         res = await res
                 except Exception as e:
-                    logger.debug(
-                        t("🧠 [Register] 工具 [{_name}] visible_when 判定异常，默认可见: {e}", _name=_name, e=e)
-                    )
+                    logger.debug(t("log.register.name_visible_check_errored", _name=_name, e=e))
                     return tool_def
                 return tool_def if res else None
 
             prepare_fn = _prepare
 
-        # 6. 注册工具
-        tool_obj = Tool(wrapped_tool, takes_ctx=True, prepare=prepare_fn)
-
         # 获取插件名称
         plugin_name = _get_plugin_name_from_module(fn.__module__)
+        from gsuid_core.logger import hl_plugin
+        from gsuid_core.ai_core.schema_brief import brief_looks_thin, make_schema_brief
+
+        tool_description = (fn.__doc__ or wrapped_tool.__doc__ or "").strip()
+        schema_brief = make_schema_brief(tool_description, explicit=brief)
+        wrapped_tool.__doc__ = tool_description
+
+        # 6. 注册工具（schema 用 brief；检索用 description 全文）
+        tool_obj = Tool(
+            wrapped_tool,
+            takes_ctx=True,
+            prepare=prepare_fn,
+            description=schema_brief or None,
+        )
 
         # 框架特权分类防护：非核心代码（plugins/ 或未知来源）注册 self/buildin/meta
         # 时重定向到 common（见 _CORE_ONLY_CATEGORIES 注释）。
         reg_category = category
+
         if plugin_name != "core" and reg_category in _CORE_ONLY_CATEGORIES:
             logger.warning(
                 t(
-                    "🧠 [Register] 插件 [{plugin_name}] 的工具 [{p0}] 声明了框架特权分类"
-                    " [{reg_category}]，已重定向到 [common] 注册",
-                    plugin_name=plugin_name,
+                    "log.register.plugin_name_privileged_category",
+                    plugin_name=hl_plugin(plugin_name),
                     p0=fn.__name__,
                     reg_category=reg_category,
                 )
@@ -319,26 +401,44 @@ def ai_tools(
 
         logger.debug(
             t(
-                "🧠 [Register] @ai_tools 装饰器执行，注册工具: {p0} (分类: {reg_category})",
+                "log.register.reg_category",
                 p0=fn.__name__,
                 reg_category=reg_category,
             )
         )
 
-        # docstring 是工具**唯一**的向量检索文本（入库文本 = name + description），
-        # 缺失即等同于"注册了一个永远召不回的工具"，必须吵出来而不是静默注册。
-        tool_description = (wrapped_tool.__doc__ or "").strip()
+        # docstring 是向量检索文本的主干（入库文本 = name + description + covers
+        # + aliases），缺失即等同于"注册了一个永远召不回的工具"，必须吵出来。
         if not tool_description:
             logger.warning(
                 t(
-                    "🧠 [Register] 工具 [{p0}]（来源 {plugin_name}）没有 docstring，向量检索只剩"
-                    " 函数名、几乎不可能被召回。常见成因：docstring 被写在了函数体首条语句"
-                    "（如 logger 调用）之后，那样它只是个普通字符串表达式，不是 docstring。",
+                    "log.register.missing_docstring_plugin_name",
                     p0=fn.__name__,
-                    plugin_name=plugin_name,
+                    plugin_name=hl_plugin(plugin_name),
                 )
             )
 
+        if schema_brief and brief_looks_thin(schema_brief):
+            logger.warning(
+                t(
+                    "log.register.schema_brief_thin",
+                    p0=fn.__name__,
+                    plugin_name=hl_plugin(plugin_name),
+                )
+            )
+
+        # covers 是跨措辞召回的关键面：插件工具缺 covers 时打 warning 提示补齐，
+        # 让"召不回的工具"从隐性变显性（不阻塞注册）。
+        if not covers and plugin_name != "core":
+            logger.debug(
+                t(
+                    "log.register.missing_covers_plugin_name",
+                    p0=fn.__name__,
+                    plugin_name=hl_plugin(plugin_name),
+                )
+            )
+
+        pred_name = getattr(visible_when, "__name__", "") if visible_when is not None else ""
         tool_base = ToolBase(
             name=fn.__name__,
             description=tool_description,
@@ -346,6 +446,11 @@ def ai_tools(
             tool=tool_obj,
             context_tags=context_tags,
             capability_domain=capability_domain,
+            covers=covers,
+            aliases=aliases,
+            schema_brief=schema_brief,
+            category=reg_category,
+            hide_from_main=pred_name == "visible_to_capability_only",
         )
 
         # 根据 category 分类注册工具
@@ -365,6 +470,60 @@ def get_registered_tools() -> Dict[str, Dict[str, ToolBase]]:
     return _TOOL_REGISTRY
 
 
+def is_core_only_category(tool_name: str) -> bool:
+    """该工具是否属于特权分类（``self`` / ``buildin`` / ``meta``）。
+
+    套件与第三方 hook **不能** ``ensure_tools`` 这三类：它们是核心专用，
+    插件滥用会把保底池撑大、或把已剥离的能力代理工具回灌主人格。
+    """
+    for category in _CORE_ONLY_CATEGORIES:
+        if category in _TOOL_REGISTRY and tool_name in _TOOL_REGISTRY[category]:
+            return True
+    return False
+
+
+def unregister_tool(tool_name: str) -> bool:
+    """从注册表移除一个工具，返回是否真的移除了。
+
+    套件卸载 / 同槽替换时必须调用：``get_main_agent_tools()`` 按当前注册表取
+    ``self+buildin``，不卸就会留下「套件没了、模型还看见空壳工具」。
+    插件热重载同理（``_TOOL_REGISTRY`` 历来不被 reload_plugin 清理）。
+    """
+    removed = False
+    for category_tools in _TOOL_REGISTRY.values():
+        if tool_name in category_tools:
+            del category_tools[tool_name]
+            removed = True
+    if removed:
+        logger.debug(t("log.register.unregistered_tool", name=tool_name))
+    return removed
+
+
+def unregister_tools_of_plugin(plugin_name: str) -> int:
+    """按插件名批量卸工具（热重载）。返回卸掉的数量。"""
+    victims = [
+        name
+        for category_tools in _TOOL_REGISTRY.values()
+        for name, tb in category_tools.items()
+        if tb.plugin == plugin_name
+    ]
+    for name in victims:
+        unregister_tool(name)
+    return len(victims)
+
+
+def unregister_entities_of_plugin(plugin_name: str) -> int:
+    """热重载前摘掉该插件登记的知识 / 图片，避免 ``_ENTITIES`` 只增不减。"""
+
+    def keep(item: Union[KnowledgePoint, KnowledgeBase, ImageEntity]) -> bool:
+        return not (isinstance(item, dict) and str(item.get("plugin") or "") == plugin_name)
+
+    before = len(_ENTITIES)
+    _ENTITIES[:] = [item for item in _ENTITIES if keep(item)]
+    _IMAGE_ENTITIES[:] = [item for item in _IMAGE_ENTITIES if keep(item)]
+    return before - len(_ENTITIES)
+
+
 def get_all_tools() -> Dict[str, ToolBase]:
     """获取所有已注册的工具（平铺结构）"""
     result = {}
@@ -380,6 +539,90 @@ def find_tool_base(tool_name: str) -> Optional[ToolBase]:
         if tb is not None:
             return tb
     return None
+
+
+def _family_bucket(domain: str) -> str:
+    """族名桶：CJK 取前两字，避免同一插件拆出十几族占满速览。"""
+    d = (domain or "").strip()
+    if len(d) >= 2 and "\u4e00" <= d[0] <= "\u9fff":
+        return d[:2]
+    return d
+
+
+_MAIN_ROSTER_SKIP_CATEGORIES: frozenset[str] = frozenset({"media", "plugin_dev", "default", "meta"})
+
+
+def main_persona_roster_ok(tb: ToolBase) -> bool:
+    """主人格速览 / capability_map 是否列出该工具（调不到的不进花名册）。"""
+    if tb.hide_from_main or tb.category in _MAIN_ROSTER_SKIP_CATEGORIES:
+        return False
+    from gsuid_core.ai_core.agent_run.support import _capability_exclusive_tool_names
+
+    return tb.name not in _capability_exclusive_tool_names()
+
+
+def collapse_family_domains(domains: List[str]) -> List[str]:
+    """同前缀 ≥3 个域折成一条索引名（后缀 …）。"""
+    buckets: dict[str, list[str]] = {}
+    for domain in domains:
+        d = (domain or "").strip()
+        if not d:
+            continue
+        buckets.setdefault(_family_bucket(d), []).append(d)
+    titles: list[str] = []
+    for bucket in sorted(buckets):
+        members = sorted(set(buckets[bucket]))
+        if len(members) >= 3:
+            titles.append(f"{bucket}…")
+        else:
+            titles.extend(members)
+    return titles
+
+
+def format_capability_family_overview(*, max_families: int = 30, max_chars: int = 1200) -> str:
+    """按 capability_domain 聚合的工具族速览。只给 find_tools / get_self 回执，不进 system。"""
+    grouped: dict[str, list[ToolBase]] = {}
+    for tb in get_all_tools().values():
+        domain = tb.capability_domain
+        if not domain or not main_persona_roster_ok(tb):
+            continue
+        grouped.setdefault(domain, []).append(tb)
+    if not grouped:
+        return ""
+    buckets: dict[str, list[str]] = {}
+    for domain in grouped:
+        buckets.setdefault(_family_bucket(domain), []).append(domain)
+    families: list[tuple[str, list[ToolBase]]] = []
+    for bucket in sorted(buckets):
+        members = sorted(set(buckets[bucket]))
+        if len(members) >= 3:
+            tools: list[ToolBase] = []
+            for d in members:
+                tools.extend(grouped[d])
+            families.append((f"{bucket}…", tools))
+        else:
+            for d in members:
+                families.append((d, grouped[d]))
+    lines: list[str] = ["（工具族速览——需要时 find_tools 精确召回：）"]
+    used = len(lines[0])
+    for title, tools in families[: max(1, max_families)]:
+        tools_s = sorted(tools, key=lambda t: t.name)
+        names = "、".join(tb.name for tb in tools_s[:3])
+        cover = ""
+        for tb in tools_s:
+            if tb.covers:
+                cover = tb.covers[0][:24]
+                break
+        line = f"- {title}：{names}"
+        if cover:
+            line += f"（{cover}）"
+        if used + len(line) + 1 > max_chars:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
 
 
 def get_tools_by_capability_domain(domain: str) -> List[ToolBase]:
@@ -424,15 +667,15 @@ def ai_alias(name: str, alias: Union[str, List[str]], scope: str = "global"):
     Args:
         name:  正式名称
         alias: 单个别名或别名列表
-        scope: 别名作用域，默认 "global"（通用）。插件可传业务 scope（如 "Genshin"）
-               隔离同名别名，避免"深渊"等词在不同游戏间串味。
+        scope: 别名作用域，默认 "global"（通用）。插件可传自己的业务 scope
+               隔离同名别名，避免通用词在不同插件间串味。
 
     调用时, 例如:
 
         from gsuid_core.ai_core.register import ai_alias
 
-        ai_alias("丝柯克", ['skk', '斯柯克'])
-        ai_alias("幽境危战", "深渊", scope="WutheringWaves")
+        ai_alias("正式名", ["别名甲", "别名乙"])
+        ai_alias("能力X", "俗称", scope="PluginA")
     """
     # 检查AI是否启用，未启用则跳过别名注册
     try:
@@ -456,7 +699,7 @@ def ai_alias(name: str, alias: Union[str, List[str]], scope: str = "global"):
     # 正式名本身不是 _ALIASES 的键（只有别名是），这里一并登记，否则"玄翎秧秧"查不到。
     _index_entity_surfaces(name, alias)
 
-    logger.trace(f"🧠 [AI][Registry] Registered aliases for {name} (scope={scope}): {alias}")
+    logger.trace(t("log.ai_registry.aliases_registered", name=name, scope=scope, alias=list(alias)))
 
 
 def _index_entity_surfaces(name: str, alias: List[str]) -> None:
@@ -530,6 +773,7 @@ def ai_entity(entity: Union[KnowledgePoint, KnowledgeBase]):
         title="角色介绍和详情 - 丝柯克",
         content="角色的详细信息, # 丝柯克 ## 武器类型xx ## 技能 ## 命之座",
         tags=["角色", "丝柯克", "skk", "Genshin"],
+        entity="丝柯克",
         _hash="123456",
     ))
     """
@@ -544,8 +788,15 @@ def ai_entity(entity: Union[KnowledgePoint, KnowledgeBase]):
 
     # 自动添加 source="plugin" 标识，表示来自插件注册
     entity["source"] = "plugin"
+    eid = entity.get("id")
+    if eid:
+        for i, existing in enumerate(_ENTITIES):
+            if isinstance(existing, dict) and existing.get("id") == eid:
+                _ENTITIES[i] = entity
+                logger.trace(t("log.ai_registry.entity_registered_plugin", title=entity["title"]))
+                return
     _ENTITIES.append(entity)
-    logger.trace(f"🧠 [AI][Registry] Entity registered (plugin): {entity['title']}")
+    logger.trace(t("log.ai_registry.entity_registered_plugin", title=entity["title"]))
 
 
 def add_manual_knowledge(entity: ManualKnowledgeBase) -> bool:
@@ -589,13 +840,13 @@ def add_manual_knowledge(entity: ManualKnowledgeBase) -> bool:
     # 检查是否已存在相同 id
     for existing in _MANUAL_ENTITIES:
         if existing["id"] == entity["id"]:
-            logger.warning(f"🧠 [AI][Registry] Manual entity already exists: {entity['id']}")
+            logger.warning(t("log.ai_registry.manual_entity_exists", entity_id=entity["id"]))
             return False
 
     # 确保 source 为 "manual"
     entity["source"] = "manual"
     _MANUAL_ENTITIES.append(entity)
-    logger.trace(f"🧠 [AI][Registry] Manual entity added: {entity['title']}")
+    logger.trace(t("log.ai_registry.manual_entity", title=entity["title"]))
     return True
 
 
@@ -616,7 +867,7 @@ def update_manual_knowledge(entity_id: str, updates: ManualKnowledgeUpdate) -> b
             updates.pop("id", None)
             updates.pop("source", None)
             _MANUAL_ENTITIES[i].update(updates)
-            logger.trace(f"🧠 [AI][Registry] Manual entity updated: {entity_id}")
+            logger.trace(t("log.ai_registry.manual_entity_updated", entity_id=entity_id))
             return True
     return False
 
@@ -634,7 +885,7 @@ def delete_manual_knowledge(entity_id: str) -> bool:
     for i, existing in enumerate(_MANUAL_ENTITIES):
         if existing["id"] == entity_id:
             _MANUAL_ENTITIES.pop(i)
-            logger.trace(f"🧠 [AI][Registry] Manual entity deleted: {entity_id}")
+            logger.trace(t("log.ai_registry.manual_entity_deleted", entity_id=entity_id))
             return True
     return False
 
@@ -665,7 +916,7 @@ def ai_image(entity: ImageEntity):
             id: str - 唯一标识符
             plugin: str - 插件名称
             path: str - 图片文件路径（绝对路径或相对路径）
-            tags: List[str] - 图片标签，用于描述图片内容，如 ["胡桃", "原神", "角色"]
+            tags: List[str] - 图片标签，用于描述图片内容，如 ["角色", "立绘"]
             content: str - 详细描述文本，可选
             source: str (自动设置为 "plugin")
 
@@ -675,11 +926,11 @@ def ai_image(entity: ImageEntity):
     from gsuid_core.ai_core.register import ai_image
 
     ai_image(ImageEntity(
-        id="hutao_character",
-        plugin="GenshinUID",
-        path="./resources/characters/hutao.png",
-        tags=["胡桃", "原神", "角色", "火系"],
-        content="胡桃角色立绘图片，往生堂第七十七代堂主",
+        id="char_portrait",
+        plugin="ExamplePlugin",
+        path="./resources/characters/portrait.png",
+        tags=["角色", "立绘"],
+        content="角色立绘图片",
         source="plugin",
         _hash="",
     ))
@@ -705,7 +956,7 @@ def ai_image(entity: ImageEntity):
     entity["source"] = "plugin"
     _ENTITIES.append(entity)
     _IMAGE_ENTITIES.append(entity)
-    logger.trace(f"🧠 [AI][Registry] Image registered: {entity.get('tags', [])}")
+    logger.trace(t("log.ai_registry.image_registered", tags=list(entity["tags"])))
 
 
 def get_image_entities() -> List[ImageEntity]:
@@ -722,7 +973,7 @@ def get_image_entity(entity_id: str) -> Optional[ImageEntity]:
 
 
 def ai_skill(path: Union[str, Path], plugin: Optional[str] = None) -> None:
-    """注册插件 repo 内的 AI Skill 目录（运行时 Skill，非 docs/skills 开发文档）。
+    """注册插件 repo 内的 AI Skill 目录（运行时 Skill，非 .agents/skills 开发文档）。
 
     让插件作者把 Skill 随插件一起放在**自己仓库内**管理，无需手动把 skill 文件夹
     挪进 ``data/ai_core/skills/`` 才能生效。注册的目录下可含一个或多个
@@ -780,11 +1031,11 @@ def ai_skill(path: Union[str, Path], plugin: Optional[str] = None) -> None:
     if result["status"] == 0:
         logger.info(
             t(
-                "🧠 [AI][Registry] Skill 目录注册成功（plugin={plugin}, count={p0}）: {p1}",
+                "log.register.ai_registry_skill_directory_ok",
                 plugin=plugin,
                 p0=result.get("count", 0),
                 p1=p.resolve(),
             )
         )
     else:
-        logger.warning(t("🧠 [AI][Registry] Skill 目录注册失败: {p0}", p0=result["msg"]))
+        logger.warning(t("log.register.ai_registry_skill_directory_fail", p0=result["msg"]))

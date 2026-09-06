@@ -7,7 +7,7 @@
 ## 任务类型
 
 1. **一次性任务 (once)**: 在指定时间点执行一次，适用于"明天叫我起床"、"周五提醒我交报告"等场景。
-2. **循环任务 (interval)**: 按固定间隔重复执行，适用于"每半小时查一下股价"、"每天早上发天气预报"等场景。
+2. **循环任务 (interval)**: 按固定间隔重复执行，适用于"每半小时提醒我喝水"、"每天早上发天气预报"等场景。
 
 ## 安全限制
 
@@ -38,6 +38,12 @@ from gsuid_core.logger import logger
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.scheduled_task.models import AIScheduledTask
+from gsuid_core.ai_core.buildin_tools.visibility import (
+    check_sched_create,
+    check_sched_mutate,
+    visible_when_sched_create,
+    visible_when_sched_mutate,
+)
 
 TZ_SHANGHAI = timezone("Asia/Shanghai")
 
@@ -51,7 +57,6 @@ MIN_INTERVAL_SECONDS = 300
 
 # 单轮节流：防止主人格用 add_once_task 逐时间点枚举周期任务。
 # Key: (session_id, turn_id) — turn_id 由 gs_agent._execute_run 写入
-# ToolContext.extra["turn_id"]。Value: 本轮已成功创建的 add_once_task 计数。
 PER_TURN_ONCE_TASK_LIMIT = 2
 _PER_TURN_ONCE_TASK_COUNT: Dict[Tuple[str, str], int] = {}
 
@@ -82,7 +87,7 @@ def _get_session_info(ev) -> tuple[Optional[str], Optional[str]]:
 
         persona_name = persona_config_manager.get_persona_for_session(session_id)
     except Exception as e:
-        logger.warning(i18n_t("⚠️ [ScheduledTask] 获取 persona_name 失败: {e}", e=e))
+        logger.warning(i18n_t("log.ai.sched_get_persona_name", e=e))
     return session_id, persona_name
 
 
@@ -96,14 +101,23 @@ def _get_execute_scheduled_task():
 # ============ 添加任务 ============
 
 
-@ai_tools(category="self", capability_domain="定时任务")
+@ai_tools(
+    category="self",
+    capability_domain="定时任务",
+    visible_when=visible_when_sched_create,
+    check_func=check_sched_create,
+    covers=["一次性定时提醒、几分钟后、明天某点叫我、就这一次"],
+    aliases=["定时任务·一次性提醒", "定时任务·几分钟后", "定时任务·明天叫我"],
+)
 async def add_once_task(
     ctx: RunContext[ToolContext],
     run_time: str,
     task_prompt: str,
 ) -> str:
     """
-    添加一次性定时任务
+    创建一次性定时任务
+
+    本工具只新建。已有条目的查询/修改/暂停/取消须调用同能力族对应工具，禁止再创建一条代替。
 
     在指定时间点执行一次任务。适用于用户说"明天早上6点叫我起床"、"周六晚上8点提醒我开会"等场景。
 
@@ -141,7 +155,7 @@ async def add_once_task(
         ... )
 
     **何时不该用本工具**：
-    - 涉及"决策 / 分析 / 复盘 / 持仓 / 账本" → 走 register_kanban_task
+    - 涉及"决策 / 分析 / 复盘 / 账本 / 多步持久化" → 走 register_kanban_task
     - 同一意图需要 3+ 个时间点触发 → 走 add_interval_task 或
       register_kanban_task(recurring_trigger="cron:..." 或 "interval:N")
     - 单轮调用本工具不得超过 2 次（硬约束，第 3 次直接拒绝）
@@ -237,11 +251,18 @@ async def add_once_task(
         return f"✅ 一次性任务添加成功！\n📋 任务ID：{task_id}\n📅 执行时间：{run_time}\n📝 任务内容：{task_prompt}"
 
     except Exception as e:
-        logger.error(i18n_t("❌ [ScheduledTask] 添加任务失败: {e}", e=e))
+        logger.error(i18n_t("log.ai.sched_add_task", e=e))
         return f"⚠️ 添加任务失败: {str(e)}"
 
 
-@ai_tools(category="self", capability_domain="定时任务")
+@ai_tools(
+    category="self",
+    capability_domain="定时任务",
+    visible_when=visible_when_sched_create,
+    check_func=check_sched_create,
+    covers=["每天/每周/每隔N分钟/工作日的循环提醒"],
+    aliases=["定时任务·每天提醒", "定时任务·每隔几分钟", "定时任务·每周", "定时任务·工作日"],
+)
 async def add_interval_task(
     ctx: RunContext[ToolContext],
     interval_value: int,
@@ -251,16 +272,18 @@ async def add_interval_task(
     max_executions: int = 10,
 ) -> str:
     """
-    添加循环任务
+    创建循环定时任务
+
+    本工具只新建。已有条目的查询/修改/暂停/取消须调用同能力族对应工具，禁止再创建一条代替。
 
     按固定间隔重复执行任务。当用户需要定期执行某个任务时调用此工具，
-    例如"每半小时查一下股价"、"每天早上发天气预报"、"每天下午3点30分查xxx"。
+    例如"每半小时提醒我喝水"、"每天早上发天气预报"、"每天下午3点30分查xxx"。
 
     循环任务会按照设定的时间间隔重复执行，达到最大执行次数后自动结束。
     系统安全限制：最大执行 150 次，最小间隔 5 分钟。
 
     **何时不该用本工具**：
-    - 任务包含"决策 / 多代理协作 / 持仓记账 / 周期复盘"——这些属于多步任务，
+    - 任务包含"决策 / 多代理协作 / 周期复盘 / 持久化记账"——这些属于多步任务，
       应走 register_kanban_task(recurring_trigger="cron:..." 或 "interval:N")，
       而不是把多步流程塞进 task_prompt。
     - task_prompt 写得超过 2 个步骤（"先 A 再 B 再 C 再写日志再汇报"），
@@ -281,12 +304,12 @@ async def add_interval_task(
         操作结果信息，包含任务ID供后续查询/暂停/取消使用
 
     Examples:
-        # 用户说"每半小时帮我查一下英伟达的股价"
+        # 用户说"每半小时提醒我站起来活动一下"
         >>> await add_interval_task(
         ...     ctx,
         ...     interval_value=30,
         ...     interval_type="minutes",
-        ...     task_prompt="查询英伟达(NVDA)的当前股价，如果涨跌幅超过2%则提醒用户。",
+        ...     task_prompt="提醒用户站起来活动一下，语气简短友好。",
         ...     max_executions=10,
         ... )
 
@@ -458,26 +481,32 @@ async def add_interval_task(
             )
 
     except Exception as e:
-        logger.error(i18n_t("❌ [ScheduledTask] 添加任务失败: {e}", e=e))
+        logger.error(i18n_t("log.ai.sched_add_task", e=e))
         return f"⚠️ 添加任务失败: {str(e)}"
 
 
 # ============ 查询任务 ============
 
 
-@ai_tools(category="common", capability_domain="定时任务")
+@ai_tools(
+    category="self",
+    capability_domain="定时任务",
+    visible_when=visible_when_sched_mutate,
+    check_func=check_sched_mutate,
+    covers=["列出我设了哪些提醒、定时任务清单"],
+    aliases=["定时任务·列出", "定时任务·我设了哪些"],
+)
 async def list_scheduled_tasks(
     ctx: RunContext[ToolContext],
 ) -> str:
     """
-    列出定时任务（群聊=本群全部任务+我自己在别处设的任务，私聊=本人任务）
+    列出当前用户自己的定时任务（不含他人条目）
 
-    当用户想查看、列出定时任务、提醒、循环任务，或想知道某条提醒是谁设置的时
-    调用此工具。触发场景如"我有哪些定时任务""看看我的提醒""任务列表"
-    "这个提醒是谁要的""谁设置的这个任务""这条提醒哪来的"。
+    当用户想查看、列出自己的定时任务、提醒、循环任务时调用此工具。
+    他人条目须凭任务 ID 用 query_scheduled_task 只读查询。
 
     Returns:
-        活跃任务列表（含 ID、发起用户、类型、状态、下次执行时间）；已结束任务只给计数
+        提问者自己的活跃任务列表（含 ID、类型、状态、下次执行时间）；已结束任务只给计数
     """
     tool_ctx: ToolContext = ctx.deps
     ev = tool_ctx.ev
@@ -485,13 +514,11 @@ async def list_scheduled_tasks(
         return "⚠️ 无法获取事件信息"
 
     try:
-        # 群聊 = 本群任务（"这提醒谁要的"须能看到别人建的，§5）∪ 提问者自己的全部任务
-        # （私聊/它群建的提醒也必须查得到，评审修复 F11）；私聊 = 本人任务。
+        # 只列提问者自己的任务（含其在它群/私聊设的）；他人条目不进列表。
         own_tasks = await AIScheduledTask.select_rows(user_id=ev.user_id)
-        group_tasks = await AIScheduledTask.select_rows(group_id=ev.group_id) if ev.group_id else []
 
         merged: dict[str, AIScheduledTask] = {}
-        for task_data in [*(group_tasks or []), *(own_tasks or [])]:
+        for task_data in own_tasks or []:
             task = task_data if isinstance(task_data, AIScheduledTask) else AIScheduledTask(**task_data)
             merged[task.task_id] = task
 
@@ -554,11 +581,18 @@ async def list_scheduled_tasks(
         return "\n".join(lines)
 
     except Exception as e:
-        logger.error(i18n_t("❌ [ScheduledTask] 查询任务列表失败: {e}", e=e))
+        logger.error(i18n_t("log.ai.sched_query_task_list", e=e))
         return f"⚠️ 查询任务列表失败: {str(e)}"
 
 
-@ai_tools(category="common", capability_domain="定时任务")
+@ai_tools(
+    category="self",
+    capability_domain="定时任务",
+    visible_when=visible_when_sched_mutate,
+    check_func=check_sched_mutate,
+    covers=["查看某条提醒详情、这是谁设的"],
+    aliases=["定时任务·查询详情"],
+)
 async def query_scheduled_task(
     ctx: RunContext[ToolContext],
     task_id: str,
@@ -646,7 +680,14 @@ async def query_scheduled_task(
 # ============ 修改任务 ============
 
 
-@ai_tools(category="common", capability_domain="定时任务")
+@ai_tools(
+    category="self",
+    capability_domain="定时任务",
+    visible_when=visible_when_sched_mutate,
+    check_func=check_sched_mutate,
+    covers=["改提醒时间或内容、改成后天、改到几点"],
+    aliases=["定时任务·改时间", "定时任务·修改提醒"],
+)
 async def modify_scheduled_task(
     ctx: RunContext[ToolContext],
     task_id: str,
@@ -661,9 +702,13 @@ async def modify_scheduled_task(
     "把那个任务改成…""定时任务的内容换一下""把时间改到后天""改成明晚8点""把循环次数改成 5 次"。
     只能修改 pending 或 paused 状态的任务。
 
+    重要：task_id 不能凭记忆猜测，必须先调用 list_scheduled_tasks 查到目标任务的
+    真实 task_id 后再传入。如果上一轮对话中 assistant 只说了"设好了"但没给出 ID，
+    那 ID 不在上下文里，必须重新 list 查询。
+
     Args:
         ctx: 工具执行上下文
-        task_id: 任务 ID
+        task_id: 任务 ID（必须来自 list_scheduled_tasks 的返回结果）
         task_prompt: 新的任务描述，不修改则不传
         run_time: 新的执行时间，格式 "YYYY-MM-DD HH:MM:SS"，不修改则不传。必须是未来时间。
             一次性任务=新的触发时间；循环任务=下一次执行的时间（执行间隔保持不变）。
@@ -741,7 +786,7 @@ async def modify_scheduled_task(
         return f"✅ 任务已修改！\n📋 任务ID：{task_id}\n📝 更新内容：{', '.join(changes)}"
 
     except Exception as e:
-        logger.error(i18n_t("❌ [ScheduledTask] 修改任务失败: {e}", e=e))
+        logger.error(i18n_t("log.ai.sched_modify_task", e=e))
         return f"⚠️ 修改任务失败: {str(e)}"
 
 
@@ -787,7 +832,14 @@ def _reschedule_job_run_time(task: AIScheduledTask, new_dt: datetime) -> None:
 # ============ 删除/取消任务 ============
 
 
-@ai_tools(category="common", capability_domain="定时任务")
+@ai_tools(
+    category="self",
+    capability_domain="定时任务",
+    visible_when=visible_when_sched_mutate,
+    check_func=check_sched_mutate,
+    covers=["取消/删掉已有提醒"],
+    aliases=["定时任务·取消", "定时任务·删掉提醒"],
+)
 async def cancel_scheduled_task(
     ctx: RunContext[ToolContext],
     task_id: str,
@@ -798,9 +850,12 @@ async def cancel_scheduled_task(
     当用户想停掉、删除、不再需要某个定时任务或提醒时调用此工具，触发场景如
     "取消那个任务""别再提醒我了""删掉定时任务 xxx"。取消后任务不再执行。
 
+    重要：task_id 不能凭记忆猜测，必须先调用 list_scheduled_tasks 查到目标任务的
+    真实 task_id 后再传入。多条任务中只取消用户指定的那一条，其余保留。
+
     Args:
         ctx: 工具执行上下文
-        task_id: 任务 ID
+        task_id: 任务 ID（必须来自 list_scheduled_tasks 的返回结果）
 
     Returns:
         操作结果信息
@@ -836,14 +891,21 @@ async def cancel_scheduled_task(
         return f"✅ 任务已取消！\n📋 任务ID：{task_id}"
 
     except Exception as e:
-        logger.error(i18n_t("❌ [ScheduledTask] 取消任务失败: {e}", e=e))
+        logger.error(i18n_t("log.ai.sched_fail_cancel_task_failed", e=e))
         return f"⚠️ 取消任务失败: {str(e)}"
 
 
 # ============ 暂停/恢复任务 ============
 
 
-@ai_tools(category="common", capability_domain="定时任务")
+@ai_tools(
+    category="self",
+    capability_domain="定时任务",
+    visible_when=visible_when_sched_mutate,
+    check_func=check_sched_mutate,
+    covers=["暂停循环提醒、先别响、别删"],
+    aliases=["定时任务·暂停"],
+)
 async def pause_scheduled_task(
     ctx: RunContext[ToolContext],
     task_id: str,
@@ -855,9 +917,12 @@ async def pause_scheduled_task(
     "先暂停那个任务""这阵子别执行了""暂停循环提醒"。
     仅循环任务支持暂停，一次性任务不支持。
 
+    重要：task_id 不能凭记忆猜测，必须先调用 list_scheduled_tasks 查到目标任务的
+    真实 task_id 后再传入。
+
     Args:
         ctx: 工具执行上下文
-        task_id: 任务 ID
+        task_id: 任务 ID（必须来自 list_scheduled_tasks 的返回结果）
 
     Returns:
         操作结果信息
@@ -896,11 +961,18 @@ async def pause_scheduled_task(
         return f"✅ 任务已暂停！\n📋 任务ID：{task_id}"
 
     except Exception as e:
-        logger.error(i18n_t("❌ [ScheduledTask] 暂停任务失败: {e}", e=e))
+        logger.error(i18n_t("log.ai.sched_fail_pause_task_failed", e=e))
         return f"⚠️ 暂停任务失败: {str(e)}"
 
 
-@ai_tools(category="common", capability_domain="定时任务")
+@ai_tools(
+    category="self",
+    capability_domain="定时任务",
+    visible_when=visible_when_sched_mutate,
+    check_func=check_sched_mutate,
+    covers=["恢复已暂停的循环提醒"],
+    aliases=["定时任务·恢复"],
+)
 async def resume_scheduled_task(
     ctx: RunContext[ToolContext],
     task_id: str,
@@ -911,9 +983,12 @@ async def resume_scheduled_task(
     当用户想让之前暂停的循环任务继续执行时调用此工具，触发场景如
     "恢复那个任务""继续之前的循环提醒""把暂停的任务开起来"。
 
+    重要：task_id 不能凭记忆猜测，必须先调用 list_scheduled_tasks 查到目标任务的
+    真实 task_id 后再传入。
+
     Args:
         ctx: 工具执行上下文
-        task_id: 任务 ID
+        task_id: 任务 ID（必须来自 list_scheduled_tasks 的返回结果）
 
     Returns:
         操作结果信息
@@ -966,5 +1041,5 @@ async def resume_scheduled_task(
         return f"✅ 任务已恢复！\n📋 任务ID：{task_id}"
 
     except Exception as e:
-        logger.error(i18n_t("❌ [ScheduledTask] 恢复任务失败: {e}", e=e))
+        logger.error(i18n_t("log.ai.sched_fail_resume_task_failed", e=e))
         return f"⚠️ 恢复任务失败: {str(e)}"

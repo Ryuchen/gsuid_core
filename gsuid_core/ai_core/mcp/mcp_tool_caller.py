@@ -42,9 +42,9 @@ async def call_mcp_tool(
     if not config:
         raise RuntimeError(t("MCP 配置 '{mcp_id}' 不存在，请检查配置", mcp_id=mcp_id))
 
-    # 构建 MCP 客户端（自动根据 transport 选择 stdio / sse）
     client = MCPClient(
         name=config.name,
+        transport=config.get_transport(),
         command=config.command,
         args=config.args,
         env=config.env,
@@ -56,7 +56,7 @@ async def call_mcp_tool(
     truncated_args = _truncate_args(arguments)
     logger.info(
         t(
-            "🔌 [MCP] 调用 {p0}.{tool_name}, 参数: {truncated_args}",
+            "log.mcp.calling_name_args_truncated",
             p0=config.name,
             tool_name=tool_name,
             truncated_args=truncated_args,

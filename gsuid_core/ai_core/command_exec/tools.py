@@ -66,18 +66,24 @@ async def _execute_and_report(ev: Optional[Event], plan: CommandPlan, timeout: i
         return f"❌ 执行失败：{err}"
     await audit.log(ev, plan, Decision.ALLOW, "", result=result)
     if cfg_get("notify_master_on_exec"):
-        logger.info(t("🧰 [CommandExec] 自动放行执行完成: {p0}", p0=plan.raw))
+        logger.info(t("log.ai.commandexec_auto_allow", p0=plan.raw))
     return _format_result(plan.raw, result)
 
 
-@ai_tools(category="buildin", check_func=_master_and_enabled, visible_when=_cmd_visible_to_master)
+# 配置 max_timeout 默认上限 600s，外层包装需 ≥ 该上限，避免被默认 60s 误杀。
+@ai_tools(
+    category="buildin",
+    check_func=_master_and_enabled,
+    visible_when=_cmd_visible_to_master,
+    timeout=600.0,
+)
 async def run_command(
     ctx: RunContext[ToolContext],
     command: str,
     timeout: int = 0,
     work_dir: Optional[str] = None,
 ) -> str:
-    """在用户本地终端执行shell命令
+    """在用户本地终端执行并返回 shell 命令结果
 
     在用户本地终端执行shell命令 / 在服务器上执行一条系统命令(仅主人可用,受审批与白名单约束)。
 

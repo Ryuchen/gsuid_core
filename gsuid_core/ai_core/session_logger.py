@@ -167,6 +167,7 @@ SESSION_ENTRY_TYPES: frozenset[str] = frozenset(
         "run_end",
         "result",
         "user_input",
+        "system_injection",
         # 模型产出
         "thinking",
         "text_output",
@@ -185,6 +186,9 @@ SESSION_ENTRY_TYPES: frozenset[str] = frozenset(
         "history_reset",
         # 交互模式变化（主动 ↔ 被动），data.mode 区分；data.from 记上一模式
         "mode_change",
+        # 前缀缓存失配探针（每 run 一条，data.reason 见 PrefixBreakReason）
+        "prefix_break",
+        "outbound_audit",
     }
 )
 
@@ -243,7 +247,7 @@ def _save_base64_image(mime_subtype: str, b64_data: str) -> Optional[str]:
             with open(fpath, "wb") as f:
                 f.write(raw)
     except Exception as e:
-        logger.warning(t("📝 [AISessionLogger] 图片外置落盘失败，退化为截断: {e}", e=e))
+        logger.warning(t("log.ai.aisessionlogger_externalize_image_disk_fail", e=e))
         return None
     return f"images/{filename}"
 
@@ -429,8 +433,7 @@ class AISessionLogger:
             self._finalize_stale_log(resumed, resumed_path)
             logger.info(
                 t(
-                    "📝 [AISessionLogger] 旧分段已达 {MAX_ENTRIES_PER_FILE} 条上限，"
-                    "滚动到同链新分段(seg {p0}): {p1} -> {p2}",
+                    "log.ai.aisessionlogger_max_entries_file_2",
                     MAX_ENTRIES_PER_FILE=MAX_ENTRIES_PER_FILE,
                     p0=self.segment_index,
                     p1=resumed_path.name,
@@ -568,7 +571,7 @@ class AISessionLogger:
         try:
             _atomic_dump_json(data, path)
         except Exception as e:
-            logger.warning(t("📝 [AISessionLogger] 旧日志收尾写盘失败（不影响新段）: {p0}: {e}", p0=path.name, e=e))
+            logger.warning(t("log.ai.aisessionlogger_finalize_log_disk_fail", p0=path.name, e=e))
 
     def _roll_to_new_file(self) -> None:
         """当前分段条数达上限时，收尾旧分段并切换到同链的新分段（不再 seed 复制上下文）。
@@ -603,8 +606,7 @@ class AISessionLogger:
             self._persisted_entry_count = 0
             logger.info(
                 t(
-                    "📝 [AISessionLogger] 分段达 {MAX_ENTRIES_PER_FILE} 条上限，"
-                    "滚动到同链新分段(seg {p0}): {old_name} -> {p1}",
+                    "log.ai.aisessionlogger_max_entries_file",
                     MAX_ENTRIES_PER_FILE=MAX_ENTRIES_PER_FILE,
                     p0=self.segment_index,
                     old_name=old_name,
@@ -626,8 +628,7 @@ class AISessionLogger:
         if entry_type not in SESSION_ENTRY_TYPES:
             logger.warning(
                 t(
-                    "📝 [AISessionLogger] 未登记的 entry 类型 '{entry_type}'，"
-                    "请在 SESSION_ENTRY_TYPES 中登记（session_id={p0}）",
+                    "log.ai.aisessionlogger_entry_type_session",
                     entry_type=entry_type,
                     p0=self.session_id,
                 )
@@ -652,8 +653,43 @@ class AISessionLogger:
             self._roll_to_new_file()
 
     def log_system_prompt(self, system_prompt: str) -> None:
-        """记录系统提示词"""
-        self._add_entry("system_prompt", {"content": system_prompt})
+        """记录系统提示词，并附 sha256 指纹（会话内 system 变化次数的观测口径）。"""
+        digest = hashlib.sha256((system_prompt or "").encode("utf-8")).hexdigest()
+        self._add_entry("system_prompt", {"content": system_prompt, "sha256": digest})
+
+    def log_prefix_break(
+        self,
+        reason: str,
+        *,
+        tools_hash: str = "",
+        system_hash: str = "",
+        tools_diff: dict[str, list[str]] | None = None,
+    ) -> None:
+        """记录本 run 相对上一 run 的前缀失配类别。"""
+        data: dict[str, object] = {"reason": reason, "tools_hash": tools_hash, "system_hash": system_hash}
+        if tools_diff is not None:
+            data["tools_diff"] = tools_diff
+        self._add_entry("prefix_break", data)
+
+    def log_outbound_audit(
+        self,
+        *,
+        group_id: str,
+        text: str,
+        image_id: str,
+        topic: str,
+        target_user: str,
+    ) -> None:
+        self._add_entry(
+            "outbound_audit",
+            {
+                "group_id": group_id,
+                "text": text[:200],
+                "image_id": image_id,
+                "topic": topic,
+                "target_user": target_user,
+            },
+        )
 
     def log_user_input(self, user_message: Any) -> None:
         """记录用户输入。
@@ -668,8 +704,25 @@ class AISessionLogger:
         """
         self._add_entry("user_input", {"content": normalize_user_message_to_text(user_message)})
 
+    def log_system_injection(self, content: str, source: str = "kanban_delivery") -> None:
+        """记录框架注入（Kanban 回灌等），不计入 user_input，避免被误认为真人发言。"""
+        norm = normalize_user_message_to_text(content)
+        self._add_entry("system_injection", {"content": norm, "source": source})
+
     def log_thinking(self, content: str) -> None:
-        """记录模型思考过程"""
+        """记录模型思考过程。
+
+        同一响应里网关可能同时给出 reasoning 字段和 ``<think>`` 文本；parts
+        层已去重，这里再跳过与上一条完全相同的思考，避免漏网双记。
+        """
+        if self.entries:
+            prev = self.entries[-1]
+            if (
+                prev.get("type") == "thinking"
+                and isinstance(prev.get("data"), dict)
+                and prev["data"].get("content") == content
+            ):
+                return
         self._add_entry("thinking", {"content": content})
 
     def log_tool_call(self, tool_name: str, args: Any, tool_call_id: str) -> None:
@@ -694,7 +747,16 @@ class AISessionLogger:
         乱码而非干净的图片引用（顺序很关键）。
         """
         content_str: str = externalize_base64_images(str(content))
-        if len(content_str) > 2000:
+        # 分页读工具：日志优先保留【读窗口】行，避免只看头 2k 误判「永远第一页」
+        if "【读窗口】" in content_str and len(content_str) > 2000:
+            win = ""
+            for line in content_str.splitlines():
+                if "【读窗口】" in line:
+                    win = line.strip()
+                    break
+            head = content_str[:1600]
+            content_str = f"{win}\n{head}\n...[截断, 共{len(content_str)}字符]"
+        elif len(content_str) > 2000:
             content_str = content_str[:2000] + f"...[截断, 共{len(content_str)}字符]"
         self._add_entry(
             "tool_return",
@@ -887,7 +949,7 @@ class AISessionLogger:
             generator_log_files=generator_log_files,
         )
         standalone.close()
-        logger.info(t("📝 [AISessionLogger] 主动消息已持久化到磁盘: {p0}", p0=standalone._file_path.name))
+        logger.info(t("log.ai.aisessionlogger_proactive_persisted_disk", p0=standalone._file_path.name))
         return True
 
     def link_agent(
@@ -910,18 +972,21 @@ class AISessionLogger:
                               "proactive_generator"
             persona_name: 被关联 Agent 的 persona_name
             create_by: 被关联 Agent 的 create_by
-            log_file: 被关联 Agent 的日志文件路径（绝对路径或相对路径）
+            log_file: 被关联 Agent 的日志文件路径（落盘为相对 session_logs/ 的 POSIX）
         """
         if self._closed:
             return
 
+        from gsuid_core.ai_core.session_log_path import relative_session_log_path
+
+        stored = relative_session_log_path(log_file) if log_file else log_file
         link_record: LinkedAgentRecord = {
             "agent_type": agent_type,
             "session_id": agent_session_id,
             "session_uuid": agent_session_uuid,
             "persona_name": persona_name,
             "create_by": create_by,
-            "log_file": log_file,
+            "log_file": stored,
             "linked_at": time.time(),
         }
         self.linked_agents.append(link_record)
@@ -929,8 +994,7 @@ class AISessionLogger:
         self.updated_at = time.time()
         logger.debug(
             t(
-                "📝 [AISessionLogger] 关联 Agent: {agent_type}"
-                " session_id={agent_session_id}, uuid={agent_session_uuid}",
+                "log.ai.aisessionlogger_agent_type_session",
                 agent_type=agent_type,
                 agent_session_id=agent_session_id,
                 agent_session_uuid=agent_session_uuid,
@@ -1047,7 +1111,7 @@ class AISessionLogger:
 
         logger.debug(
             t(
-                "📝 [AISessionLogger] 持久化日志: {p0} ({p1} 条, {p2})",
+                "log.ai.aisessionlogger_persisting_log_entries",
                 p0=self._file_path.name,
                 p1=len(self.entries),
                 p2="整写" if need_full else "增量",
@@ -1088,7 +1152,7 @@ class AISessionLogger:
                 f.truncate()
             return True
         except Exception as e:
-            logger.warning(t("📝 [AISessionLogger] 增量追加失败，回退整写: {e}", e=e))
+            logger.warning(t("log.ai.aisessionlogger_incremental_append_falling_fail", e=e))
             return False
 
     def _build_data(self) -> "SessionLogFileData":
@@ -1145,7 +1209,7 @@ class AISessionLogger:
 
         # 收尾整写：刷新表头 + 落 ended_at（force_full 绕过"无新增即跳过"的短路）
         self._persist_sync(force_full=True)
-        logger.info(t("📝 [AISessionLogger] 会话日志已关闭并持久化: {p0}", p0=self._file_path.name))
+        logger.info(t("log.ai.aisessionlogger_session_log_closed", p0=self._file_path.name))
 
     def __del__(self) -> None:
         """析构时兜底持久化（若未显式调用 close）"""
@@ -1204,7 +1268,5 @@ def clean_old_session_logs(days: int) -> int:
                 continue
 
     if removed:
-        logger.info(
-            t("📝 [AISessionLogger] 已清理 {removed} 个超过 {days} 天的会话日志/图片文件", removed=removed, days=days)
-        )
+        logger.info(t("log.ai.aisessionlogger_cleaned_removed_session_delete", removed=removed, days=days))
     return removed

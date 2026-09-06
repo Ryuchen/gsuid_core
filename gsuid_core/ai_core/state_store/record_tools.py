@@ -4,7 +4,7 @@
 设计意图
 --------
 扁平的 ``state_*`` KV（一个键一个值）足以表达"账户余额=10万"这种单字段状态，
-但当代理需要持久化「持仓表」「交易流水」「报名名单」「投票记录」这类**多条结构化
+但当代理需要持久化「报名名单」「投票记录」「任务条目」这类**多条结构化
 记录**时，KV 就力不从心：
 
 - 用 ``state_append`` 追加 JSON 块：只能整块读、整块写，无法按 id 更新单条；
@@ -15,15 +15,15 @@
 所有写操作走 ``state_mutate`` 的乐观锁，并发安全；读操作支持简单的 where 过滤、
 排序、分页与基础聚合。
 
-这一层**不引入任何业务术语**（不知道"账户/持仓/流水/股票/积分"），任何插件或
-代理都可以在它之上自由构造"虚拟账本""任务清单""签到记录"等持久化结构。
+这一层**不引入任何业务术语**（不知道具体插件领域词），任何插件或
+代理都可以在它之上自由构造"任务清单""签到记录""报名表"等持久化结构。
 
 存储模型
 --------
 每个集合是 ``AIPersistentState`` 里的一行，``state_key`` 形如
 ``record:<collection_name>``，``value`` 是 ``{record_id: payload_dict}`` 的 JSON。
 适用规模 ≤ 数千条记录；超出后单条写入仍是 O(N)，建议代理在业务上分片
-（如按日期拆 ``record:trade_log:202605``）。
+（如按日期拆 ``record:checkin:202605``）。
 """
 
 import json
@@ -66,7 +66,7 @@ def _resolve_scope(ctx: RunContext[ToolContext], scope: Optional[str]) -> str:
 def _parse_payload(payload: str) -> Dict[str, Any]:
     """payload 必须是 JSON 对象。非对象直接抛错，避免代理把字符串塞进去。
 
-    特别地：当代理误把"空流水""空持仓"等当成一条 `record_put(payload="[]" / "{}")`
+    特别地：当代理误把"空名单""空条目"等当成一条 `record_put(payload="[]" / "{}")`
     去预创建集合时，给出对应纠错指引——record_* 集合是按需创建，不需要先建空容器。
     """
     obj = json.loads(payload)
@@ -113,12 +113,12 @@ async def record_put(
     """
     向一个具名集合写入一条结构化记录（不存在则创建，存在则覆盖整条 payload）。
 
-    适合用来持久化"账户、持仓、交易流水、签到名单、投票记录"等结构化数据。
+    适合用来持久化"签到名单、投票记录、任务条目"等结构化数据。
     集合本身是按需创建的，无需先声明 schema。
 
     Args:
-        collection: 集合名，建议带业务前缀如 "stock:account" / "stock:trade_log"
-        payload: 记录内容，必须是 JSON 对象字符串，如 `{"price": 12.3, "qty": 100}`
+        collection: 集合名，建议带业务前缀如 "myplugin:items" / "myplugin:events"
+        payload: 记录内容，必须是 JSON 对象字符串，如 `{"name": "item", "qty": 1}`
         record_id: 记录的唯一 ID；留空时自动生成 UUID，原样返回给调用方
         scope: 数据隔离范围。"auto"=按当前会话自动判断；可显式传 "user:xx"/"group:yy"/"global"
         ttl_days: 整个集合的保留天数（不是单条），不填则永久保留
@@ -143,8 +143,9 @@ async def record_put(
     try:
         await state_mutate(real_scope, key, _writer, ttl_days=ttl_days)
     except Exception as e:
-        logger.exception(t("📒 [RecordStore] record_put 失败: {e}", e=e))
+        logger.exception(t("log.ai.recordstore_record_put", e=e))
         return f"写入失败: {e}"
+    await _remember_record(ctx, real_scope, collection, rid, rec)
     return f"ok rid={rid}"
 
 
@@ -270,7 +271,7 @@ async def record_append(
         return f"参数错误: {e}"
 
     # 闭包通过共享 dict 把"最终选定的 rid"带回外部——与本文件 record_delete /
-    # record_update 的 flag 写法一致，避免 type: ignore + getattr 兜底（LLM.md §1.4）。
+    # record_update 的 flag 写法一致，避免 type: ignore + getattr 兜底（AGENTS.md §1.4）。
     chosen: Dict[str, str] = {"rid": uuid.uuid4().hex[:12]}
 
     def _writer(current: Any) -> Dict[str, Any]:
@@ -288,8 +289,9 @@ async def record_append(
     try:
         await state_mutate(real_scope, key, _writer, ttl_days=ttl_days)
     except Exception as e:
-        logger.exception(t("📒 [RecordStore] record_append 失败: {e}", e=e))
+        logger.exception(t("log.ai.recordstore_record_append", e=e))
         return f"写入失败: {e}"
+    await _remember_record(ctx, real_scope, collection, chosen["rid"], rec)
     return f"ok rid={chosen['rid']}"
 
 
@@ -302,13 +304,13 @@ async def record_update(
     scope: str = "auto",
 ) -> str:
     """
-    对集合内某条记录做**字段级合并更新**（保留 patch 未提及的字段）。
+    改写集合内某条记录的字段（合并更新，保留 patch 未提及的字段）。
 
     与 ``record_put`` 的区别：
     - ``record_put``：整条 payload 覆盖，patch 没提到的字段会丢。
     - ``record_update``：浅合并；patch 里的字段会覆盖旧字段，其它字段保留。
 
-    适合"持仓数量变了 / 余额变了 / 状态字段切换"这类只改部分字段的场景。
+    适合"数量变了 / 余额变了 / 状态字段切换"这类只改部分字段的场景。
     记录不存在时返回 "not_found"，不会创建新记录——要创建请用 ``record_put``。
 
     Args:
@@ -346,7 +348,7 @@ async def record_update(
     try:
         await state_mutate(real_scope, key, _writer)
     except Exception as e:
-        logger.exception(t("📒 [RecordStore] record_update 失败: {e}", e=e))
+        logger.exception(t("log.ai.recordstore_record_update", e=e))
         return f"更新失败: {e}"
     return "updated" if flag["hit"] else "not_found"
 
@@ -387,7 +389,7 @@ async def record_delete(
     try:
         await state_mutate(real_scope, key, _deleter)
     except Exception as e:
-        logger.exception(t("📒 [RecordStore] record_delete 失败: {e}", e=e))
+        logger.exception(t("log.ai.recordstore_record_delete", e=e))
         return f"删除失败: {e}"
     return "deleted" if deleted_flag["hit"] else "not_found"
 
@@ -443,3 +445,39 @@ async def record_summary(
         summary["hit"] = hit
         summary["avg"] = (total / hit) if hit else None
     return json.dumps(summary, ensure_ascii=False)
+
+
+async def _remember_record(
+    ctx: RunContext[ToolContext],
+    record_scope: str,
+    collection: str,
+    rid: str,
+    rec: Dict[str, Any],
+) -> None:
+    """record 真值写完后登记认知节点。"""
+    from datetime import date
+
+    from gsuid_core.ai_core.cognition.types import CogKind
+    from gsuid_core.ai_core.cognition.remember import MemoryWrite, remember
+
+    ev = ctx.deps.ev if ctx.deps is not None else None
+    owner = str(ev.user_id) if ev is not None and ev.user_id else ""
+    if record_scope.startswith("user:") and not record_scope.startswith("user_global:"):
+        cog_scope = f"user_global:{record_scope[5:]}"
+    else:
+        cog_scope = record_scope
+    try:
+        await remember(
+            MemoryWrite(
+                kind=CogKind.RECORD,
+                ref=f"{record_scope}:{collection}:{rid}",
+                scope_key=cog_scope,
+                owner_user_id=owner,
+                title=collection,
+                summary=json.dumps(rec, ensure_ascii=False)[:200],
+                as_of=date.today().isoformat(),
+                source="record",
+            )
+        )
+    except Exception as e:
+        logger.debug(t("log.ai.cognition_node_sync_fail", kind="record", ref=rid, e=e))

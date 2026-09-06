@@ -4,7 +4,7 @@
 前置条件：rag/base.py 的 init_embedding_model() 必须已执行。
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
@@ -12,6 +12,7 @@ from gsuid_core.server import on_core_shutdown
 from gsuid_core.ai_core.configs.ai_config import ai_config
 
 if TYPE_CHECKING:
+    from .observer import ObservationRecord
     from .ingestion.worker import IngestionWorker
 
 # 模块级引用，供 /api/chat_with_history 调用 flush_all()
@@ -32,7 +33,7 @@ async def init_memory_system():
     """
     # 检查AI总开关
     if not ai_config.get_config("enable").data:
-        logger.info(t("🧠 [Memory] AI总开关已关闭，跳过记忆系统初始化"))
+        logger.info(t("log.memory.master_ai_switch_skipping"))
         return
 
     from gsuid_core.ai_core.rag.base import client, init_embedding_model
@@ -42,35 +43,35 @@ async def init_memory_system():
         from gsuid_core.ai_core.rag.base import client
 
         if client is None:
-            logger.debug(t("🧠 [Memory] RAG 未启用，跳过记忆系统初始化"))
+            logger.debug(t("log.memory.rag_disabled_skipping_2"))
             return
 
-    logger.info(t("🧠 [Memory] 开始初始化记忆系统..."))
+    logger.info(t("log.memory.memory_start_initializing_system"))
 
     # 1. 确保 Qdrant Collection 存在
     try:
         from .vector.startup import ensure_memory_collections
 
         await ensure_memory_collections()
-        logger.info(t("🧠 [Memory] Qdrant Collection 初始化完成"))
+        logger.info(t("log.memory.qdrant_collection_initialization"))
     except Exception as e:
-        logger.error(t("🧠 [Memory] Qdrant Collection 初始化失败: {e}", e=e))
+        logger.error(t("log.memory.initialize_qdrant_collection", e=e))
         return
 
     # 3. 启动 IngestionWorker 后台任务（主事件循环上的 task，LLM 调用为
     # await 网络 I/O 不阻塞循环；独立线程双循环架构曾因跨循环取消击穿主循环，已废弃）
     global _ingestion_worker
     if _ingestion_worker is not None:
-        logger.info(t("🧠 [Memory] IngestionWorker 已存在，跳过重复启动"))
+        logger.info(t("log.memory.ingestionworker_exists_skipping_duplicate"))
     else:
         try:
             from .ingestion.worker import IngestionWorker
 
             _ingestion_worker = IngestionWorker()
             _ingestion_worker.start()
-            logger.info(t("🧠 [Memory] IngestionWorker 后台任务已启动"))
+            logger.info(t("log.memory.task_ingestionworker_background_started"))
         except Exception as e:
-            logger.error(t("🧠 [Memory] IngestionWorker 启动失败: {e}", e=e))
+            logger.error(t("log.memory.start_ingestionworker", e=e))
             return
 
     # 3.5 C9：启动多模态摄入 Worker（独立队列，异步转述高价值图片）
@@ -79,7 +80,7 @@ async def init_memory_system():
 
         start_multimodal_worker()
     except Exception as e:
-        logger.warning(t("🧠 [Memory] C9 多模态摄入 Worker 启动失败: {e}", e=e))
+        logger.warning(t("log.memory.start_c9_multimodal_ingestion", e=e))
 
     # 4. C11：注册记忆生命周期维护定时任务（每周一次衰减 / 巩固 / 遗忘）
     try:
@@ -94,18 +95,30 @@ async def init_memory_system():
             id="ai_memory_lifecycle_maintenance",
             replace_existing=True,
         )
-        logger.info(t("🧠 [Memory] C11 记忆生命周期维护任务已注册（每周一次）"))
+        logger.info(t("log.memory.c11_lifecycle_maintenance"))
     except Exception as e:
-        logger.warning(t("🧠 [Memory] C11 生命周期维护任务注册失败: {e}", e=e))
+        logger.warning(t("log.memory.register_c11_lifecycle_maintenance", e=e))
 
-    logger.info(t("🧠 [Memory] 记忆系统初始化完成"))
+    logger.info(t("log.memory.system_initialization"))
 
 
 def get_ingestion_worker():
     """获取 IngestionWorker 实例（需在记忆系统初始化后调用才有效）"""
     if _ingestion_worker is None:
-        logger.warning(t("🧠 [Memory] IngestionWorker 尚未初始化，请确认记忆系统已启动"))
+        logger.warning(t("log.memory.ingestionworker_initialized_make_sure"))
     return _ingestion_worker
+
+
+def get_ingestion_worker_or_none() -> Optional["IngestionWorker"]:
+    """检索/观察热路径用：worker 未启动时返回 None，不打 warning。"""
+    return _ingestion_worker
+
+
+def peek_ingestion_buffers(scope_keys: Sequence[str]) -> list["ObservationRecord"]:
+    """只读复制尚未 flush 的缓冲；worker 未启动则空列表。"""
+    if _ingestion_worker is None:
+        return []
+    return _ingestion_worker.peek_buffers(scope_keys)
 
 
 @on_core_shutdown(priority=20)
@@ -118,11 +131,11 @@ async def shutdown_memory_system():
     if _ingestion_worker is None:
         return
 
-    logger.info(t("🧠 [Memory] 正在关闭 IngestionWorker..."))
+    logger.info(t("log.memory.memory_ingestionworker_shutting_down"))
     try:
         await _ingestion_worker.stop()
     except Exception as e:
-        logger.error(t("🧠 [Memory] IngestionWorker 关闭失败: {e}", e=e), exc_info=True)
+        logger.error(t("log.memory.shut_ingestionworker", e=e), exc_info=True)
     finally:
         _ingestion_worker = None
 
@@ -132,4 +145,4 @@ async def shutdown_memory_system():
 
         await stop_multimodal_worker()
     except Exception as e:
-        logger.error(t("🧠 [Memory] 多模态摄入 Worker 关闭失败: {e}", e=e))
+        logger.error(t("log.memory.shut_multimodal_ingestion_worker", e=e))

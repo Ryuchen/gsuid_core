@@ -132,7 +132,7 @@ async def extract_and_upsert_edges(
         # §6 残句拦截（摄入侧）：悬空谓语结尾的 fact（"用户X提到"）零信息量，
         # 不入库——与注入侧同判据，源头止血。
         if _DANGLING_FACT_RE.search(fact):
-            logger.debug(t("🧠 [Memory] 摄入拦截残句 fact: {fact}", fact=fact))
+            logger.debug(t("log.memory.ingestion_blocked_sentence_fragment", fact=fact))
             continue
         source_id = entity_name_to_id[source_name] if source_name in entity_name_to_id else None
         target_id = entity_name_to_id[target_name] if target_name in entity_name_to_id else None
@@ -176,35 +176,29 @@ async def extract_and_upsert_edges(
         )
 
     # 统一在一个 session 中写入所有 Edge。
-    # OperationalError（"database is locked"）重试：SQLite 单写者 + 大库 WAL 检查点在高并发
-    # 回灌下偶发写锁超时；重试而非放弃，杜绝丢窗口边（§14）。每次重试重置累积态避免重复。
+    # OperationalError 重试：写锁尖峰仍可能超时；重试重置累积态。Conflict 同事务，不重复落库。
     edges_vector_data: list[dict] = []
     merged_count = 0
-    from gsuid_core.ai_core.memory.ingestion.eval_write_lock import eval_write_guard
+    from gsuid_core.ai_core.memory.ingestion.eval_write_lock import db_write_guard
 
     for _attempt in range(6):
         edges_vector_data = []
         merged_count = 0
         try:
-            # eval_mode 下与 entity 写共用进程内写锁，串行化 SQLite 写事务、消除并发忙等。
-            async with eval_write_guard(), async_maker() as session:
+            # 与 entity 写共用进程内写锁，串行化 SQLite 写事务（线上多 scope 并发 flush 同样需要）。
+            async with db_write_guard(), async_maker() as session:
                 for i, (edge_data, source_id, target_id, fact) in enumerate(valid_edges):
                     merge_into = merge_results[i]
+                    # 极性矛盾时记下旧边，新边 id 生成后再 attach Conflict（同事务）。
+                    conflict_old: tuple[str, str] | None = None
                     if merge_into:
                         result = await session.execute(select(AIMemEdge).where(col(AIMemEdge.id) == merge_into))
                         old_edge = result.scalar_one_or_none()
                         if old_edge is not None:
                             if _fact_polarity(old_edge.fact) != _fact_polarity(fact):
-                                # C11 语义矛盾：同 src/tgt 高相似但极性相反 → 以新事实为准，
-                                # 旧事实软删除 + 记录 AIMemConflict（不在普通回复中堆叠新旧矛盾）。
+                                # C11：同 src/tgt 极性相反 → 软删旧边，下文建新边并记 Conflict。
                                 old_edge.invalid_at = now
-                                await AIMemConflict.record(
-                                    scope_key=scope_key,
-                                    fact_signature=f"{source_id}|{target_id}",
-                                    old_edge_id=old_edge.id,
-                                    new_edge_id="",
-                                    summary=f"[事实更新] 旧:{old_edge.fact[:120]} → 新:{fact[:120]}",
-                                )
+                                conflict_old = (old_edge.id, old_edge.fact)
                             else:
                                 # 命中既有等价 Edge：累加提及次数并刷新有效期，不写重复 Edge
                                 old_edge.mention_count = (old_edge.mention_count or 1) + 1
@@ -225,6 +219,16 @@ async def extract_and_upsert_edges(
                         mention_count=1,
                     )
                     session.add(new_edge)
+                    if conflict_old is not None:
+                        old_id, old_fact = conflict_old
+                        AIMemConflict.attach(
+                            session,
+                            scope_key=scope_key,
+                            fact_signature=f"{source_id}|{target_id}",
+                            old_edge_id=old_id,
+                            new_edge_id=edge_id,
+                            summary=f"[事实更新] 旧:{old_fact[:120]} → 新:{fact[:120]}",
+                        )
 
                     # 收集向量写入数据（session 外批量执行）
                     edges_vector_data.append(
@@ -247,7 +251,7 @@ async def extract_and_upsert_edges(
                 continue
             logger.warning(
                 t(
-                    "🧠 [Memory] scope={scope_key} Edge 写入重试 6 次仍失败（database locked），跳过本窗口边",
+                    "log.memory.fail_skip_retry_write_scope_key",
                     scope_key=scope_key,
                 )
             )
@@ -256,7 +260,7 @@ async def extract_and_upsert_edges(
     if merged_count:
         logger.info(
             t(
-                "🧠 [Memory] scope={scope_key} Edge 归并 {merged_count} 条重复事实",
+                "log.memory.scope_key_merged_duplicate",
                 scope_key=scope_key,
                 merged_count=merged_count,
             )
@@ -267,4 +271,4 @@ async def extract_and_upsert_edges(
         try:
             await upsert_edge_vectors_batch(edges_vector_data)
         except Exception as e:
-            logger.warning(f"Edge vector batch upsert failed: {e}")
+            logger.warning(t("log.memory.edge_vector_batch_fail", error=str(e)))

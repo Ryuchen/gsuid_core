@@ -19,11 +19,14 @@ self_model 结构（存于 state_store）::
     }
 """
 
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from gsuid_core.i18n import t as i18n_t
 from gsuid_core.logger import logger
 from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
+
+if TYPE_CHECKING:
+    from gsuid_core.ai_core.relationship import RelationshipView
 
 # state_store 中自我模型的 state_key
 _SELF_MODEL_KEY = "self_model"
@@ -31,8 +34,47 @@ _SELF_MODEL_KEY = "self_model"
 _MAX_ITEMS_PER_FIELD = 20
 # 单条笔记最大字符数
 _MAX_NOTE_CHARS = 200
-# self_model 的合法字段
+# self_model 的合法列表字段
 _FIELDS = ("commitments", "preferences_learned", "recurring_topics", "self_notes")
+_ONTOLOGY_FIELD = "self_ontology"
+
+
+def default_self_ontology() -> str:
+    from gsuid_core.config import core_config
+
+    raw = core_config.get_config("framework_aliases")
+    aliases = [str(a) for a in raw] if isinstance(raw, list) and raw else ["GsCore", "gsuid_core"]
+    names = "、".join(aliases) if aliases else "GsCore、gsuid_core"
+    return (
+        f"- 「{names}」是承载我的宿主框架。"
+        "群友讨论这些名字 = 在讨论我的宿主。可以搭话，"
+        "必须用角色卡里的世界观转述，禁止用开发者口吻介绍架构。\n"
+        "- 「插件」是我可调用的能力；「更新/重启」= 我暂时离线。\n"
+        "- 群里的 bot 统计（DAU/消息量/留存）可能是在统计我这类角色。\n"
+        "- 配置里的 masters = 最高信任关系的人（如何称呼以角色卡为准）。"
+    )
+
+
+async def ensure_self_ontology(bot_id: str) -> str:
+    """框架写入本体知识；空则填默认模板。"""
+    from gsuid_core.ai_core.state_store import state_mutate, state_get_value
+
+    raw = await state_get_value(_self_scope(bot_id), _SELF_MODEL_KEY)
+    if isinstance(raw, dict) and _ONTOLOGY_FIELD in raw:
+        val = raw[_ONTOLOGY_FIELD]
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, list) and val and isinstance(val[0], str) and val[0].strip():
+            return val[0].strip()
+    text = default_self_ontology()
+
+    def _mutate(current: Any) -> Dict[str, object]:
+        model = _self_model_state(current)
+        model[_ONTOLOGY_FIELD] = text
+        return model
+
+    await state_mutate(_self_scope(bot_id), _SELF_MODEL_KEY, _mutate)
+    return text
 
 
 def _self_scope(bot_id: str) -> str:
@@ -41,7 +83,7 @@ def _self_scope(bot_id: str) -> str:
 
 
 def _normalize_self_model(raw: Any) -> Dict[str, List[str]]:
-    """把 state_store 读出的原始值规整为 self_model 结构。"""
+    """把 state_store 读出的原始值规整为 self_model 列表字段。"""
     model: Dict[str, List[str]] = {f: [] for f in _FIELDS}
     if not isinstance(raw, dict):
         return model
@@ -49,6 +91,19 @@ def _normalize_self_model(raw: Any) -> Dict[str, List[str]]:
         value = raw[field] if field in raw else None
         if isinstance(value, list):
             model[field] = [str(x) for x in value if isinstance(x, str) and x.strip()]
+    return model
+
+
+def _self_model_state(current: Any) -> Dict[str, object]:
+    """读-改-写时保留 self_ontology，避免列表字段 mutate 把本体知识整包抹掉。"""
+    model: Dict[str, object] = dict(_normalize_self_model(current))
+    if not isinstance(current, dict) or _ONTOLOGY_FIELD not in current:
+        return model
+    val = current[_ONTOLOGY_FIELD]
+    if isinstance(val, str) and val.strip():
+        model[_ONTOLOGY_FIELD] = val.strip()
+    elif isinstance(val, list) and val and isinstance(val[0], str) and val[0].strip():
+        model[_ONTOLOGY_FIELD] = val[0].strip()
     return model
 
 
@@ -82,7 +137,7 @@ async def add_self_note(
     from gsuid_core.ai_core.state_store import state_mutate
 
     if field not in _FIELDS:
-        logger.warning(i18n_t("🪞 [SelfCognition] 非法 self_model 字段: {field}", field=field))
+        logger.warning(i18n_t("log.ai.selfcog_invalid_self_model_field", field=field))
         return False
     content = (content or "").strip()
     if not content:
@@ -95,14 +150,14 @@ async def add_self_note(
     from gsuid_core.ai_core.interaction_scaffold import is_persistent_style_rule
 
     if field == "preferences_learned" and is_persistent_style_rule(content):
-        logger.warning(i18n_t("🪞 [SelfCognition] 拒绝把持久说话规矩写入偏好（疑似漂移注入）: {p0}", p0=content[:60]))
+        logger.warning(i18n_t("log.ai.selfcog_refused_persist_persistent_inject", p0=content[:60]))
         return False
 
-    def _mutate(current: Any) -> Dict[str, List[str]]:
-        model = _normalize_self_model(current)
-        items = model[field]
+    def _mutate(current: Any) -> Dict[str, object]:
+        model = _self_model_state(current)
+        items = list(model[field]) if isinstance(model[field], list) else []
         if content in items:
-            items.remove(content)  # 去重：已存在则移到末尾（视为最新）
+            items.remove(content)
         items.append(content)
         if len(items) > _MAX_ITEMS_PER_FIELD:
             items = items[-_MAX_ITEMS_PER_FIELD:]
@@ -110,9 +165,14 @@ async def add_self_note(
         return model
 
     await state_mutate(_self_scope(bot_id), _SELF_MODEL_KEY, _mutate)
+    # 同步认知节点：让「我记过什么」能被 search_cognition 命中，而不是只能等
+    # 下一轮稳定前缀。称呼/禁忌这类**规则**优先落 AIMemPreference，此处只留非规则反思。
+    from gsuid_core.ai_core.cognition.distill import distill_self_note
+
+    await distill_self_note(note=content, note_type=field, bot_id=bot_id)
     logger.debug(
         i18n_t(
-            "🪞 [SelfCognition] {bot_id} self_model.{field} 追加: {content}",
+            "log.ai.selfcog_bot_id_self_model_field",
             bot_id=bot_id,
             field=field,
             content=content,
@@ -142,7 +202,7 @@ async def overwrite_self_model_field(
     from gsuid_core.ai_core.state_store import state_mutate
 
     if field not in _FIELDS:
-        logger.warning(i18n_t("🪞 [SelfCognition] 非法 self_model 字段: {field}", field=field))
+        logger.warning(i18n_t("log.ai.selfcog_invalid_self_model_field", field=field))
         return False
     cleaned: List[str] = []
     for raw in items:
@@ -151,15 +211,15 @@ async def overwrite_self_model_field(
             cleaned.append(text)
     cleaned = cleaned[-_MAX_ITEMS_PER_FIELD:]
 
-    def _mutate(current: Any) -> Dict[str, List[str]]:
-        model = _normalize_self_model(current)
+    def _mutate(current: Any) -> Dict[str, object]:
+        model = _self_model_state(current)
         model[field] = cleaned
         return model
 
     await state_mutate(_self_scope(bot_id), _SELF_MODEL_KEY, _mutate)
     logger.info(
         i18n_t(
-            "🪞 [SelfCognition] {bot_id} self_model.{field} 被整字段覆盖（{p0} 条）",
+            "log.ai.selfcog_bot_id_self_field",
             bot_id=bot_id,
             field=field,
             p0=len(cleaned),
@@ -197,7 +257,7 @@ async def retrieve_self_episodes(bot_id: str, limit: int = 3) -> str:
             )
             rows = list(result.scalars().all())
     except Exception as e:
-        logger.debug(i18n_t("🪞 [SelfCognition] 自我情景记忆检索失败: {e}", e=e))
+        logger.debug(i18n_t("log.ai.selfcog_self_episodic_memory_fail", e=e))
         return ""
 
     if not rows:
@@ -265,32 +325,9 @@ async def _compute_live_recurring_topics(
     return await get_context_tags(scope_key, top_n=top_n)
 
 
-def _relationship_line(user_id: str, favorability: Optional[int]) -> str:
-    """生成"当前对话者与我的关系"描述（关系层：好感数值 + 主人身份）。"""
-    from gsuid_core.ai_core.utils import _is_master_user
-
-    if _is_master_user(user_id):
-        return "当前对话者是我的主人（最高信任）。"
-    if favorability is None:
-        # None 仅代表"没显式打过分"，不等于陌生——避免对高频群友恒判"尚不熟悉"
-        return "当前对话者：打过照面的群友。"
-    if favorability >= 75:
-        rel = "很熟的老朋友"
-    elif favorability >= 50:
-        rel = "算是熟人"
-    elif favorability >= 20:
-        rel = "见过几次面"
-    elif favorability >= 0:
-        rel = "还不太熟"
-    else:
-        rel = "关系有些紧张"
-    return f"当前对话者：{rel}（好感度 {favorability}），不是主人。"
-
-
 async def build_self_cognition_context(
     bot_id: str,
-    user_id: str = "",
-    favorability: Optional[int] = None,
+    rel: Optional["RelationshipView"] = None,
     scope_key: Optional[str] = None,
     include_relationship: bool = True,
 ) -> str:
@@ -299,16 +336,15 @@ async def build_self_cognition_context(
     内容 = 演化层 self_model 摘要（bot/scope 级，稳定）+ 当前对话者关系（per-user）。
 
     ``include_relationship``（§优化 O-3 缓存）：
-      - True（默认，per-turn 注入）：含关系行；关系随当前对话者/好感度变化。
+      - True（per-turn 注入）：含关系行；关系随当前对话者 / zone 变化。
       - False（建 session 时进 system_prompt）：仅 self_model 块、**不含**关系行——
         群聊 session 整群共享，关系是 per-user 的、不能冻进共享前缀，由
         ``build_relationship_context`` 每轮单独注入 user 侧。
 
     Args:
-        bot_id:       机器人 ID
-        user_id:      当前对话者 ID（include_relationship=False 时不需要）
-        favorability: 当前对话者好感度（由 handle_ai 查询后传入）
-        scope_key:    本轮对话所在 scope（如 ``group:xxx`` / ``user_global:xxx``）。
+        bot_id:    机器人 ID
+        rel:       当前对话者的关系视图（``include_relationship=False`` 时不需要）
+        scope_key: 本轮对话所在 scope（如 ``group:xxx`` / ``user_global:xxx``）。
             提供时，``recurring_topics`` 会优先从该 scope 的 group_profile 标签累计
             实时计算（top 5）——比静态 self_model.recurring_topics 更贴近当前会话。
 
@@ -317,6 +353,10 @@ async def build_self_cognition_context(
     """
     model = await get_self_model(bot_id)
     lines: List[str] = ["【关于我自己（仅供参考）】"]
+    ontology = await ensure_self_ontology(bot_id)
+    if ontology:
+        lines.append("【我是什么】")
+        lines.append(ontology)
 
     if model["commitments"]:
         lines.append(f"我的承诺: {'；'.join(model['commitments'][-5:])}")
@@ -341,8 +381,8 @@ async def build_self_cognition_context(
     if model["self_notes"]:
         lines.append(f"我最近的反思: {'；'.join(model['self_notes'][-3:])}")
 
-    if include_relationship:
-        lines.append(_relationship_line(user_id, favorability))
+    if include_relationship and rel is not None:
+        lines.append(rel.line)
 
     # 不再注入"我的能力域: planning / mcp / 子任务工具…"等工程语汇——每轮复读会把
     # 角色重塑成"工具系统"，是出戏主因。能调什么工具由 tools schema 承担，不进自述。
@@ -353,10 +393,11 @@ async def build_self_cognition_context(
     return "\n".join(lines)
 
 
-def build_relationship_context(user_id: str, favorability: Optional[int]) -> str:
+def build_relationship_context(rel: "RelationshipView") -> str:
     """当前对话者关系（per-user，每轮注入 user 侧）。
 
     self_model 块随 session 固化进 system_prompt（缓存友好），但关系是 per-user 的，
     群聊共享 session 下必须每轮按当前对话者单独给出——括号包裹暗示是背景感知。
+    文案不再自划档：唯一来源是 ``relationship.zones``（见 ``RelationshipView.line``）。
     """
-    return f"（{_relationship_line(user_id, favorability)}）"
+    return f"（{rel.line}）"

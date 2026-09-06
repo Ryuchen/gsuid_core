@@ -122,7 +122,7 @@ def _build_mcp_tool_function(
 
         logger.info(
             t(
-                "🔌 [MCP Tool] 调用 {p0}/{tool_name}, 参数: {call_args}",
+                "log.mcp.tool_calling_name_args_call",
                 p0=client.name,
                 tool_name=tool_name,
                 call_args=call_args,
@@ -135,7 +135,7 @@ def _build_mcp_tool_function(
                 error_text = result.text
                 logger.warning(
                     t(
-                        "🔌 [MCP Tool] {p0}/{tool_name} 返回错误: {error_text}",
+                        "log.mcp.mcp_tool_name_error_text_fail",
                         p0=client.name,
                         tool_name=tool_name,
                         error_text=error_text,
@@ -144,7 +144,7 @@ def _build_mcp_tool_function(
                 return f"MCP 工具执行失败: {error_text}"
             return result.text
         except Exception as e:
-            logger.error(t("🔌 [MCP Tool] {p0}/{tool_name} 调用异常: {e}", p0=client.name, tool_name=tool_name, e=e))
+            logger.error(t("log.mcp.mcp_tool_name_call_fail", p0=client.name, tool_name=tool_name, e=e))
             return f"MCP 工具调用异常: {e}"
 
     # 设置函数元数据
@@ -153,7 +153,9 @@ def _build_mcp_tool_function(
     mcp_tool_wrapper.__qualname__ = f"mcp.{client.name}.{tool_name}"
     mcp_tool_wrapper.__module__ = "gsuid_core.ai_core.mcp.startup"
     mcp_tool_wrapper.__annotations__ = annotations
-    mcp_tool_wrapper.__signature__ = inspect.Signature(parameters=params)
+    # mcp_tool_wrapper 是 FunctionType, 静态类型无 __signature__ 字段;
+    # setattr 动态写入，pyright 不再标红（与 register.py 一致）。
+    setattr(mcp_tool_wrapper, "__signature__", inspect.Signature(parameters=params))
 
     return mcp_tool_wrapper
 
@@ -219,7 +221,7 @@ def _register_mcp_tool(
     # 检查是否已注册
     tool_registry = _get_tool_registry()
     if MCP_CATEGORY in tool_registry and registered_name in tool_registry[MCP_CATEGORY]:
-        logger.debug(t("🔌 [MCP] 工具已注册，跳过: {registered_name}", registered_name=registered_name))
+        logger.debug(t("log.mcp.registered_skipping_name", registered_name=registered_name))
         return
 
     # 创建包装函数
@@ -232,7 +234,7 @@ def _register_mcp_tool(
         if check_func is not None:
             logger.info(
                 t(
-                    "🔒 [MCP] 工具 '{registered_name}' 已配置权限检查 (需要等级 {p0})",
+                    "log.mcp.registered_name_permission_check",
                     registered_name=registered_name,
                     p0=config.get_tool_required_pm(tool_name),
                 )
@@ -248,13 +250,14 @@ def _register_mcp_tool(
         plugin=f"mcp_{client.name}",
         tool=tool_obj,
         check_func=check_func,
+        category=MCP_CATEGORY,
     )
 
     if MCP_CATEGORY not in tool_registry:
         tool_registry[MCP_CATEGORY] = {}
     tool_registry[MCP_CATEGORY][registered_name] = tool_base
 
-    logger.info(t("🔌 [MCP] 注册工具: {registered_name} (来自 {p0})", registered_name=registered_name, p0=client.name))
+    logger.info(t("log.mcp.register_registered_name", registered_name=registered_name, p0=client.name))
 
 
 async def _register_mcp_server(config_id: str, config: MCPConfig) -> int:
@@ -270,6 +273,7 @@ async def _register_mcp_server(config_id: str, config: MCPConfig) -> int:
     """
     client = MCPClient(
         name=config.name,
+        transport=config.get_transport(),
         command=config.command,
         args=config.args,
         env=config.env,
@@ -280,7 +284,7 @@ async def _register_mcp_server(config_id: str, config: MCPConfig) -> int:
     try:
         tools = await client.list_tools()
     except Exception as e:
-        logger.error(t("🔌 [MCP] 连接 MCP 服务器失败 [{p0}]: {e}", p0=config.name, e=e))
+        logger.error(t("log.mcp.connect_server", p0=config.name, e=e))
         return 0
 
     # 保存客户端引用
@@ -298,7 +302,7 @@ async def _register_mcp_server(config_id: str, config: MCPConfig) -> int:
             )
             registered_count += 1
         except Exception as e:
-            logger.error(t("🔌 [MCP] 注册工具失败 [{p0}/{p1}]: {e}", p0=config.name, p1=tool_info.name, e=e))
+            logger.error(t("log.mcp.fail_register_tool_failed", p0=config.name, p1=tool_info.name, e=e))
 
     return registered_count
 
@@ -331,7 +335,7 @@ async def unregister_mcp_server(config_id: str) -> int:
 
     for tool_name in tools_to_remove:
         del tool_registry[MCP_CATEGORY][tool_name]
-        logger.info(t("🔌 [MCP] 注销工具: {tool_name}", tool_name=tool_name))
+        logger.info(t("log.mcp.unregister_name_tool", tool_name=tool_name))
 
     # 清理客户端引用
     if config_id in _mcp_clients:
@@ -378,27 +382,25 @@ async def register_all_mcp_tools() -> None:
     enabled_configs = mcp_config_manager.get_enabled_configs()
 
     if not enabled_configs:
-        logger.info(t("🔌 [MCP] 没有启用的 MCP 配置，跳过注册"))
+        logger.info(t("log.mcp.enabled_configurations_skipping"))
         return
 
-    logger.info(t("🔌 [MCP] 发现 {p0} 个启用的 MCP 配置，开始注册...", p0=len(enabled_configs)))
+    logger.info(t("log.mcp.found_enabled_configurations", p0=len(enabled_configs)))
 
     total_registered = 0
     for config_id, config in enabled_configs:
-        logger.info(t("🔌 [MCP] 正在注册 MCP 服务器: {p0} ({config_id})", p0=config.name, config_id=config_id))
+        logger.info(t("log.mcp.registering_server_config", p0=config.name, config_id=config_id))
         count = await _register_mcp_server(config_id, config)
         total_registered += count
-        logger.info(t("🔌 [MCP] {p0} 注册完成，共 {count} 个工具", p0=config.name, count=count))
+        logger.info(t("log.mcp.registration_tools_total", p0=config.name, count=count))
 
-    logger.info(
-        t("🔌 [MCP] 所有 MCP 工具注册完成，共注册 {total_registered} 个工具", total_registered=total_registered)
-    )
+    logger.info(t("log.mcp.tools_registered_total", total_registered=total_registered))
 
 
 async def shutdown_mcp_clients() -> None:
     """关闭时清理 MCP 客户端资源"""
     _mcp_clients.clear()
-    logger.info(t("🔌 [MCP] MCP 客户端资源已清理"))
+    logger.info(t("log.mcp.client_resources_cleaned"))
 
 
 # 启动/关闭函数（由 ai_core/startup.py 的 init_ai_core() 统一调用）
@@ -407,7 +409,7 @@ async def init_mcp_tools():
     from gsuid_core.ai_core.configs.ai_config import ai_config
 
     if not ai_config.get_config("enable").data:
-        logger.info(t("🔌 [MCP] AI总开关已关闭，跳过MCP工具注册"))
+        logger.info(t("log.mcp.ai_master_switch_skipping_2"))
         return
 
     await register_all_mcp_tools()

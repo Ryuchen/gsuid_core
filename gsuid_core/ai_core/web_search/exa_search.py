@@ -112,8 +112,8 @@ async def exa_search(
     api_key_pool = _get_api_key_pool()
 
     if not api_key_pool:
-        logger.warning(t("🌐 [WebSearch] Exa API Key 未配置，跳过搜索"))
-        return []
+        logger.warning(t("log.ai.websearch_exa_api_key_configured"))
+        raise RuntimeError(t("log.ai.websearch_exa_api_key_configured"))
 
     if max_results is None:
         max_results = int(exa_config.get_config("max_results").data or "10")
@@ -122,6 +122,7 @@ async def exa_search(
 
     # 记录已尝试的 api_key，避免重复尝试
     tried_keys = set()
+    last_err: Exception | None = None
 
     while len(tried_keys) < len(api_key_pool):
         api_key = _select_api_key([k for k in api_key_pool if k not in tried_keys])
@@ -138,12 +139,13 @@ async def exa_search(
                 api_key=api_key,
             )
 
-            logger.info(t("🌐 [WebSearch][Exa] 搜索: {query}, 返回 {p0} 条结果", query=query, p0=len(results)))
+            logger.info(t("log.ai.websearch_exa_search_query", query=query, p0=len(results)))
             return results
 
-        except Exception:
-            logger.warning(t("🌐 [WebSearch][Exa] api_key ...{p0} 失败，尝试下一个", p0=api_key[-4:]))
+        except (RuntimeError, OSError, ValueError, TypeError) as e:
+            logger.warning(t("log.ai.websearch_exa_api_key_trying", p0=api_key[-4:]))
+            last_err = e
             continue
 
-    logger.error(t("🌐 [WebSearch][Exa] 所有 api_key 均失败"))
-    return []
+    logger.error(t("log.ai.websearch_exa_api_keys"))
+    raise RuntimeError(t("log.ai.websearch_exa_api_keys") + (f": {last_err}" if last_err else ""))

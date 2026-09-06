@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Type, Tuple, Optional
 
 from sqlmodel import SQLModel, func, select
 
+from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.webconsole.mount_app import GsAdminModel, site
 from gsuid_core.utils.database.base_models import async_maker
@@ -155,7 +156,13 @@ def _extract_columns_from_model(model_class: Type[SQLModel]) -> List[ColumnInfo]
 
                 columns.append(ColumnInfo(field_name, title, col_type, nullable, default))
     except Exception as e:
-        logger.error(f"Error extracting columns from model {model_class.__name__}: {e}")
+        logger.error(
+            t(
+                "log.db_admin.extract_columns_fail",
+                model_name=model_class.__name__,
+                error=e,
+            )
+        )
     return columns
 
 
@@ -180,7 +187,7 @@ def _collect_admin_models() -> Dict[str, List[DatabaseTableInfo]]:
     plugin_tables: Dict[str, List[DatabaseTableInfo]] = {}
     table_info_cache: Dict[str, DatabaseTableInfo] = {}
 
-    logger.debug("Collecting admin models...")
+    logger.debug(t("log.db_admin.collect_start"))
 
     found_admins = []
 
@@ -194,14 +201,20 @@ def _collect_admin_models() -> Dict[str, List[DatabaseTableInfo]]:
                 model = getattr(obj, "model", None)
                 if model is not None:
                     found_admins.append(obj)
-                    logger.trace(f"Found GsAdminModel: {name} with model {model.__name__}")
+                    logger.trace(
+                        t(
+                            "log.db_admin.model_found",
+                            admin_name=name,
+                            model_name=model.__name__,
+                        )
+                    )
     except Exception as e:
-        logger.error(f"Error importing mount_app: {e}")
+        logger.error(t("log.db_admin.import_mount_app_fail", error=e))
         import traceback
 
         traceback.print_exc()
 
-    logger.debug(f"Total found admins: {len(found_admins)}")
+    logger.debug(t("log.db_admin.admin_count", count=len(found_admins)))
 
     # 处理找到的每个 admin
     for admin_cls in found_admins:
@@ -238,7 +251,14 @@ def _collect_admin_models() -> Dict[str, List[DatabaseTableInfo]]:
         # 获取插件 ID
         plugin_id, plugin_name = _get_plugin_id_from_model(model_class)
 
-        logger.trace(f"Adding table {table_name} ({page_title}) to plugin {plugin_id}")
+        logger.trace(
+            t(
+                "log.db_admin.adding_table_name_page_create",
+                table_name=table_name,
+                page_title=page_title,
+                plugin_name=plugin_id,
+            )
+        )
 
         # 添加到插件表列表
         if plugin_id not in plugin_tables:
@@ -247,9 +267,20 @@ def _collect_admin_models() -> Dict[str, List[DatabaseTableInfo]]:
 
     # 也检查 site.plugins_page（用于插件）
     try:
-        logger.trace(f"Processing site.plugins_page: {len(site.plugins_page)} plugins")
+        logger.trace(
+            t(
+                "log.db_admin.plugins_page_start",
+                plugin_count=len(site.plugins_page),
+            )
+        )
         for plugin_name, admin_list in site.plugins_page.items():
-            logger.trace(f"Processing plugin {plugin_name} with {len(admin_list)} admins")
+            logger.trace(
+                t(
+                    "log.db_admin.plugin_admins",
+                    plugin_name=plugin_name,
+                    admin_count=len(admin_list),
+                )
+            )
             for admin_cls in admin_list:
                 model_class = getattr(admin_cls, "model", None)
                 if model_class is not None:
@@ -278,22 +309,29 @@ def _collect_admin_models() -> Dict[str, List[DatabaseTableInfo]]:
                     # 缓存表信息
                     table_info_cache[table_name] = table_info
 
-                    logger.trace(f"Adding table {table_name} ({page_title}) to plugin {plugin_name}")
+                    logger.trace(
+                        t(
+                            "log.db_admin.adding_table_name_page_create",
+                            table_name=table_name,
+                            page_title=page_title,
+                            plugin_name=plugin_name,
+                        )
+                    )
 
                     # 添加到插件表列表
                     if plugin_name not in plugin_tables:
                         plugin_tables[plugin_name] = []
                     plugin_tables[plugin_name].append(table_info)
     except Exception as e:
-        logger.error(f"Error processing site.plugins_page: {e}")
+        logger.error(t("log.db_admin.plugins_page_fail", error=e))
 
     """
-    logger.debug("\nFinal collection results:")
-    logger.debug(f"Collected {len(plugin_tables)} plugins: {list(plugin_tables.keys())}")
+    logger.debug("🐛 \nFinal collection results:")
+    logger.debug(f"🔌 Collected {len(plugin_tables)} plugins: {list(plugin_tables.keys())}")
     for pid, tables in plugin_tables.items():
-        logger.debug(f"  Plugin {pid}: {len(tables)} tables")
+        logger.debug(f"  🔌 Plugin {pid}: {len(tables)} tables")
         for table in tables:
-            logger.debug(f"    - {table.table_title} ({table.table_name})")
+            logger.debug(f"    🐛 - {table.table_title} ({table.table_name})")
     """
 
     return plugin_tables
@@ -348,6 +386,10 @@ async def get_table_data(
 ) -> PaginatedData:
     """Get paginated data from a table with optional search and filter"""
     from sqlmodel import or_, and_
+    from sqlalchemy import String, cast
+
+    page = max(1, page)
+    per_page = max(1, min(per_page, 500))
 
     table_info = get_table_info(table_name)
     if not table_info:
@@ -364,20 +406,27 @@ async def get_table_data(
             if search:
                 search_term = f"%{search}%"
                 search_conditions = []
+                valid_names = {col.name for col in table_info.columns}
 
-                # 确定搜索列：如果指定了 search_columns，则只搜索指定列；否则搜索所有文本列
+                # 指定列则只搜这些列；否则搜全部列（含 int 等，CAST 成文本后模糊匹配）
                 if search_columns:
-                    search_col_list = [col.strip() for col in search_columns.split(",")]
+                    search_col_list = [col.strip() for col in search_columns.split(",") if col.strip()]
                 else:
-                    # 默认搜索所有文本类型列
-                    search_col_list = [
-                        col.name for col in table_info.columns if col.col_type in ("str", "text", "json")
-                    ]
+                    search_col_list = [col.name for col in table_info.columns]
 
+                col_type_by_name = {col.name: col.col_type for col in table_info.columns}
                 for col_name in search_col_list:
-                    # 验证列名是否有效
-                    if col_name in [col.name for col in table_info.columns]:
-                        search_conditions.append(getattr(model_class, col_name).ilike(search_term))
+                    if col_name not in valid_names:
+                        continue
+                    col_attr = getattr(model_class, col_name, None)
+                    if col_attr is None:
+                        continue
+                    col_type = col_type_by_name.get(col_name, "str")
+                    if col_type in ("str", "text", "json"):
+                        search_conditions.append(col_attr.ilike(search_term))
+                    elif col_type in ("int", "float", "datetime", "date", "time"):
+                        # 非文本列 CAST 后再模糊匹配，否则搜 UID 等数字字段会被静默跳过
+                        search_conditions.append(cast(col_attr, String).ilike(search_term))
 
                 if search_conditions:
                     conditions.append(or_(*search_conditions))
@@ -450,7 +499,7 @@ async def get_table_data(
 
             return PaginatedData(dict_items, total, page, per_page)
     except Exception as e:
-        logger.error(f"Error getting table data: {e}")
+        logger.error(t("log.db_admin.get_table_data_fail", error=e))
         return PaginatedData([], 0, page, per_page)
 
 
@@ -489,7 +538,7 @@ async def create_record(table_name: str, data: Dict[str, Any]) -> Optional[Dict[
 
             return result_dict
     except Exception as e:
-        logger.error(f"Error creating record: {e}")
+        logger.error(t("log.db_admin.create_record_fail", error=e))
         return None
 
 
@@ -553,7 +602,7 @@ async def update_record(
 
             return result_dict
     except Exception as e:
-        logger.error(f"Error updating record: {e}")
+        logger.error(t("log.db_admin.update_record_fail", error=e))
         return None
 
 
@@ -588,5 +637,5 @@ async def delete_record(table_name: str, record_id: Any) -> bool:
             await session.commit()
             return True
     except Exception as e:
-        logger.error(f"Error deleting record: {e}")
+        logger.error(t("log.db_admin.delete_record_fail", error=e))
         return False

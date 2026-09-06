@@ -63,7 +63,7 @@ async def move_file(
     destination_path: str,
 ) -> str:
     """
-    移动文件
+    改写文件路径（移动）
 
     在 data/ai_core/artifacts 目录内将文件从一个位置移动到另一个位置。
     如果目标路径已存在文件或目录，操作将被拒绝（不允许覆盖）。
@@ -107,7 +107,7 @@ async def move_file(
         size = safe_dst.stat().st_size
         logger.info(
             t(
-                "🧠 [BuildinTools] 文件移动成功: {source_path} → {destination_path} ({p0})",
+                "log.ai.buildintools_file_move_succeeded_ok",
                 source_path=source_path,
                 destination_path=destination_path,
                 p0=_format_size(size),
@@ -116,7 +116,7 @@ async def move_file(
         return f"文件移动成功: {source_path} → {destination_path} ({_format_size(size)})"
 
     except Exception as e:
-        logger.exception(t("🧠 [BuildinTools] 文件移动失败: {e}", e=e))
+        logger.exception(t("log.ai.buildintools_file_move", e=e))
         return f"错误：文件移动失败: {str(e)}"
 
 
@@ -128,7 +128,7 @@ async def copy_file(
     overwrite: bool = False,
 ) -> str:
     """
-    复制文件
+    读取源文件并写入副本
 
     在 data/ai_core/artifacts 目录内将文件从一个位置复制到另一个位置。
 
@@ -172,7 +172,7 @@ async def copy_file(
         size = safe_dst.stat().st_size
         logger.info(
             t(
-                "🧠 [BuildinTools] 文件复制成功: {source_path} → {destination_path} ({p0})",
+                "log.ai.buildintools_file_copy_succeeded_ok",
                 source_path=source_path,
                 destination_path=destination_path,
                 p0=_format_size(size),
@@ -181,7 +181,7 @@ async def copy_file(
         return f"文件复制成功: {source_path} → {destination_path} ({_format_size(size)})"
 
     except Exception as e:
-        logger.exception(t("🧠 [BuildinTools] 文件复制失败: {e}", e=e))
+        logger.exception(t("log.ai.buildintools_file_copy", e=e))
         return f"错误：文件复制失败: {str(e)}"
 
 
@@ -192,7 +192,7 @@ async def pack_to_zip(
     zip_path: str,
 ) -> str:
     """
-    打包文件为 zip
+    读取文件并写入 zip 压缩包
 
     将 data/ai_core/artifacts 目录内的一个或多个文件/目录打包成 zip 压缩文件。
     多个源路径用英文逗号分隔。
@@ -260,7 +260,7 @@ async def pack_to_zip(
         zip_size = safe_zip.stat().st_size
         logger.info(
             t(
-                "🧠 [BuildinTools] zip 打包成功: {zip_path} (共 {file_count} 个文件, {p0})",
+                "log.ai.buildintools_zip_packaging_succeeded_ok",
                 zip_path=zip_path,
                 file_count=file_count,
                 p0=_format_size(zip_size),
@@ -269,7 +269,7 @@ async def pack_to_zip(
         return f"zip 打包成功: {zip_path}\n包含文件数: {file_count}\n压缩包大小: {_format_size(zip_size)}"
 
     except Exception as e:
-        logger.exception(t("🧠 [BuildinTools] zip 打包失败: {e}", e=e))
+        logger.exception(t("log.ai.buildintools_zip_packaging", e=e))
         # 清理可能不完整的 zip 文件
         if safe_zip.exists():
             try:

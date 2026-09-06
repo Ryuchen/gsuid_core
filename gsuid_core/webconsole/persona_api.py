@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 
 from gsuid_core.ai_core.persona import (
     Persona,
+    copy_persona,
     load_persona,
     save_persona,
     delete_persona,
@@ -23,7 +24,7 @@ from gsuid_core.ai_core.persona import (
 )
 from gsuid_core.ai_core.gs_agent import build_new_persona
 from gsuid_core.webconsole.app_app import app
-from gsuid_core.webconsole.web_api import require_auth
+from gsuid_core.webconsole.web_api import require_auth, require_admin
 from gsuid_core.ai_core.persona.config import persona_config_manager
 from gsuid_core.ai_core.persona.models import (
     MAX_FILE_SIZE,
@@ -31,6 +32,12 @@ from gsuid_core.ai_core.persona.models import (
     validate_audio_type,
     validate_image_type,
 )
+from gsuid_core.webconsole.plugins_api import _build_config_item
+from gsuid_core.ai_core.persona.settings import (
+    DEFAULT_PERSONA_SETTINGS,
+    persona_settings_manager,
+)
+from gsuid_core.utils.plugins_config.models import GsDivider
 
 from ._api_tags import PERSONA
 
@@ -90,6 +97,12 @@ async def get_persona_detail(persona_name: str, _: Dict[str, Any] = Depends(requ
                 "content": content,
                 "metadata": metadata,
             },
+        }
+    except ValueError:
+        return {
+            "status": 1,
+            "msg": "非法角色名",
+            "data": None,
         }
     except FileNotFoundError:
         return {
@@ -165,7 +178,10 @@ async def get_persona_avatar(persona_name: str, _: Dict[str, Any] = Depends(requ
     Returns:
         头像图片文件，如果不存在则返回404
     """
-    avatar_path = get_persona_avatar_path(persona_name)
+    try:
+        avatar_path = get_persona_avatar_path(persona_name)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="非法角色名")
     if not avatar_path:
         raise HTTPException(status_code=404, detail=f"角色 '{persona_name}' 的头像不存在")
 
@@ -183,7 +199,10 @@ async def get_persona_image(persona_name: str, _: Dict[str, Any] = Depends(requi
     Returns:
         立绘图片文件，如果不存在则返回404
     """
-    image_path = get_persona_image_path(persona_name)
+    try:
+        image_path = get_persona_image_path(persona_name)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="非法角色名")
     if not image_path:
         raise HTTPException(status_code=404, detail=f"角色 '{persona_name}' 的立绘不存在")
 
@@ -201,7 +220,10 @@ async def get_persona_audio(persona_name: str, _: Dict[str, Any] = Depends(requi
     Returns:
         音频文件，如果不存在则返回404
     """
-    audio_path = get_persona_audio_path(persona_name)
+    try:
+        audio_path = get_persona_audio_path(persona_name)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="非法角色名")
     if not audio_path:
         raise HTTPException(status_code=404, detail=f"角色 '{persona_name}' 的音频不存在")
 
@@ -565,10 +587,41 @@ async def add_persona(
         }
 
 
+@app.post("/api/persona/{persona_name}/copy", summary="复制角色", tags=PERSONA)
+async def copy_persona_endpoint(
+    persona_name: str,
+    _: Dict[str, Any] = Depends(require_auth),
+) -> Dict[str, Any]:
+    """复制整个人格目录。新名称在源名后追加 2/3/…；副本启用范围强制 disabled。"""
+    persona = Persona(persona_name)
+    if not persona.exists():
+        return {
+            "status": 1,
+            "msg": f"角色 '{persona_name}' 不存在",
+            "data": None,
+        }
+    try:
+        new_name = copy_persona(persona_name)
+    except ValueError as e:
+        return {
+            "status": 1,
+            "msg": str(e),
+            "data": None,
+        }
+    return {
+        "status": 0,
+        "msg": "ok",
+        "data": {
+            "name": new_name,
+            "source": persona_name,
+        },
+    }
+
+
 @app.delete("/api/persona/{persona_name}", summary="删除角色", tags=PERSONA)
 async def remove_persona(
     persona_name: str,
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     删除角色
@@ -647,8 +700,9 @@ async def update_persona_config(
         data: 更新后的配置对象
 
     注意：
-    - scope 可选值为: "disabled"(不对任何群聊启用), "global"(对所有群/角色启用), "specific"(仅对指定群聊启用)
-    - 全部人格中只能有一个配置为 "global"
+    - scope 可选值: disabled / global / specific / global_group / global_private
+    - global 覆盖群聊+私聊；global_group 仅群聊；global_private 仅私聊
+    - global / global_group / global_private 全局互斥，只能有一个
     """
     # 检查 persona 是否存在
     persona = Persona(persona_name)
@@ -805,6 +859,86 @@ async def update_persona_config(
     }
 
 
+def _persona_settings_web_dict(persona_name: str) -> Dict[str, Any]:
+    """把 persona.json 序列化成插件配置同构的 ``PluginConfigItem`` 字典。"""
+    cfg = persona_settings_manager.get_config(persona_name)
+    data: Dict[str, Any] = {}
+    for key in DEFAULT_PERSONA_SETTINGS:
+        data[key] = _build_config_item(cfg.get_config(key), key)
+    return data
+
+
+@app.get("/api/persona/{persona_name}/settings", summary="获取人格设定（persona.json）", tags=PERSONA)
+async def get_persona_settings(
+    persona_name: str,
+    _: Dict[str, Any] = Depends(require_auth),
+) -> Dict[str, Any]:
+    """返回称呼 / 失败短句等 GSC 字段（含 title/desc/type/value），前端按插件配置渲染。"""
+    persona = Persona(persona_name)
+    if not persona.exists():
+        return {
+            "status": 1,
+            "msg": f"角色 '{persona_name}' 不存在",
+            "data": None,
+        }
+    return {
+        "status": 0,
+        "msg": "ok",
+        "data": _persona_settings_web_dict(persona_name),
+    }
+
+
+@app.put("/api/persona/{persona_name}/settings", summary="更新人格设定（persona.json）", tags=PERSONA)
+async def update_persona_settings(
+    persona_name: str,
+    data: Dict[str, Any],
+    _: Dict[str, Any] = Depends(require_auth),
+) -> Dict[str, Any]:
+    """按 key 写入字符串值。未知键 / 分割线跳过。也可传完整 PluginConfigItem（取 value）。"""
+    persona = Persona(persona_name)
+    if not persona.exists():
+        return {
+            "status": 1,
+            "msg": f"角色 '{persona_name}' 不存在",
+            "data": None,
+        }
+    if not isinstance(data, dict):
+        return {
+            "status": 1,
+            "msg": "请求体必须是对象",
+            "data": None,
+        }
+    cfg = persona_settings_manager.get_config(persona_name)
+    updated: list[str] = []
+    for key, value in data.items():
+        if key not in DEFAULT_PERSONA_SETTINGS:
+            continue
+        template = DEFAULT_PERSONA_SETTINGS[key]
+        if isinstance(template, GsDivider):
+            continue
+        raw: object = value
+        if isinstance(value, dict) and "value" in value and "type" in value:
+            raw = value["value"]
+        if not isinstance(raw, str):
+            return {
+                "status": 1,
+                "msg": f"{key} 必须是字符串",
+                "data": None,
+            }
+        if not cfg.set_config(key, raw):
+            return {
+                "status": 1,
+                "msg": f"写入失败: {key}",
+                "data": None,
+            }
+        updated.append(key)
+    return {
+        "status": 0,
+        "msg": f"已更新: {', '.join(updated)}" if updated else "没有更新任何配置",
+        "data": _persona_settings_web_dict(persona_name),
+    }
+
+
 @app.get("/api/persona/config/global", summary="获取全局启用的角色", tags=PERSONA)
 async def get_global_persona(_: Dict[str, Any] = Depends(require_auth)) -> Dict[str, Any]:
     """
@@ -842,3 +976,44 @@ async def get_all_persona_configs(_: Dict[str, Any] = Depends(require_auth)) -> 
         "msg": "ok",
         "data": configs,
     }
+
+
+@app.get("/api/persona/heartbeat/status", summary="Heartbeat 巡检运行态", tags=PERSONA)
+async def get_heartbeat_status(_: Dict[str, Any] = Depends(require_auth)) -> Dict[str, Any]:
+    """返回每个 Persona 的 Heartbeat 巡检 job 是否已注册，以及配置侧是否启用定时巡检。"""
+    try:
+        from gsuid_core.ai_core.heartbeat.inspector import get_inspector
+
+        inspector = get_inspector()
+        scheduled = set(getattr(inspector, "_scheduled_jobs", {}) or {})
+        items = []
+        for persona_name in list_available_personas():
+            cfg = persona_config_manager.get_persona_config_dict(persona_name) or {}
+            ai_mode = cfg.get("ai_mode") or []
+            if isinstance(ai_mode, dict):
+                ai_mode = ai_mode.get("value") or ai_mode.get("data") or []
+            inspect_interval = cfg.get("inspect_interval")
+            if isinstance(inspect_interval, dict):
+                inspect_interval = inspect_interval.get("value") or inspect_interval.get("data")
+            enabled = "定时巡检" in (ai_mode if isinstance(ai_mode, list) else [])
+            job_id = (getattr(inspector, "_scheduled_jobs", {}) or {}).get(persona_name)
+            items.append(
+                {
+                    "persona_name": persona_name,
+                    "enabled": enabled,
+                    "inspect_interval": inspect_interval,
+                    "job_registered": persona_name in scheduled,
+                    "job_id": job_id,
+                }
+            )
+        return {
+            "status": 0,
+            "msg": "ok",
+            "data": {
+                "inspector_running": bool(getattr(inspector, "is_running", False)),
+                "items": items,
+                "count": len(items),
+            },
+        }
+    except Exception as e:
+        return {"status": 1, "msg": f"获取 Heartbeat 状态失败: {e}", "data": None}

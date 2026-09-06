@@ -7,19 +7,19 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
 
 ## 一、工具分类（category）与"框架保底池"的关系
 
-工具是否属于"框架保底"主要由注册时声明的 ``category`` 字符串决定：
+工具是否属于"框架通道核"由 ``MAIN_AGENT_CORE_TOOLS`` 名单决定（群/私同一份）：
 
-- ``get_main_agent_tools()``     → 加载 ``self`` + ``buildin`` 两个分类（**保底池**）；
-                                   其中 ``self`` 再经 ``_SELF_CATEGORY_WHITELIST`` 收敛到
-                                   4 个核心工具，防插件滥用 ``category="self"`` 撑大保底池。
-- ``search_tools(query=...)``    → 在 ``planning`` / ``common`` / ``media`` / ``default``
-                                   与插件注册的 ``by_trigger`` 等分类里做向量检索按需加载。
-- ``tool_state_signals``         → 按"用户名下持久实体"把 ``planning`` 能力族精确补进工具列表。
+- ``get_main_agent_tools()``     → 加载通道核（发现 / 回想 / 委派 / 发送 /
+                                   一次性与周期提醒入口）。列出/改/删/暂停、
+                                   web_search、self 信息、命令执行不进核，由状态信号、
+                                   本句检索或 ``find_tools`` 补上。
+- ``search_tools(query=...)``    → 在未暴露工具里做向量检索（含未进核的 self/buildin）；
+                                   ``meta`` / ``plugin_dev`` 永不被检索。
+- ``tool_state_signals``         → 按"用户名下持久实体"把能力族精确补进工具列表。
 - ``create_subagent`` 默认子代理 → 默认装配 ``default`` 分类 + ``buildin`` 部分。
 
-要让一个新工具成为保底工具，注册时写 ``category="self"`` 或 ``category="buildin"``。
-要让新工具仅在向量检索命中时出现，留 ``category="common"`` / ``"media"`` /
-``"default"`` 即可。
+要让一个新工具进入通道核，把它的名字加进 ``MAIN_AGENT_CORE_TOOLS``（并想清楚 schema 税）。
+要让新工具仅在向量检索命中时出现，不要进该名单即可。
 
 ## 二、按 category 列出所有内置工具
 
@@ -28,34 +28,32 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
 分类而本文档没同步，请以 ``register.py`` 的 ``_TOOL_REGISTRY`` 为准。
 
 ### 2.1 ``category="self"`` —— 仅主人格保底（不会装配进能力代理）
-这些是"只能由主人格直接调用"的工具：副作用强、面向用户。``get_main_agent_tools``
-还会用 ``rag.tools._SELF_CATEGORY_WHITELIST`` 把 self 保底池收敛到这 4 个核心工具
-（防插件滥用 ``category="self"`` 撑大保底池），故下表即当前的 self 白名单全集：
+这些是"只能由主人格直接调用"的工具：副作用强、面向用户。通道核收发送类 self
+以及一次性/周期提醒入口；列出/改/删/暂停仍注册为 self，由状态信号或 find_tools 带出。
 
 | 工具 | 来源 | 说明 |
 |---|---|---|
 | ``send_message_by_ai`` | ``message_sender.py`` | 主动以当前人格口吻发消息给主人（**仅主人格可用，能力代理禁用**） |
-| ``update_user_favorability`` | ``favorability_manager.py`` | 增量更新好感度 |
-| ``add_once_task`` | ``scheduler.py`` | 注册一次性定时任务（口语触发，需常驻主人格手边） |
-| ``add_interval_task`` | ``scheduler.py`` | 注册周期定时任务（同上） |
+| ``send_meme`` | ``meme_tools.py`` | 按情绪从库里发一张表情包 |
+| ``add_once_task`` | ``scheduler.py`` | 一次性定时任务（通道核入口） |
+| ``add_interval_task`` | ``scheduler.py`` | 周期定时任务（通道核入口） |
 
-> ``create_subagent`` / ``evaluate_agent_mesh_capability`` 已改为 ``common``、
-> ``query_user_memory`` 已改为 ``buildin``——见下文对应小节。
+> ``create_subagent`` / ``evaluate_agent_mesh_capability`` 为 ``common``。
+> 好感度由框架每轮结算，没有增量工具；绝对值覆盖仅主人 ``set_user_favorability``。
 
 ### 2.2 ``category="buildin"`` —— 主人格 + 能力代理都保底
 "任何任务都可能需要"的基础能力。能力代理经 ``task_basics`` 能力族拿到大部分。
 
-- ``search_knowledge``（``rag_search.py``）：向量检索知识库
-- ``web_search_tool``（``web_search.py``）：Tavily web 搜索
+- ``search_cognition``（``rag_search.py``）：回想（记忆 / 偏好 / 知识 / 落盘 / 产物 / 近窗 / 记录 / 图片 / 表情）
+- ``read_handle``（``planning/tool_output_tools.py``）：统一读句柄（已删除 ``read_persisted_output``）
+- ``web_search_tool``（``web_search.py``）：统一 web 搜索（Tavily / Jina / Exa / AnySearch / Firecrawl / MCP）
 - ``web_fetch_tool``（``web_fetch.py``）：抓取网页并转 Markdown
-- ``query_user_memory``（``database_query.py``）：查询用户多群组记忆 + 好感度（统一照会）
 - ``get_self_info``（``self_info.py``）：取完整自我认知（身份 / 能力 / 主人）
 - ``get_self_persona_info``（``self_info.py``）：查 Persona 资源（立绘/头像/音频/配置）
-- ``read_image``（``image_reader.py``）：按图片ID（``img_xxx`` / ``res_xxx`` / 直链）
-  取回群聊图片并转述为文字（群聊只给 Agent 图片ID、需看图时再读，保底常驻）
-- ``state_get`` / ``state_set`` / ``state_list``（``state_store/tools.py``）：
-  高频通用持久键值状态（低频的 ``state_delete`` / ``state_append`` 已降为 ``common``，
-  靠"持久状态"能力族按需召回）
+- ``read_image``（``image_reader.py``）：按图片ID取回群聊图片并转述（``visible_when`` 有图才露）
+- ``read_video``（``video_reader.py``）：按视频ID取回；有视频且模型声明 video 才露
+- ``state_get`` / ``state_set``（``state_store/tools.py``）：高频持久键值
+  （``state_list`` / ``state_delete`` / ``state_append`` 在 common，按能力族召回）
 
 ### 2.2.1 ``category="planning"`` —— 状态驱动 + 向量检索按需（**非保底**）
 长任务编排 / 产物 / 结构化集合工具。**刻意不进保底池**——这 15 个重型 schema 每轮常驻会
@@ -81,7 +79,7 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
   派子 Agent 跑即时多步任务（不进 Kanban 任务树）
 - ``evaluate_agent_mesh_capability``（``planning/kanban_tools.py``，
   ``capability_domain="长期任务编排"``）：Kanban 任务树前置评估
-- ``search_image``（``rag_search.py``）：图片资源向量检索
+- ``search_image``（``rag_search.py``）：图片资源向量检索（主人格隐藏，走 ``search_cognition``）
 - ``get_user_avatar``（``avatar_tools.py``）：按用户ID取头像，注册 RM 后返回
   ``img_xxx``（再交给 ``read_image`` 看 / ``send_message_by_ai`` 发）
 - ``update_self_note``（``self_info.py``）：写 self_note
@@ -94,18 +92,23 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
 - ``install_skill``（``skill_installer.py``，``capability_domain="技能管理"``）：
   从 git 仓库 / zip 直链 / SKILL.md 直链安装技能到 SKILLS_PATH 并热重载
   （``check_pm`` 限主人 + ``visible_when`` 对非主人隐藏）
-- ``send_meme`` / ``collect_meme`` / ``search_meme``（``meme_tools.py``）：
-  表情包发送 / 收藏 / 检索
+- ``collect_meme`` / ``search_meme``（``meme_tools.py``，``capability_domain="表情"``）：
+  收藏当前消息图片 / 检索表情库（``search_meme`` 对主人格隐藏）
 - ``list_scheduled_tasks`` / ``query_scheduled_task`` / ``modify_scheduled_task``
   （``scheduler.py``）：定时任务管理（只读 / 改）按需
 - ``cancel_scheduled_task`` / ``pause_scheduled_task`` / ``resume_scheduled_task``
   （``scheduler.py``）：定时任务停 / 起按需
 
-### 2.4 ``category="media"`` —— 向量检索按需（图文渲染）
+### 2.4 ``category="media"`` —— 资料出图（主人格不保底，归 ``render_agent``）
 | 工具 | 来源 | 说明 |
 |---|---|---|
-| ``render_html_to_image`` | ``html_render_tools.py`` | HTML 模板 → 图片（webconsole 复用浏览器） |
+| ``render_html_to_image`` | ``html_render_tools.py`` | 自写 HTML 出图（多数据点主路径） |
+| ``render_card`` | ``html_render_tools.py`` | 结构化 JSON 固定布局 → 图片 |
 | ``render_markdown_to_image`` | ``html_render_tools.py`` | Markdown → 图片 |
+
+> 三者同属 ``capability_domain="资料出图"``，由能力代理 ``render_agent`` 白名单持有；
+> 主人格经 exclusive 剥离后**不应**直调，应
+> ``create_subagent(agent_profile="render_agent", task=事实包)``。
 
 ### 2.5 ``category="default"`` —— 沙盒 / 子 Agent 专用
 ``@ai_tools()`` 不传 category 即落入 ``"default"``。这些工具不在保底池，
@@ -139,7 +142,7 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
 - ``load_plugin_into_core``：复用 ``reload_plugin`` 把（全新 / 改动后的）插件热加载进框架
 - ``test_plugin_command``：**功能自测**——实跑插件某条命令（MockBot 拦截下发、只回收产出），
   回复主人前确认命令真能跑出预期结果
-- ``search_skill_docs``：**查文档首选**——对启动时挂载进知识库的 docs/skills 全部开发文档做混合检索
+- ``search_skill_docs``：**查文档首选**——对启动时挂载进知识库的 .agents/skills 全部开发文档做混合检索
   （dense+BM25）；可选 ``skill=`` 限定到某一份（如 ``gscore-plugin-development``）
 - ``read_plugin_dev_guide``：确定性阅读 ``gscore-plugin-development`` SKILL（目录 / 整章，亦作 RAG 关闭时的兜底）
 
@@ -149,10 +152,10 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
 是内置能力节点默认挂载的工具族（节点 ``tool_packs`` 声明，webconsole 可见可卸）：
 
 ``artifact_put`` / ``artifact_get`` / ``artifact_list`` + ``state_*`` +
-``record_*`` + ``search_knowledge`` + ``web_search_tool`` / ``web_fetch_tool``。
+``record_*`` + ``search_cognition`` + ``web_search_tool`` / ``web_fetch_tool``。
 
 注意：``send_message_by_ai`` 不在此列——能力代理只对主人格交付结果，由
-``kanban_executor._persona_relay`` 用主人格口吻转译后送达，不持有"直接和主人对话"的下行通道。
+交互完成后回灌主 session 由主人格收尾；能力代理不持有对用户直发通道。
 """
 
 # 工具装饰器
@@ -202,6 +205,9 @@ from gsuid_core.ai_core.buildin_tools.get_time import (
 # Subagent工具 - 创建子Agent完成特定任务
 from gsuid_core.ai_core.buildin_tools.subagent import create_subagent
 
+# 声明式图表原语（方案八）：chart_spec → 内联 SVG，供 render_agent 出真图表
+from gsuid_core.ai_core.buildin_tools.chart_svg import render_chart_spec
+
 # 定时任务工具 - 管理定时/循环任务（增删改查启停）
 from gsuid_core.ai_core.buildin_tools.scheduler import (
     add_once_task,
@@ -233,10 +239,10 @@ from gsuid_core.ai_core.buildin_tools.meme_tools import (
 # RAG检索工具 - 知识库查询，支持类别/插件筛选
 from gsuid_core.ai_core.buildin_tools.rag_search import (
     search_image,
-    search_knowledge,
+    search_cognition,
 )
 
-# Web搜索工具 - 基于Tavily的web搜索
+# Web搜索工具 - 统一调度 Tavily / Jina / Exa / AnySearch / Firecrawl / MCP
 from gsuid_core.ai_core.buildin_tools.web_search import web_search_tool
 
 # 用户头像工具 - 按用户ID取头像并注册到RM，返回图片ID
@@ -254,6 +260,15 @@ from gsuid_core.ai_core.buildin_tools.file_manager import (
 # 图片读取工具 - 按图片ID取回群聊图片并转述为文字（保底）
 from gsuid_core.ai_core.buildin_tools.image_reader import read_image
 
+# 视频读取工具 - 按视频ID惰性取回（保底，有视频才露）
+from gsuid_core.ai_core.buildin_tools.video_reader import read_video
+
+# 控制面工具 - 查在途委派 / 对框架校验申辩（非用户可见通道）
+from gsuid_core.ai_core.buildin_tools.control_tools import (
+    check_delegation,
+    dispute_directive,
+)
+
 # 统一审批交互工具 - 全框架唯一的审批转达入口 + 审批能力族
 from gsuid_core.ai_core.buildin_tools.approval_tools import (
     ask_user,
@@ -262,11 +277,6 @@ from gsuid_core.ai_core.buildin_tools.approval_tools import (
     request_user_approval,
     list_pending_approvals,
     request_master_approval,
-)
-
-# 数据库查询工具 - 查询用户数据（记忆/事实/好感度统一照会）
-from gsuid_core.ai_core.buildin_tools.database_query import (
-    query_user_memory,
 )
 
 # A-4：群成员称呼 / 身份确定性记忆
@@ -278,6 +288,7 @@ from gsuid_core.ai_core.buildin_tools.identity_tools import (
 from gsuid_core.ai_core.buildin_tools.message_sender import (
     send_message_by_ai,
 )
+from gsuid_core.ai_core.buildin_tools.cognition_write import attach_article
 
 # 文件操作工具 - artifacts 路径内的文件移动/复制/打包 zip
 from gsuid_core.ai_core.buildin_tools.file_operations import (
@@ -307,8 +318,10 @@ from gsuid_core.ai_core.buildin_tools.plugin_developer import (
     read_plugin_dev_guide,
 )
 
-# HTML渲染工具 - 将HTML/Markdown渲染为图片
+# HTML渲染工具 - 将HTML/Markdown/结构化卡片渲染为图片
+# （外链/icon/资源图在 render_html_to_image 内自动嵌 data URI，无独立嵌图工具）
 from gsuid_core.ai_core.buildin_tools.html_render_tools import (
+    render_card,
     render_html_to_image,
     render_markdown_to_image,
 )
@@ -316,7 +329,6 @@ from gsuid_core.ai_core.buildin_tools.html_render_tools import (
 # 好感度管理工具 - 管理用户好感度
 from gsuid_core.ai_core.buildin_tools.favorability_manager import (
     set_user_favorability,
-    update_user_favorability,
 )
 
 # 动态工具发现 - 允许AI搜索和发现可能需要的新工具
@@ -330,11 +342,14 @@ from gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery import (
 __all__ = [
     # 工具装饰器
     "ai_tools",
-    # RAG检索工具
-    "search_knowledge",
+    # 认知检索（主人格唯一「回想」动词）+ RAG 图片检索
+    "search_cognition",
     "search_image",
+    "attach_article",
     # 图片读取工具（按ID取图转述，保底）
     "read_image",
+    # 视频读取工具（按ID惰性取回，保底）
+    "read_video",
     # 用户头像工具（按ID取头像，返回RM图片ID）
     "get_user_avatar",
     # Web搜索工具
@@ -355,10 +370,7 @@ __all__ = [
     "ask_user_form",
     "request_user_approval",
     "request_master_approval",
-    # 数据库查询工具
-    "query_user_memory",
-    # 好感度管理工具
-    "update_user_favorability",
+    # 好感度管理工具（仅主人绝对值覆盖；增量由框架结算）
     "set_user_favorability",
     # 群成员称呼 / 身份
     "remember_user_alias",
@@ -371,6 +383,9 @@ __all__ = [
     "_get_current_date",
     # Subagent工具
     "create_subagent",
+    # 控制面工具
+    "check_delegation",
+    "dispute_directive",
     # 自我信息工具
     "get_self_persona_info",
     "get_self_info",
@@ -423,6 +438,8 @@ __all__ = [
     "record_delete",
     "record_summary",
     # HTML渲染工具
+    "render_card",
+    "render_chart_spec",
     "render_html_to_image",
     "render_markdown_to_image",
     # Kanban 任务编排工具

@@ -8,8 +8,9 @@ from typing import Any, Dict
 
 from fastapi import Body, Depends, Request
 
+from gsuid_core.i18n import t
 from gsuid_core.webconsole.app_app import app
-from gsuid_core.webconsole.web_api import require_auth
+from gsuid_core.webconsole.web_api import require_admin
 from gsuid_core.utils.database.admin_api import (
     create_record,
     delete_record,
@@ -25,7 +26,7 @@ from ._api_tags import DATABASE
 
 
 @app.get("/api/database/plugins", summary="获取所有插件数据库", tags=DATABASE)
-async def get_database_plugins(request: Request, _user: Dict[str, Any] = Depends(require_auth)):
+async def get_database_plugins(request: Request, _user: Dict[str, Any] = Depends(require_admin)):
     """
     获取所有插件及其数据库信息
 
@@ -72,12 +73,12 @@ async def get_database_plugins(request: Request, _user: Dict[str, Any] = Depends
     except Exception as e:
         from gsuid_core.logger import logger
 
-        logger.error(f"Failed to get database plugins: {e}")
+        logger.error(t("log.webconsole.database_plugins_fail", error=e))
         return {"status": 1, "msg": str(e), "data": []}
 
 
 @app.get("/api/database/{plugin_id}/tables", summary="获取插件表信息", tags=DATABASE)
-async def get_plugin_tables(plugin_id: str, request: Request, _user: Dict[str, Any] = Depends(require_auth)):
+async def get_plugin_tables(plugin_id: str, request: Request, _user: Dict[str, Any] = Depends(require_admin)):
     """
     获取指定插件的数据库表列表
 
@@ -102,12 +103,12 @@ async def get_plugin_tables(plugin_id: str, request: Request, _user: Dict[str, A
     except Exception as e:
         from gsuid_core.logger import logger
 
-        logger.error(f"Failed to get plugin tables: {e}")
+        logger.error(t("log.webconsole.database_tables_fail", error=e))
         return {"status": 1, "msg": str(e), "data": {}}
 
 
 @app.get("/api/database/table/{table_name}", summary="获取表元数据", tags=DATABASE)
-async def get_table_metadata(table_name: str, request: Request, _user: Dict[str, Any] = Depends(require_auth)):
+async def get_table_metadata(table_name: str, request: Request, _user: Dict[str, Any] = Depends(require_admin)):
     """
     获取数据表元数据
 
@@ -134,7 +135,7 @@ async def get_table_metadata(table_name: str, request: Request, _user: Dict[str,
     except Exception as e:
         from gsuid_core.logger import logger
 
-        logger.error(f"Failed to get table metadata: {e}")
+        logger.error(t("log.webconsole.database_metadata_fail", error=e))
         return {"status": 1, "msg": str(e), "data": None}
 
 
@@ -147,7 +148,7 @@ async def get_table_data_api(
     search_columns: str = "",
     filter_columns: str = "",
     filter_values: str = "",
-    _user: Dict[str, Any] = Depends(require_auth),
+    _user: Dict[str, Any] = Depends(require_admin),
 ):
     """
     获取数据表分页数据
@@ -186,7 +187,7 @@ async def get_table_data_api(
     except Exception as e:
         from gsuid_core.logger import logger
 
-        logger.error(f"Failed to get table data: {e}")
+        logger.error(t("log.webconsole.database_data_fail", error=e))
         return {"status": 1, "msg": str(e), "data": {"items": [], "total": 0, "page": page, "per_page": per_page}}
 
 
@@ -194,7 +195,7 @@ async def get_table_data_api(
 async def create_record_api(
     table_name: str,
     data: Dict[str, Any] = Body(...),
-    _user: Dict[str, Any] = Depends(require_auth),
+    _user: Dict[str, Any] = Depends(require_admin),
 ):
     """
     创建新记录
@@ -218,7 +219,7 @@ async def create_record_api(
     except Exception as e:
         from gsuid_core.logger import logger
 
-        logger.error(f"Failed to create record: {e}")
+        logger.error(t("log.webconsole.database_create_fail", error=e))
         return {"status": 1, "msg": str(e), "data": None}
 
 
@@ -227,7 +228,7 @@ async def update_record_api(
     table_name: str,
     record_id: str,
     data: Dict[str, Any] = Body(...),
-    _user: Dict[str, Any] = Depends(require_auth),
+    _user: Dict[str, Any] = Depends(require_admin),
 ):
     """
     更新记录
@@ -261,7 +262,7 @@ async def update_record_api(
     except Exception as e:
         from gsuid_core.logger import logger
 
-        logger.error(f"Failed to update record: {e}")
+        logger.error(t("log.webconsole.database_update_fail", error=e))
         return {"status": 1, "msg": str(e), "data": None}
 
 
@@ -269,7 +270,7 @@ async def update_record_api(
 async def delete_record_api(
     table_name: str,
     record_id: str,
-    _user: Dict[str, Any] = Depends(require_auth),
+    _user: Dict[str, Any] = Depends(require_admin),
 ):
     """
     删除记录
@@ -302,5 +303,5 @@ async def delete_record_api(
     except Exception as e:
         from gsuid_core.logger import logger
 
-        logger.error(f"Failed to delete record: {e}")
+        logger.error(t("log.webconsole.database_delete_fail", error=e))
         return {"status": 1, "msg": str(e), "data": None}

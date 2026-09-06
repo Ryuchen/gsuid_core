@@ -22,9 +22,10 @@
 """
 
 import re
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Sequence
 from dataclasses import field, dataclass
 
+from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 
 # CJK surface 至少 2 字、ASCII surface 至少 3 字才允许入索引（见模块 docstring）。
@@ -39,11 +40,23 @@ class EntityRef:
     surface: str
     canonicals: List[str] = field(default_factory=list)
     plugins: List[str] = field(default_factory=list)
+    # (plugin, canonical) 成对保存：同词在不同插件可指向不同正式名。
+    bindings: List[Tuple[str, str]] = field(default_factory=list)
 
     @property
     def is_ambiguous(self) -> bool:
         """被多个插件注册 = 无法确定归属，调用方不得据此路由。"""
         return len(self.plugins) > 1
+
+    def canonical_for(self, plugin: str) -> Optional[str]:
+        """这篇知识所属插件把该 surface 映射到的唯一正式名。"""
+        if not plugin:
+            return None
+        hits = [canon for owner, canon in self.bindings if owner == plugin and canon]
+        uniq = list(dict.fromkeys(hits))
+        if len(uniq) != 1:
+            return None
+        return uniq[0]
 
 
 # surface（已归一化）→ EntityRef
@@ -83,6 +96,9 @@ def register_entity_surface(surface: str, canonical: str, plugin: str) -> None:
         _SURFACE_INDEX[key] = ref
         _SCAN_ORDER = None
 
+    pair = (plugin, canonical)
+    if canonical and pair not in ref.bindings:
+        ref.bindings.append(pair)
     if canonical and canonical not in ref.canonicals:
         ref.canonicals.append(canonical)
     if plugin not in ref.plugins:
@@ -103,6 +119,27 @@ def _scan_order() -> List[str]:
     if _SCAN_ORDER is None:
         _SCAN_ORDER = sorted(_SURFACE_INDEX, key=len, reverse=True)
     return _SCAN_ORDER
+
+
+def strip_surfaces(text: str, surfaces: Sequence[str]) -> str:
+    """从文本拿掉一组 surface（最长优先）。边界规则与 ``_contains`` 相同。
+
+    唤醒词/人格名走这条，不当成游戏实体去路由。
+    """
+    body = text or ""
+    names = sorted({s.strip() for s in surfaces if s and s.strip()}, key=len, reverse=True)
+    if not body or not names:
+        return body
+    out = body
+    for raw in names:
+        key = _normalize_surface(raw)
+        if not key:
+            continue
+        if key.isascii():
+            out = re.sub(rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])", " ", out, flags=re.IGNORECASE)
+        else:
+            out = out.replace(raw, " ").replace(key, " ")
+    return re.sub(r"\s+", " ", out).strip()
 
 
 def _contains(text: str, surface: str) -> bool:
@@ -154,7 +191,7 @@ def plugins_in_text(text: str) -> List[str]:
     plugins: List[str] = []
     for ref in find_entities_in_text(text):
         if ref.is_ambiguous:
-            logger.trace(f"🧠 [EntityIndex] surface {ref.surface!r} 归属歧义 {ref.plugins}，不路由")
+            logger.trace(t("log.entity_index.ambiguous_skip", surface=ref.surface, plugins=list(ref.plugins)))
             continue
         for plugin in ref.plugins:
             if plugin not in plugins:

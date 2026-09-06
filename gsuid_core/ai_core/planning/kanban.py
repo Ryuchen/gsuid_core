@@ -53,9 +53,7 @@ def get_root_refresh_lock(root_task_id: str) -> asyncio.Lock:
     return lock
 
 
-# ─────────────────────────────────────────────────────────────────────
 # 创建：任务树
-# ─────────────────────────────────────────────────────────────────────
 
 
 async def create_kanban_tree(
@@ -123,8 +121,6 @@ async def create_kanban_tree(
 
     # 子任务级周期触发的依赖关系硬约束：禁止任何子任务 depends_on 周期子任务。
     # 周期子任务永不"完成"（armed 持续到 recurring_until 才 disarm），下游若依赖
-    # 它 = 永远等待 = 死锁。用 not_before + recurring_until 错开时间来表达"汇总
-    # 子任务等周期结束后再跑"的语义。
     recurring_indexes = {i for i, spec in enumerate(subtasks) if (spec.get("recurring_trigger") or "").strip()}
     if recurring_indexes:
         for spec in subtasks:
@@ -207,10 +203,8 @@ async def create_kanban_tree(
             display_name=str(spec.get("description") or "")[:64] or display_name,
             interval_seconds=0,
             agent_profile=str(spec.get("agent_profile") or "").strip(),
-            # 周期子任务模板自身不进 ready 队列；首次依赖满足时由调度器 arm（详见
-            # ``executor._maybe_arm_recurring_subtasks``）。注册时直接挂上 APScheduler
-            # 还会把"立即触发一次"和"等下个 cron 时点"语义混在一起，让主人格难以
-            # 判断；统一用"依赖满足才 arm"路径，arm 成功才进 APScheduler。
+            # 周期子任务模板自身不进 ready 队列；
+            # 注册时直接挂上 APScheduler
             status="pending",
             node_kind="subtask",
             parent_task_id=root.id,
@@ -247,7 +241,7 @@ async def create_kanban_tree(
     )
     logger.info(
         t(
-            "📋 [Kanban] 创建任务树 root=#{p0} {p1}（{p2} 子任务）",
+            "log.ai.kanban_created_task_tree_root",
             p0=root.ordinal,
             p1=root.display_name,
             p2=len(children),
@@ -256,9 +250,7 @@ async def create_kanban_tree(
     return root, children
 
 
-# ─────────────────────────────────────────────────────────────────────
 # 周期触发：模板克隆
-# ─────────────────────────────────────────────────────────────────────
 
 
 async def clone_tree_for_fire(
@@ -312,7 +304,6 @@ async def clone_tree_for_fire(
     for tpl_child in template_children:
         # 注意：模板上的 not_before 是绝对时间，克隆到实例时通常已经过期；
         # 周期模板自身的 cron 表达式已经决定了"什么时候开火"，子任务级再叠 not_before
-        # 没意义。这里**不复制 not_before**，所有实例子任务都立即可调度。
         new_child = await AIAgentTask.create_task(
             goal=tpl_child.goal,
             owner_user_id=tpl_child.owner_user_id,
@@ -366,7 +357,7 @@ async def clone_tree_for_fire(
     )
     logger.info(
         t(
-            "📋 [Kanban] 周期触发: 模板 root={p0} 第 {p1} 次开火，克隆实例 root={p2}",
+            "log.ai.kanban_recurring_trigger_template_2",
             p0=template_root.id,
             p1=template_root.fire_count + 1,
             p2=instance_root.id,
@@ -485,7 +476,7 @@ async def clone_subtask_for_fire(template: AIAgentTask) -> Optional[AIAgentTask]
     )
     logger.info(
         t(
-            "📋 [Kanban] 周期子任务: 模板 subtask={p0} 第 {p1} 次开火 → 实例 subtask={p2} root={p3}",
+            "log.ai.kanban_recurring_subtask_template",
             p0=fresh.id,
             p1=fresh.fire_count + 1,
             p2=new_child.id,
@@ -534,9 +525,7 @@ async def arm_recurring_subtask(template: AIAgentTask, trigger_spec: str) -> Tup
         "decision",
         f"周期子任务 armed: trigger={trigger_spec}",
     )
-    logger.info(
-        t("📋 [Kanban] 周期子任务 armed subtask={p0} trigger={trigger_spec}", p0=template.id, trigger_spec=trigger_spec)
-    )
+    logger.info(t("log.ai.kanban_recurring_subtask_armed_2", p0=template.id, trigger_spec=trigger_spec))
     return True, "armed"
 
 
@@ -577,9 +566,7 @@ async def disarm_template(template_root_id: str) -> bool:
     return True
 
 
-# ─────────────────────────────────────────────────────────────────────
 # 查询：任务树
-# ─────────────────────────────────────────────────────────────────────
 
 
 async def _query_children(root_task_id: str) -> List[AIAgentTask]:
@@ -660,7 +647,7 @@ def get_ready_child_tasks(
     2. dependency_task_ids 全部为 completed / skipped（或依赖项是已 armed 的周期模板，
        见 ``deps_satisfied_for``）；
     3. 根任务不在 paused / failed / cancelled / waiting_approval；
-    4. ``not_before`` 字段为空或 ≤ ``now``——支持"等开盘 / 等下班"等延后语义；
+    4. ``not_before`` 字段为空或 ≤ ``now``——支持"等上班 / 等下班"等延后语义；
     5. 当前子任务的 task_node_lock 未被占（执行器层自行加锁防并发）。
     6. **排除周期子任务模板本身**（``recurring_trigger`` 非空且 ``template_subtask_id``
        为空——模板不直接派活，由调度器单独走 arm 路径挂 APScheduler）。
@@ -673,7 +660,7 @@ def get_ready_child_tasks(
         if c.status != "pending":
             continue
         if is_recurring_subtask_template(c):
-            # 周期子任务模板：依赖未满足时仍在 pending；依赖刚满足时也不进 ready，
+            # 周期子任务模板：依赖未满足时仍在 pending；依赖刚满足时也不进 ready
             # 由 ``kanban_executor._maybe_arm_recurring_subtasks`` 转 armed 挂 APScheduler。
             continue
         if not deps_satisfied_for(c, children):
@@ -737,9 +724,7 @@ def compute_kanban_column(task: AIAgentTask, deps_satisfied: bool = True) -> str
     return "target"
 
 
-# ─────────────────────────────────────────────────────────────────────
 # 状态机：mark_subtask_running / completed / failed
-# ─────────────────────────────────────────────────────────────────────
 
 
 async def mark_subtask_running(task: AIAgentTask) -> bool:
@@ -810,9 +795,7 @@ def _drop_subtask_recurring_job(subtask_id: str) -> None:
         pass
 
 
-# ─────────────────────────────────────────────────────────────────────
 # 根任务状态汇总
-# ─────────────────────────────────────────────────────────────────────
 
 
 def is_leaf_root(root: AIAgentTask, children_count: int) -> bool:
@@ -854,7 +837,6 @@ async def refresh_root_status(root_task_id: str) -> Optional[str]:
             new_status = root.status
         elif has_armed_recurring and any(s in ("pending", "running", "waiting_approval", "paused") for s in statuses):
             # 周期子任务模板存在且还有正在跑/等待的兄弟节点 → 保持 running
-            # （即便所有"非周期子任务"已 completed，整棵树也不算结束）。
             # 注意：周期模板自身 status 永远是 pending，不计入"全 completed"判断。
             new_status = "running"
         elif all(s in ("completed", "skipped") for s in statuses):
@@ -883,12 +865,48 @@ async def refresh_root_status(root_task_id: str) -> Optional[str]:
                 update_data={"status": new_status, "updated_at": now},
             )
             await AIAgentTaskLog.add_log(root.id, "decision", f"根任务状态汇总：{root.status} -> {new_status}")
+            if new_status in ("completed", "failed"):
+                await _distill_root_terminal(root, children, new_status)
         return new_status
 
 
-# ─────────────────────────────────────────────────────────────────────
+async def _distill_root_terminal(
+    root: AIAgentTask,
+    children: List[AIAgentTask],
+    status: str,
+) -> None:
+    """根任务终态回流认知层：目标 + 结论摘要 → episode(+fact)，挂 artifact 溯源边。
+
+    动机：能力代理产出的结论过去只在 artifact 表里、30 天 TTL 到期即删，记忆与知识库
+    完全感知不到；用户一个月后追问「上次那个思路」只能靠会话碎片。这里只回流**结论**，
+    整棵任务日志不回流（那是流水，不是认知）。失败只丢节点，不影响任务状态。
+    """
+    try:
+        from gsuid_core.ai_core.planning.models import AIAgentArtifact
+        from gsuid_core.ai_core.cognition.distill import distill_task_terminal
+
+        artifacts = await AIAgentArtifact.list_for_root(root.id)
+        conclusion = " / ".join(a.summary for a in artifacts if a.summary)[:400]
+        if not conclusion:
+            done = [c.display_name or c.goal for c in children if c.status == "completed"]
+            conclusion = "；".join(done)[:400]
+        await distill_task_terminal(
+            root_task_id=root.id,
+            goal=root.goal,
+            status=status,
+            conclusion=conclusion,
+            scope_key=root.scope_key,
+            # 属主必传：scope_key 是 group:{gid}，只按它过滤会让同群任何人
+            # 都能从 search_cognition 召回别人的任务结论与产物摘要
+            owner_user_id=root.owner_user_id or "",
+            artifact_ids=[a.id for a in artifacts],
+            as_of=datetime.now().strftime("%Y-%m-%d"),
+        )
+    except Exception as e:
+        logger.debug(t("log.ai.cognition_distill_task_fail", task=root.id, e=e))
+
+
 # 任务级状态操作：暂停 / 恢复 / 终止（webconsole 与主人格句柄都走这里）
-# ─────────────────────────────────────────────────────────────────────
 
 
 async def pause_task(task_id: str) -> bool:
@@ -905,7 +923,7 @@ async def pause_task(task_id: str) -> bool:
         update_data={"status": "paused", "updated_at": now},
     )
     await AIAgentTaskLog.add_log(task_id, "decision", "任务已被主人暂停")
-    logger.info(t("📋 [Kanban] 任务 {task_id} 已暂停", task_id=task_id))
+    logger.info(t("log.ai.kanban_task_id_paused", task_id=task_id))
     return True
 
 
@@ -920,7 +938,7 @@ async def resume_task(task_id: str) -> bool:
         update_data={"status": "running", "updated_at": now},
     )
     await AIAgentTaskLog.add_log(task_id, "decision", "任务已被主人恢复")
-    logger.info(t("📋 [Kanban] 任务 {task_id} 已恢复", task_id=task_id))
+    logger.info(t("log.ai.kanban_task_id_resumed", task_id=task_id))
     return True
 
 
@@ -934,12 +952,10 @@ async def abort_task(task_id: str, reason: str) -> None:
     await AIAgentTaskLog.add_log(task_id, "decision", f"任务终止：{reason}")
     _drop_not_before_job(task_id)
     _drop_subtask_recurring_job(task_id)
-    logger.info(t("📋 [Kanban] 任务 {task_id} 已终止：{reason}", task_id=task_id, reason=reason))
+    logger.info(t("log.ai.kanban_task_id_terminated_reason", task_id=task_id, reason=reason))
 
 
-# ─────────────────────────────────────────────────────────────────────
 # 失败处理：重派 / 审批 / 整树失败
-# ─────────────────────────────────────────────────────────────────────
 
 
 async def respawn_child_task(
@@ -1096,9 +1112,7 @@ async def fail_task_tree(root_task_id: str, reason: str) -> bool:
             )
             _drop_subtask_recurring_job(c.id)
     await AIAgentTaskLog.add_log(root.id, "decision", f"整棵任务树被终结：{reason} | 级联失败 {cascaded} 子任务")
-    logger.info(
-        t("📋 [Kanban] 整树失败 root={root_task_id} cascaded={cascaded}", root_task_id=root_task_id, cascaded=cascaded)
-    )
+    logger.info(t("log.ai.kanban_entire_tree_root_task", root_task_id=root_task_id, cascaded=cascaded))
     return True
 
 
@@ -1168,7 +1182,7 @@ async def hard_delete_task_tree(
                 if unschedule_template(r.id):
                     stats["unscheduled_jobs"] += 1
     except Exception as e:
-        logger.warning(t("📋 [Kanban] 硬删除前摘除周期 job 失败 task={task_id}: {e}", task_id=task_id, e=e))
+        logger.warning(t("log.ai.kanban_remove_recurring_job_hard", task_id=task_id, e=e))
 
     # 删除前把所有子任务的 not_before + 周期子任务 APScheduler job 也摘掉
     try:
@@ -1186,7 +1200,7 @@ async def hard_delete_task_tree(
     except Exception as e:
         logger.warning(
             t(
-                "📋 [Kanban] 硬删除前摘除 not_before/subtask-recurring job 失败 task={task_id}: {e}",
+                "log.ai.kanban_remove_subtask_recurring_fail",
                 task_id=task_id,
                 e=e,
             )
@@ -1223,6 +1237,18 @@ async def hard_delete_task_tree(
         await session.execute(delete(AIAgentTask).where(col(AIAgentTask.id).in_(all_task_ids)))
         await session.commit()
 
+    # FileOS 级联：按 root 删 SQL/payload，并清理 Qdrant 悬空点
+    try:
+        from .tool_output_index import delete_tool_output_index
+        from .tool_output_store import AIToolOutputRecord
+
+        _n_fileos, _paths_fileos, fileos_ids = await AIToolOutputRecord.delete_by_root_task_ids(root_ids)
+        stats["fileos_deleted"] = _n_fileos
+        if fileos_ids:
+            await delete_tool_output_index(fileos_ids)
+    except Exception as e:
+        logger.warning(t("log.ai.kanban_hard_delete_task_files", task_id=task_id, e=e))
+
     if delete_files:
         try:
             from .workspace import ARTIFACT_ROOT
@@ -1245,7 +1271,7 @@ async def hard_delete_task_tree(
                 except OSError:
                     pass
         except Exception as e:
-            logger.warning(t("📋 [Kanban] 硬删除任务文件失败 task={task_id}: {e}", task_id=task_id, e=e))
+            logger.warning(t("log.ai.kanban_hard_delete_task_files", task_id=task_id, e=e))
 
     for tid in all_task_ids:
         _TASK_NODE_LOCKS.pop(tid, None)
@@ -1253,7 +1279,7 @@ async def hard_delete_task_tree(
         _ROOT_REFRESH_LOCKS.pop(rid, None)
 
     logger.info(
-        t("📋 [Kanban] 硬删除任务树 root=%s requested=%s tasks=%s logs=%s artifacts=%s dirs=%s"),
+        t("log.ai.kanban_hard_deleted_task_tree"),
         root.id,
         task_id,
         stats["tasks_deleted"],
@@ -1322,7 +1348,7 @@ async def bulk_delete_task_trees(
             total_stats["failed_root_ids"].append(root.id)
 
     logger.info(
-        t("📋 [Kanban] 批量删除完成 matched=%s deleted=%s failed=%s tasks=%s logs=%s artifacts=%s dirs=%s"),
+        t("log.ai.kanban_batch_deletion_matched_fail"),
         len(roots),
         deleted,
         failed,
@@ -1334,9 +1360,7 @@ async def bulk_delete_task_trees(
     return deleted, failed, total_stats
 
 
-# ─────────────────────────────────────────────────────────────────────
 # 崩溃恢复
-# ─────────────────────────────────────────────────────────────────────
 
 
 async def recover_zombie_subtasks(stale_minutes: int = 15) -> int:
@@ -1385,13 +1409,11 @@ async def recover_zombie_subtasks(stale_minutes: int = 15) -> int:
             "decision",
             f"崩溃恢复：running {kind_label}已重置为 pending（心跳超时）",
         )
-    logger.info(t("📋 [Kanban] 崩溃恢复：复活 {p0} 个僵尸任务", p0=len(zombies)))
+    logger.info(t("log.ai.kanban_crash_recovery_revived", p0=len(zombies)))
     return len(zombies)
 
 
-# ─────────────────────────────────────────────────────────────────────
 # 查询辅助：列出全部根任务（看板视图）
-# ─────────────────────────────────────────────────────────────────────
 
 
 async def list_root_tasks(

@@ -5,9 +5,8 @@
 
 ## 三条委派路径
 
-- ``create_subagent(task=...)``（无 agent_profile）：跑一个临时的通用
-  Plan-and-Solve Agent，工具向量检索装配，**不挂任何 Kanban 树**。适合
-  完全一次性、无产物、主人格自己直接对话回答用户的内部小步骤。
+- ``create_subagent(task=...)``（空 agent_profile）：模型路径拒绝，须填花名册
+  node_id。内核 ``summarize_long_input``（无 ctx）仍走通用 Plan-and-Solve。
 - ``create_subagent(task=..., agent_profile=...)``（默认 transient=False）：
   **自动转为创建一棵单子任务的 Kanban 叶子根树**——同步等待该子任务跑完，把
   代理返回值 + artifact 句柄拼成回执串返回给主人格。这条路径之所以走 Kanban：
@@ -23,6 +22,7 @@
   生成文件 / 持久化状态的任务都必须保持 transient=False**。
 """
 
+import re
 import asyncio
 from typing import Optional
 
@@ -35,12 +35,153 @@ from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.rag.tools import search_tools
 from gsuid_core.ai_core.session_registry import get_ai_session_registry
 from gsuid_core.ai_core.configs.ai_config import ai_config
+from gsuid_core.ai_core.control.delegation import await_delegation, delegation_handle
 
-# 注意：create_agent 在 create_subagent() 内部懒加载导入，
+# 注意：create_agent 在 create_subagent() 内部懒加载导入
 # 避免 buildin_tools → subagent → gs_agent → persona → buildin_tools 的循环导入。
 
 # 子Agent最大迭代次数上限，防止死循环
 _SUBAGENT_MAX_ITERATIONS = 3
+
+# 能力代理返回「只有过程句、无事实包」时再催一次交付（避免无限递归）
+_INCOMPLETE_DELIVERY_MARKERS = (
+    "停止重复",
+    "下面再",
+    "再做几次",
+    "然后再",
+    "然后渲染",
+    "先补充",
+    "先检索",
+    "我去翻",
+    "正在搜索",
+    "继续搜索",
+    "稍后",
+    "接下来会",
+    "马上整理",
+)
+_TRANSIENT_PREFIX_RE = re.compile(
+    r"^【[^】]*临时代理已完成[^】]*】[^\n]*\n*",
+    re.MULTILINE,
+)
+
+
+def _strip_transient_wrapper(text: str) -> str:
+    """去掉 create_subagent 返回前缀，便于判空。"""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    return _TRANSIENT_PREFIX_RE.sub("", s).strip()
+
+
+# 已登记产物句柄：有 res_ 即视为可消费交付（勿被 OOC 误杀后再判 incomplete）
+_RES_HANDLE_RE = re.compile(r"\bres_[0-9a-fA-F]{6,}\b")
+_ARTIFACT_REGISTERED_RE = re.compile(
+    r"(已登记\s*artifact|artifact[_\s-]?put|事实包已登记|登记为\s*\*?`?res_)",
+    re.IGNORECASE,
+)
+
+
+def looks_like_incomplete_subagent_delivery(text: str) -> bool:
+    """能力代理是否只回了过程句 / 空壳，没有可消费的事实包。
+
+    形状判据：过短且无结构，或命中过程口癖且无表格/列表/JSON/多段落。
+    有 res_ 句柄或 artifact 登记声明 → 一律视为完整（深度调研常把正文放 artifact）。
+    """
+    body = _strip_transient_wrapper(text)
+    if not body:
+        return True
+    # 错误前缀：已是失败语义，主路径另处理，不视为「可再催」的空过程句
+    if body.startswith("⚠️") or "执行失败" in body[:40]:
+        return False
+    # 成功交付硬信号：句柄 / 登记声明（优先于过程口癖）
+    if _RES_HANDLE_RE.search(body) or _ARTIFACT_REGISTERED_RE.search(body):
+        return False
+    has_structure = (
+        "|" in body
+        or "```" in body
+        or body.lstrip().startswith("{")
+        or body.lstrip().startswith("[")
+        or body.count("\n") >= 5
+        or len(re.findall(r"(?m)^\s*[-*•]|\d+[\.、]\s+\S", body)) >= 3
+    )
+    if has_structure and len(body) >= 120:
+        return False
+    if any(m in body for m in _INCOMPLETE_DELIVERY_MARKERS) and not has_structure:
+        return True
+    # 无结构且过短：几乎一定是过程句
+    if not has_structure and len(body) < 160:
+        return True
+    return False
+
+
+def _delivery_followup_task(original_task: str) -> str:
+    """催收事实包：要求基于已检索结果立即交付，禁止过程句与 render。"""
+    ot = (original_task or "").strip()
+    if len(ot) > 1200:
+        ot = ot[:1200] + "…"
+    return (
+        "【交付催收·硬门】上一轮你未交付可消费的事实包（仅过程句或空输出）。\n"
+        f"原任务：\n{ot}\n\n"
+        "要求：基于你**已经检索到的信息**（不要再空转同一工具），**立即**输出完整 "
+        "Markdown 或 JSON 事实包：\n"
+        "① 条目列表（日期、事件、关键数字、为何重要、来源 URL、**数据时点**）\n"
+        "② 依据（工具/字段/URL）\n"
+        "③ 可选：主线摘要与风险提示\n"
+        "缺来源或时点须补查或标「信息可能过时/时点未知」；"
+        "禁止只说「下面再搜 / 停止重复 / 然后渲染」；"
+        "禁止 render_*（出图由主人格再委派 render_agent）；"
+        "长文可用 artifact_put。若确实零数据，写「无检索结果：原因=…」。"
+    )
+
+
+def _main_persona_receipt_hint(*, image_likely: bool = False) -> str:
+    """回执里给主人格的固定口吻（不诱导自渲）。"""
+    from gsuid_core.ai_core.capability_agents.delegation_contracts import (
+        RENDER_DONE_RECEIPT_MARK,
+    )
+
+    if image_likely:
+        return (
+            f"【工具通道】{RENDER_DONE_RECEIPT_MARK}；"
+            "【聊天通道】发图后至多一句角色口吻；禁止念工具名/句柄/节点名/流程；"
+            "禁止把代理全文当群聊台词；主语永远是你自己。"
+        )
+    return (
+        "【工具通道】长结构化结果再 "
+        'create_subagent(agent_profile="render_agent", task=事实包或句柄) 出图；'
+        "禁止自写 HTML / 直调 render_*；出图委派**不要**再对用户说话。"
+        "【聊天通道】委派长任务前须已说一句「得等一会儿」；"
+        "子任务在途除等待句外 <SILENCE>；未发图勿说「图好了」；"
+        "禁止把代理全文当台词；禁止对用户提节点名/句柄/「让某某去画」。"
+    )
+
+
+_DATEISH_RE = re.compile(
+    r"(20\d{2}[-/.年]\d{1,2}([-/.月]\d{1,2})?|\d{1,2}\s*月|Q[1-4]|时点|截至|as of|fetched)",
+    re.I,
+)
+_URLISH_RE = re.compile(r"https?://|www\.|来源|依据|工具", re.I)
+
+
+def _factpack_freshness_note(body: str) -> str:
+    """轻量启发式：疑缺来源/时点时附在回执（不注入主 system）。"""
+    text = (body or "").strip()
+    if len(text) < 80:
+        return ""
+    if _URLISH_RE.search(text) and _DATEISH_RE.search(text):
+        return ""
+    missing: list[str] = []
+    if not _URLISH_RE.search(text):
+        missing.append("来源")
+    if not _DATEISH_RE.search(text):
+        missing.append("时点")
+    if not missing:
+        return ""
+    return (
+        f"\n⚠ 事实包疑缺{'/'.join(missing)}：出图前可要求 research 补查，"
+        "或在 render_agent 的 task 里标明「信息可能过时」。"
+    )
+
 
 # 全局并发上限信号量：首个子Agent调用时按配置 subagent_max_concurrency 懒创建并缓存。
 # 不在导入期读配置（此时配置可能未就绪）；改并发数需重启——给运行中的信号量改容量不安全。
@@ -54,16 +195,26 @@ def _get_subagent_semaphore() -> asyncio.Semaphore:
     return _subagent_semaphore
 
 
-# create_subagent(agent_profile=...) 转 Kanban 路径同步等待的超时（秒）
-# 主人格被这条工具阻塞，等代理跑完。超时后返回"任务仍在跑，到 webconsole 看进度"。
-# 选 180 秒：覆盖 95% 的 code_agent / research_agent 单步任务；真要更长的任务
-# 主人格应当主动用 register_kanban_task 显式建任务树，不走临时委派。
-_KANBAN_INLINE_WAIT_TIMEOUT_SEC = 180.0
-# 内部轮询的步长——任务完成会被 _run_one_task_node 写库，本侧轮询读出来即可
-_KANBAN_INLINE_POLL_INTERVAL_SEC = 0.6
+# create_subagent(agent_profile=...) 转 Kanban：生产立刻 deferred 回灌，不占会话锁。
+# TEST/评测仍同步等待，因评测 HTTP 等不到回灌。
+_KANBAN_TEST_WAIT_TIMEOUT_SEC = 90.0
+
+# 纯 lookup 默认同步 ad-hoc（transient），不建看板卡。
+# 外部检索默认 Kanban：超时可回灌，取消不会把事实包扔掉。
+_TRANSIENT_DEFAULT_PROFILES = frozenset(
+    {
+        "internal_reporter",
+        "memory_curator",
+        "scheduler_assistant",
+    }
+)
 
 
-@ai_tools(category="common", capability_domain="长期任务编排")
+@ai_tools(
+    category="common",
+    capability_domain="长期任务编排",
+    timeout=500.0,
+)
 async def create_subagent(
     ctx: RunContext[ToolContext],
     task: str,
@@ -73,45 +224,129 @@ async def create_subagent(
     transient: bool = False,
 ) -> str:
     """
-    处理复杂任务的终极工具。
-    当用户的问题需要：多步拆解、深度调研、长时间执行、收集大量资料时调用此工具。
-    它会自动创建一个具备“规划 -> 逐步执行 -> 校验 -> 总结”能力的自主Agent。
+    委派专职能力代理（或通用 Plan-and-Solve 子 Agent）执行多步任务。
+
+    ## 路由（agent_profile 填 node_id，禁止自造名）
+    - ``research_agent``：外部检索 / 综合分析 → **只交事实包**（来源+时点）
+    - ``render_agent``：把**已有**事实包渲成美观信息图（多项数据出图**必走**；主人格禁自渲）
+    - ``code_agent``：写代码 / PIL·脚本真文件产物（不是 HTML 信息卡）
+    - ``internal_reporter`` / ``memory_curator`` / ``scheduler_assistant`` / …
+      见本轮 system 能力清单
+
+    ## task 合同
+    - 写清意图 + 交付物；执行体身份按当前会话 persona 与 get_self_persona_info，不在此写角色设定。
+    - 检索综合：目标 + 范围；交付须含条目/数字/**来源**/**时点**。
+    - 出图：粘贴完整事实包（或 res_ 句柄）+ 可选版式偏好；写明**禁止再检索**。
+    - 禁止把「漂亮出图」派给 research；禁止主人格自己写 HTML 调 render_*。
+    - 接任务应走主通道 TextPart（或框架兜底）；本工具回执不对用户播报过程。
 
     Args:
         ctx: 工具执行上下文
-        task: 需要完成的复杂任务描述。请把用户的原始意图清晰地转述在这里。
-        agent_profile: 用自然语言描述需要哪类专职能力代理（"写代码""金融分析"
-            "调研"）。指定后会派给对应的无人格能力代理执行；留空则用通用规划
-            执行子Agent（保持原有泛化行为）。
-        transient: **是否绕过 Kanban 直接跑临时任务**。默认 False——所有带
-            `agent_profile` 的调用都会自动建一棵叶子根 Kanban 任务卡（产物可追溯、
-            看板可见）。**只有当任务是纯粹的"读取 / 查询 / lookup"** —— 比如
-            "把当前 workspace 里有哪些文件列出来"、"用 internal_reporter 把 record:
-            stock:account 表读出来给我看一眼"、"问 research_agent 一句什么是 PB
-            ratio" ——**才**传 True 跳过 Kanban，避免在看板上堆出一堆"获取/查看/列出"
-            的无产物任务卡。**任何会生成文件 / 图片 / 报告 / 持久化状态变更的任务**
-            都必须保持 transient=False（默认值）。
+        task: 任务全文（事实包请直接写进 task，勿只写「帮我出图」）。
+        agent_profile: 必填 node_id（或可 resolve 的自然语言）；禁止空、禁止自造名。
+        transient: True 仅纯 lookup；出图/落盘/改状态必须 False（默认）。
 
     **何时不要用 create_subagent**：
-    - 任务需要 ≥ 2 步、跨能力代理接力、或周期触发 → 一律走 `register_kanban_task`。
-    - 任务交付的产物要让主人事后追溯（"那张图呢""那个账户余额是多少"）→ 默认
-      transient=False 会自动转 Kanban 叶子根，看板上有一张任务卡；不要传 True。
-    - 简单的"问代理一个单点答案、不需要事后追溯" → 用 transient=True，跑完即丢。
+    - ≥2 能力接力或周期任务 → ``register_kanban_task``。
+    - 要事后追溯产物 → 默认 transient=False。
     """
-    # transient=True：直接走通用 Plan-and-Solve Agent，不创建 Kanban 任务卡。
-    # 即使指定了 agent_profile 也不走 Kanban——这是用户显式宣告"只是 lookup，没产物
-    # 需要追溯"。代理在 ad-hoc workspace 跑，结果文本直接返回主人格。
-    if transient and agent_profile:
-        return await _dispatch_transient_capability_agent(ctx, task, agent_profile)
-    # agent_profile 非空 + transient=False（默认）→ 自动转为创建 Kanban 叶子根
-    # 单任务并同步等待执行完成。
-    # 实现见 _dispatch_via_kanban：所有"通过代理人格创建的、要产物追溯的任务"统一走 Kanban，
-    # 产物会自动挂到该树的 root_task_id 下，看板树视图直接可见，主人格事后
-    # 也能 artifact_get_recent 找回产物。
-    if agent_profile:
+    # 子代理墙钟不计入主人格 soft budget（research 常 >45s，否则触发禁工具→无法 render）
+    from gsuid_core.ai_core.wall_clock import pause_wall_clock
+
+    async with pause_wall_clock():
+        raw = await _create_subagent_impl(
+            ctx,
+            task=task,
+            max_tokens=max_tokens,
+            max_iterations=max_iterations,
+            agent_profile=agent_profile,
+            transient=transient,
+        )
+        head = (task or "").strip().split("\n", 1)[0][:80]
+        if ctx.deps is not None:
+            from gsuid_core.ai_core.outbound import write_decision_memo, remember_outbound_topic
+
+            remember_outbound_topic(ctx.deps.extra, head)
+            ev = ctx.deps.ev
+            await write_decision_memo(
+                bot_self_id=str(ev.bot_self_id) if ev is not None and ev.bot_self_id else "",
+                text=f"委派 {head[:40]}",
+                ref=f"decision:sub:{head[:40]}"[:160],
+                owner_user_id=str(ev.user_id) if ev is not None and ev.user_id else "",
+            )
+        body = f"（委派原问：{head}）\n{raw}" if head else raw
+        return await _maybe_fold_subagent_receipt(ctx, body)
+
+
+async def _maybe_fold_subagent_receipt(ctx: RunContext[ToolContext], text: str) -> str:
+    """回执 >1500 字落 FileOS 折句柄卡，堵整包回灌。"""
+    if len(text) <= 1500:
+        return text
+    from gsuid_core.ai_core.planning.tool_output_helper import persist_and_fold_tool_return
+
+    ev = ctx.deps.ev if ctx.deps is not None else None
+    session_id = ""
+    if ctx.deps is not None and ctx.deps.parent_session_id:
+        session_id = ctx.deps.parent_session_id
+    card = await persist_and_fold_tool_return(
+        "create_subagent",
+        text,
+        ev,
+        session_id,
+        is_group=bool(ev and ev.group_id),
+    )
+    return card if card else text[:1500] + "\n…[过长已截断，详见句柄]"
+
+
+async def summarize_long_input(text: str, *, max_tokens: int = 18000) -> str:
+    """内核长度防护：无工具上下文的摘要委派（不是模型可调的 ``create_subagent``）。"""
+    from gsuid_core.ai_core.wall_clock import pause_wall_clock
+
+    async with pause_wall_clock():
+        return await _create_subagent_impl(
+            None,
+            task=f"请总结以下用户输入，保留关键信息：\n\n{text}",
+            max_tokens=max_tokens,
+            max_iterations=15,
+            agent_profile="",
+            transient=True,
+        )
+
+
+async def _create_subagent_impl(
+    ctx: RunContext[ToolContext] | None,
+    *,
+    task: str,
+    max_tokens: int,
+    max_iterations: int,
+    agent_profile: str,
+    transient: bool,
+) -> str:
+    """create_subagent 实现体（已在 pause_wall_clock 内）。``ctx is None`` 仅内核摘要用。"""
+    # 无 ctx 的内核摘要不走能力路由，避免摘要任务被误派到专域节点。
+    if ctx is not None and agent_profile:
+        from gsuid_core.ai_core.agent_node import resolve_node
+
+        pid = resolve_node(agent_profile)
+        if not pid:
+            from gsuid_core.ai_core.agent_node import list_nodes
+
+            ids = [n.node_id for n in list_nodes() if n.source != "persona" and n.node_id != "capability_evaluator"][:8]
+            listed = "、".join(ids) if ids else "（花名册为空）"
+            return f"未匹配到能力节点 `{agent_profile.strip()}`。可用 node_id：{listed}"
+        use_transient = transient or pid in _TRANSIENT_DEFAULT_PROFILES
+        if use_transient:
+            return await _dispatch_transient_capability_agent(ctx, task, agent_profile)
         return await _dispatch_via_kanban(ctx, task, agent_profile)
 
-    logger.info(i18n_t("🧠 [Subagent] 启动通用规划执行Agent，任务: {p0}...", p0=task[:50]))
+    if ctx is not None and not agent_profile:
+        from gsuid_core.ai_core.agent_node import list_nodes
+
+        ids = [n.node_id for n in list_nodes() if n.source != "persona" and n.node_id != "capability_evaluator"][:8]
+        listed = "、".join(ids) if ids else "（花名册为空）"
+        return f"未指定 agent_profile。请从花名册填写 node_id：{listed}"
+
+    logger.info(i18n_t("log.ai.subagent_general_planning_executor_start", p0=task[:50]))
 
     async with _get_subagent_semaphore():
         # 搜索工具
@@ -122,7 +357,7 @@ async def create_subagent(
         )
         # 子Agent不能再创建子Agent，防止递归爆炸
         tools = [t for t in tools if t.name != "create_subagent"]
-        logger.debug(i18n_t("🧠 [Subagent] 工具列表: {p0}", p0=[tool.name for tool in tools]))
+        logger.debug(i18n_t("log.ai.subagent_tool_list", p0=[tool.name for tool in tools]))
 
         # ✨ 内置一个 Plan-and-Solve System Prompt
         system_prompt = """
@@ -174,10 +409,8 @@ async def create_subagent(
 
         # 建立主 Agent ↔ SubAgent 的关联（双向）。
         # _session_logger / _file_path 都是已声明字段（见 gs_agent.GsCoreAIAgent.__init__
-        # 与 session_logger.AISessionLogger.__init__），直接访问 + None 判断即可，
-        # 无需 getattr 兜底（LLM.md §1.4）。
         try:
-            parent_session_id = ctx.deps.ev.session_id if ctx.deps.ev else None
+            parent_session_id = ctx.deps.ev.session_id if ctx is not None and ctx.deps.ev else None
             if parent_session_id:
                 parent_session = _session_registry.get_ai_session(parent_session_id)
                 if parent_session is not None:
@@ -206,8 +439,7 @@ async def create_subagent(
                         )
                         logger.info(
                             i18n_t(
-                                "🧠 [Subagent] 建立 Agent 关联: {parent_session_id}({p0})"
-                                " -> {subagent_session_id}({p1})",
+                                "log.ai.subagent_establishing_agent_link",
                                 parent_session_id=parent_session_id,
                                 p0=parent_logger.session_uuid,
                                 subagent_session_id=subagent_session_id,
@@ -215,27 +447,26 @@ async def create_subagent(
                             )
                         )
         except Exception as link_err:
-            logger.warning(i18n_t("🧠 [Subagent] 建立 Agent 关联失败（非致命）: {link_err}", link_err=link_err))
+            logger.warning(i18n_t("log.ai.subagent_establish_agent_link_fail", link_err=link_err))
 
         try:
             # 直接把任务扔给它，它会被 system_prompt 逼着去先列 TODO list
             result = await agent.run(
                 user_message=f"【当前任务】\n{task}\n\n请立即开始你的规划与执行！",
-                bot=ctx.deps.bot,
-                ev=ctx.deps.ev,
+                bot=ctx.deps.bot if ctx is not None else None,
+                ev=ctx.deps.ev if ctx is not None else None,
                 tools=tools,
                 return_mode="return",  # 结果返回给主Agent，由主Agent决定何时发送给用户
             )
 
-            return f"【子Agent规划并执行完毕，交付结果如下】\n\n{result}"
+            return f"【子Agent交付完毕】{_main_persona_receipt_hint()}\n\n{result}"
 
         except Exception as e:
-            logger.error(i18n_t("❌[Subagent] 执行失败: {e}", e=e))
+            logger.error(i18n_t("log.ai.subagent_fail_execution_failed", e=e))
             return f"⚠️ 复杂任务执行失败，子Agent崩溃: {str(e)}"
         finally:
             # SubAgent 执行完毕（无论成功或异常），确保日志落盘并从 AISessionRegistry 移除。
             # agent._session_logger 是 GsCoreAIAgent 已声明字段（可能为 None），直接访问。
-            # remove_ai_session 内部是幂等的（不存在返回 False，不抛异常），无需 try/except。
             if agent._session_logger is not None:
                 agent._session_logger.close()
             _session_registry.remove_ai_session(subagent_session_id)
@@ -278,12 +509,22 @@ async def _dispatch_transient_capability_agent(
     pid = resolve_node(agent_profile)
     profile = get_node(pid)
     if profile is None:
-        return f"⚠️ 能力代理节点不存在: {agent_profile}（解析为 {pid}）"
+        from gsuid_core.ai_core.agent_node import list_nodes
 
-    logger.info(i18n_t("🧠 [Subagent] transient 模式直跑 profile={pid} task={p0}", pid=pid, p0=repr(task[:60])))
+        avail = ", ".join(
+            f"{n.node_id}({n.display_name})"
+            for n in list_nodes()
+            if n.source != "persona" and n.node_id != "capability_evaluator"
+        )
+        return (
+            f"⚠️ 能力代理节点不存在: {agent_profile}（解析为 {pid or '空'}）。"
+            f"请改用下列 node_id 之一：{avail or '（当前无已注册能力代理）'}"
+        )
+
+    logger.info(i18n_t("log.ai.subagent_transient_mode_direct", pid=pid, p0=repr(task[:60])))
     try:
-        # runner._ensure_adhoc_workspace contextmanager 会在无 plan_ctx 时建临时
-        # ad-hoc workspace；这里直接调 run_capability_agent，让 runner 自己处理。
+        # runner._ensure_adhoc_workspace contextmanager 会在无 plan_ctx 时建临时 ad-hoc workspace；
+        # 这里直接调 run_capability_agent，让 runner 自己处理。
         raw_result = await run_capability_agent(
             profile_id=pid,
             task=task,
@@ -292,17 +533,55 @@ async def _dispatch_transient_capability_agent(
             session_id_suffix=f"transient_{pid}",
         )
     except Exception as e:
-        logger.exception(i18n_t("🧠 [Subagent] transient 代理执行异常: {e}", e=e))
+        logger.exception(i18n_t("log.ai.subagent_transient_agent_fail", e=e))
         return f"⚠️ {pid} 临时代理执行失败: {type(e).__name__}: {e}"
 
+    # 空/过程句：再与 subagent 对话一次，要求交出事实包（仅 1 次）
+    if looks_like_incomplete_subagent_delivery(raw_result or ""):
+        first_preview = repr((raw_result or "")[:80])
+        logger.warning(
+            i18n_t(
+                "log.ai.create_subagent_incomplete_delivery",
+                pid=pid,
+                preview=first_preview,
+            )
+        )
+        first_raw = raw_result
+        try:
+            raw_result = await run_capability_agent(
+                profile_id=pid,
+                task=_delivery_followup_task(task),
+                ev=ev,
+                bot=ctx.deps.bot,
+                session_id_suffix=f"transient_{pid}_retry",
+            )
+        except Exception as e:
+            logger.exception(i18n_t("log.ai.create_subagent_delivery_requery_fail", e=e))
+            raw_result = first_raw
+        if looks_like_incomplete_subagent_delivery(raw_result or ""):
+            logger.warning(i18n_t("log.ai.create_subagent_still_incomplete", pid=pid))
+
+    from gsuid_core.ai_core.capability_agents.delegation_contracts import (
+        receipt_image_likely,
+    )
+
+    image_likely = receipt_image_likely(pid=pid, has_image_art=False)
     prefix_note = (
         f"【{pid} 临时代理已完成 / transient 模式】"
-        "（**未在看板创建任务卡**——本次为 lookup 模式，产物不挂 Kanban、事后"
-        "无法 artifact_get_recent 追溯。若需要可追溯的产物，请改用 transient=False。）"
+        "（**未在看板创建任务卡**——lookup 模式。）"
+        f"{_main_persona_receipt_hint(image_likely=image_likely)}"
     )
     if (raw_result or "").startswith(CAPABILITY_AGENT_ERROR_PREFIX):
         return f"{prefix_note}\n\n{raw_result}"
-    return f"{prefix_note}\n\n{raw_result}"
+    if looks_like_incomplete_subagent_delivery(raw_result or ""):
+        return (
+            f"{prefix_note}\n\n"
+            f"⚠️ 子代理未交付可用事实包（过程句/空输出）。"
+            f"请主人格改用 web_search_tool 自行补查，或再次 create_subagent 并收紧 task。"
+            f"\n\n【子代理原文】\n{(raw_result or '').strip() or '（空）'}"
+        )
+    note = _factpack_freshness_note(raw_result or "") if pid == "research_agent" else ""
+    return f"{prefix_note}\n\n{raw_result}{note}"
 
 
 async def _dispatch_via_kanban(
@@ -311,19 +590,16 @@ async def _dispatch_via_kanban(
     agent_profile: str,
 ) -> str:
     """把 create_subagent(agent_profile=...) 转为创建 Kanban **单任务**（叶子根）
-    并同步等待执行完成。
+    并启动执行。生产路径立刻 deferred 回灌，不占主会话锁；TEST 仍同步等待。
 
     每条主人格通过画像派出的任务都走这条路：
     1. ``kanban.create_kanban_tree(root_agent_profile=pid)`` 建一棵**只有根任务**
        的叶子树——根任务自身带 ``agent_profile``，被调度器当作单一可执行节点直接
        派出。**不再**创建冗余的"根 + 1 子任务"双节点结构；
     2. ``kick_root`` 立刻派活；
-    3. 轮询数据库等根任务进终态（completed / failed / waiting_approval 等）；
+    3. 生产：``mark_deferred_main_delivery`` 后立即返回，完成后
+       ``_wake_main_agent_for_delivery``；TEST 同步等到终态。
     4. 抓根任务最新产出 artifact 句柄 + relay 文本，拼成回执给主人格。
-
-    超时（``_KANBAN_INLINE_WAIT_TIMEOUT_SEC``）后**不强制中止**——任务会继续在
-    Kanban 调度器里跑，主人格收到提示"任务仍在跑，到 webconsole 看进度"，并被告知
-    该 Kanban 任务 id 以便后续 `artifact_get_recent` 追问。
     """
     ev = ctx.deps.ev
     if ev is None:
@@ -334,7 +610,17 @@ async def _dispatch_via_kanban(
     pid = resolve_node(agent_profile)
     profile = get_node(pid)
     if profile is None:
-        return f"⚠️ 能力代理节点不存在: {agent_profile}（解析为 {pid}）"
+        from gsuid_core.ai_core.agent_node import list_nodes
+
+        avail = ", ".join(
+            f"{n.node_id}({n.display_name})"
+            for n in list_nodes()
+            if n.source != "persona" and n.node_id != "capability_evaluator"
+        )
+        return (
+            f"⚠️ 能力代理节点不存在: {agent_profile}（解析为 {pid or '空'}）。"
+            f"请改用下列 node_id 之一：{avail or '（当前无已注册能力代理）'}"
+        )
 
     # 拼一个简短的根目标——用任务原文前 96 字，足够 evaluator / 看板辨识
     root_goal = task[:96].replace("\n", " ").strip() or f"{profile.display_name} 临时任务"
@@ -352,8 +638,9 @@ async def _dispatch_via_kanban(
     from gsuid_core.ai_core.planning.models import AIAgentTask, AIAgentArtifact
     from gsuid_core.ai_core.planning.kanban_executor import (
         kick_root,
+        mark_deferred_main_delivery,
         mark_interactive_relay_root,
-        discard_interactive_relay_root,
+        try_claim_deferred_for_inline_return,
     )
 
     scope_key = make_scope_key(
@@ -373,7 +660,7 @@ async def _dispatch_via_kanban(
         user_type=ev.user_type or "direct",
         WS_BOT_ID=ev.WS_BOT_ID,
         session_id=ev.session_id,
-        # 透传派活人的权限等级——否则 Kanban 执行体重建 Event 后退回默认 6，
+        # 透传派活人的权限等级——否则 Kanban 执行体重建 Event 后退回默认 6
         # 主人（pm=0）派出的 plugin_dev 代理会被自家 check_pm 工具全部拒绝。
         user_pm=ev.user_pm,
         broadcast_targets=[],
@@ -382,44 +669,67 @@ async def _dispatch_via_kanban(
         root_agent_profile=pid,
     )
 
+    # 任务正文里的 res_ 句柄 → input_artifact_ids（调研→渲染跨叶子树交接）
+    from gsuid_core.ai_core.planning.kanban_tools import extract_res_ids
+
+    handoff_ids = extract_res_ids(task)
+    if handoff_ids:
+        await AIAgentTask.update_data_by_data(
+            select_data={"id": root.id},
+            update_data={"input_artifact_ids": handoff_ids},
+        )
+        root.input_artifact_ids = handoff_ids
+
     logger.info(
         i18n_t(
-            "🧠 [Subagent] 转 Kanban 叶子根：root#{p0} id={p1} profile={pid} task={p2}",
+            "log.ai.subagent_convert_kanban_leaf",
             p0=root.ordinal,
             p1=root.id[:6],
             pid=pid,
             p2=repr(task[:60]),
         )
     )
-    # 登记为"主人格转述"：交互式派发下，执行体（kanban_executor）**不自动推群**，
-    # 由下面轮询拿到结论后回执给主人格、主人格转述一次，避免同一结论推两遍刷屏。
+    # 登记为"主人格转述"：交互式派发下，执行体（kanban_executor）**不自动推群**。
+    # 立刻 deferred：后到群消息不再 cancel 本轮，完成后走回灌。
     mark_interactive_relay_root(root.id)
+    mark_deferred_main_delivery(root.id)
     asyncio.create_task(kick_root(root.id))
 
-    # 同步等待根任务进终态（轮询）
-    waited = 0.0
-    final: Optional[AIAgentTask] = None
-    while waited < _KANBAN_INLINE_WAIT_TIMEOUT_SEC:
-        await asyncio.sleep(_KANBAN_INLINE_POLL_INTERVAL_SEC)
-        waited += _KANBAN_INLINE_POLL_INTERVAL_SEC
-        fresh = await AIAgentTask.get_by_id(root.id)
-        if fresh is None:
-            return f"⚠️ Kanban 任务记录消失（task_id={root.id[:8]}）；可能被并发删除，请到 webconsole 看任务列表。"
-        if fresh.status in ("completed", "failed", "cancelled", "waiting_approval"):
-            final = fresh
-            break
+    extra = ctx.deps.extra if ctx.deps is not None else {}
+    parent_cb = extra["parent_create_by"] if "parent_create_by" in extra else ""
+    wait_sec = _KANBAN_TEST_WAIT_TIMEOUT_SEC if parent_cb == "TEST" else 0.0
+    handle = delegation_handle(root.id)
+    deleg = await await_delegation(handle, wait_sec=wait_sec)
+    if deleg is None:
+        return f"⚠️ Kanban 任务记录消失（task_id={root.id}）；可能被并发删除，请到 webconsole 看任务列表。"
+    final: Optional[AIAgentTask] = await AIAgentTask.get_by_id(root.id) if deleg.is_terminal else None
 
     if final is None:
-        # 主人格侧放弃等待、不会转述了 → 撤销静默登记，让执行体完成时照常推群兜底，
-        # 否则这条任务的结论会既没被主人格转述、也没被执行体播报，彻底"消失"。
-        discard_interactive_relay_root(root.id)
-        return (
-            f"⏳ 任务仍在执行中（已等待 {int(waited)}s 超时）。\n"
-            f"Kanban 任务: 任务#{root.ordinal}｜{root.display_name}\n"
-            f"任务 id（前 8 位）: {root.id[:8]}\n"
-            "可到 webconsole 看板查看实时进度；事后追问产物用 "
-            "`artifact_get_recent` 即可（已绑定本任务树）。任务完成时会自动推群告知。"
-        )
+        fresh_after = await AIAgentTask.get_by_id(root.id)
+        if fresh_after is not None and fresh_after.status in (
+            "completed",
+            "failed",
+            "cancelled",
+            "waiting_approval",
+        ):
+            if try_claim_deferred_for_inline_return(root.id):
+                final = fresh_after
+            else:
+                return (
+                    f"✅ 任务#{root.ordinal} 刚好完成，框架正在回灌产物。"
+                    "请只输出 <SILENCE>，勿向用户说话、勿重复 create_subagent。"
+                )
+        else:
+            return (
+                f"⏳ 子任务后台执行中（将自动回灌）。"
+                f"task#{root.ordinal} / {pid} / 句柄 {handle}\n"
+                "本 tool_return 不是终局结论。"
+                "对用户默认 <SILENCE>"
+                "（禁止过程动词、任务编号、句柄、编排词、叙述第二个执行者）。"
+                "禁止再 create_subagent 同任务。\n"
+                "完成后自动回灌。用户之后追问进度时，用 find_tools 召回 check_delegation"
+                "（句柄只进工具参数，绝不写进给用户看的台词）。"
+            )
 
     # 抓 artifact（最新一份用作产物展示）
     arts = await AIAgentArtifact.list_for_task(final.id)
@@ -430,23 +740,31 @@ async def _dispatch_via_kanban(
         if a.payload_path and (a.mime or "").startswith("image/"):
             binary_tag = "（真实图片，可 send_message_by_ai(image_id=) 直发）"
         elif a.payload_path:
-            binary_tag = "（落盘文件）"
+            binary_tag = "（落盘文件/文本，文本类请 artifact_get 取原文再 render）"
         art_lines.append(f"  - {a.id} | {a.mime or 'text/plain'} | {a.summary[:80]}{binary_tag}")
         if not primary_handle and a.payload_path and (a.mime or "").startswith("image/"):
             primary_handle = a.id
     if not primary_handle and arts:
         primary_handle = arts[0].id
 
-    status_label = {
+    _status_labels = {
         "completed": "✅ 已完成",
         "failed": "❌ 失败",
         "cancelled": "🚫 已取消",
         "waiting_approval": "⏸️ 等待审批",
-    }.get(final.status, final.status)
+    }
+    status_label = _status_labels[final.status] if final.status in _status_labels else final.status
 
+    from gsuid_core.ai_core.capability_agents.delegation_contracts import (
+        receipt_image_likely,
+    )
+
+    has_image_art = any(bool(a.payload_path) and (a.mime or "").startswith("image/") for a in arts)
     parts = [
         f"【{pid} 代理完成 - Kanban 任务#{root.ordinal}】 {status_label}",
         f"任务: {root.display_name}",
+        _main_persona_receipt_hint(image_likely=receipt_image_likely(pid=pid, has_image_art=has_image_art)),
+        "文本类 res_ 请 artifact_get 取原文，**不要** read_image。",
     ]
     if final.failure_reason:
         parts.append(f"失败原因: {final.failure_reason[:300]}")
@@ -456,22 +774,23 @@ async def _dispatch_via_kanban(
         if primary_handle:
             parts.append(
                 f"💡 主要产物句柄: `{primary_handle}`"
-                "（如需把图片 / 文件发给用户，调用 send_message_by_ai(image_id=该句柄)——"
+                "（图片类 send_message_by_ai(image_id=)；文本类 artifact_get 后 render——"
                 "**只在参数里用这个句柄，绝不要把 res_/img_ 句柄本身写进给用户看的话里**）"
             )
     else:
         parts.append("（本任务无显式 artifact 登记）")
 
-    # 文本结论：交互式派发下执行体**不再自动推群**，这段结论要由主人格**亲自转述一次**
-    # 给用户（用角色口吻、简明扼要，别照搬）。以下摘要就是你要转述的内容来源。
-    text_excerpt = ""
-    for a in arts:
-        if a.payload_inline:
-            text_excerpt = a.payload_inline[:1200]
-            break
+    # 落盘 text/* 也要读出（大段 markdown 不在 payload_inline）
+    from gsuid_core.ai_core.planning.kanban_executor import _artifact_text_excerpt
+
+    text_excerpt = _artifact_text_excerpt(arts, limit=4000)
     if text_excerpt:
         parts.append(
             "\n⬇️ 下面是代理的结论，请你用角色口吻**转述给用户**（这不是给你自己看的备忘，"
             "用户还没看到；转述时不要提任何 res_/任务 id）：\n" + text_excerpt
         )
+        if pid == "research_agent":
+            note = _factpack_freshness_note(text_excerpt)
+            if note:
+                parts.append(note.strip())
     return "\n".join(parts)

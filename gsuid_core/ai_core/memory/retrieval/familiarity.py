@@ -122,7 +122,8 @@ def _kmeans_clusters(vectors: list[list[float]], k: int) -> list[tuple[list[floa
     data = np.asarray(vectors, dtype=np.float64)
     if k == 1:
         return [(data.mean(axis=0).tolist(), list(vectors))]
-    labels = KMeans(n_clusters=k, n_init=1, random_state=0).fit_predict(data)
+    # sklearn 1.8+: n_init 由 int=10 改为 str="auto", 整型被拒。
+    labels = KMeans(n_clusters=k, n_init="auto", random_state=0).fit_predict(data)
     out: list[tuple[list[float], list[list[float]]]] = []
     for ci in range(k):
         members = [vectors[i] for i in range(len(vectors)) if labels[i] == ci]
@@ -194,7 +195,8 @@ async def recollection_search(
         # 收集本轮所有候选分支及其打分（论文 Algorithm 3 line 14），轮末统一保留 top-B 为新 beam。
         scored_branches: list[tuple[float, np.ndarray]] = []
         for x in beams:
-            candidates = await dense_search_episodes_with_vectors(x.tolist(), scope_keys, top_n, exclude_ids=seen_ids)
+            query_vec = [float(v) for v in x]
+            candidates = await dense_search_episodes_with_vectors(query_vec, scope_keys, top_n, exclude_ids=seen_ids)
             if not candidates:
                 continue
             for c in candidates:
@@ -317,7 +319,7 @@ async def probe_and_route(
     )
     logger.debug(
         t(
-            "🧠 [RF-Mem] 探针路由: route={route} s̄={p0:.4f} H={p1:.4f} k={p2}",
+            "log.memory.rf_mem_route_probe_routing",
             route=route,
             p0=signal.mean_score,
             p1=signal.entropy,

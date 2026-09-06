@@ -35,14 +35,14 @@ def _src(rel: str) -> str:
 def test_private_chat_scope_is_user_global() -> None:
     """observer 的 scope 判据：group_id 为空 → USER_GLOBAL。私聊必须走这一支。"""
     group_id = None
-    speaker_id = "3100542635"
+    speaker_id = "100000006"
 
     scope = make_scope_key(
         ScopeType.GROUP if group_id else ScopeType.USER_GLOBAL,
         group_id if group_id else speaker_id,
     )
 
-    assert scope == "user_global:3100542635"
+    assert scope == "user_global:100000006"
     assert not scope.startswith("group:"), "私聊记忆落进 group scope，偏好记忆将永远为空"
 
 
@@ -90,10 +90,33 @@ def test_the_fallback_detector_actually_detects() -> None:
 
 
 def test_memory_call_sites_pass_none_for_private() -> None:
-    """两个 observe 调用点 + 一个 dual_route 调用点都必须显式处理私聊为 None。"""
-    for rel in ("gsuid_core/handler.py", "gsuid_core/ai_core/handle_ai.py"):
-        src = _src(rel)
-        assert "str(event.group_id) if event.group_id else None" in src, f"{rel} 未按「私聊传 None」写 group_id"
+    """所有记忆调用点都必须显式处理私聊为 None。
+
+    锁点变更：observe / 检索的调用点已迁进 ``kits/memory/kit.py``（H00 / H05），
+    scope 构造集中在 ``cog_scope_from_ctx`` 与 ``AgentHookContext.group_id``——
+    锁跟着代码搬（§9.3），不是删掉。
+    """
+    # 内核侧仍有 group_id 传参的地方
+    kernel = _src("gsuid_core/ai_core/handle_ai.py")
+    assert "str(event.group_id) if event.group_id else None" in kernel, "handle_ai 未按「私聊传 None」写 group_id"
+
+    # 套件侧：group_id 一律取自 ctx.group_id（该属性私聊恒 None）
+    kit = _src("gsuid_core/ai_core/kits/memory/kit.py")
+    assert "group_id=ctx.group_id" in kit, "memory 套件未走 ctx.group_id"
+    assert "group_id=ctx.group_id or" not in kit, "memory 套件把 group_id 回退了"
+
+    # Context 的 group_id 属性本身必须私聊恒 None（这是上面那条能成立的前提）
+    hooks = _src("gsuid_core/ai_core/hooks/models.py")
+    assert "if self.ev is None or not self.ev.group_id:" in hooks
+    assert "return None" in hooks
+
+    from gsuid_core.ai_core.hooks import AgentHookPoint, AgentHookContext
+    from gsuid_core.ai_core.cognition import CogScope
+    from gsuid_core.ai_core.kits.memory.kit import cog_scope_from_ctx
+
+    ctx = AgentHookContext(point=AgentHookPoint.RETRIEVE_CONTEXT)
+    scope = cog_scope_from_ctx(ctx)
+    assert isinstance(scope, CogScope) and scope.group_id is None and scope.is_private
 
 
 # ── Bug A：静默落库 ────────────────────────────────────────────────
@@ -169,3 +192,120 @@ def test_idle_flush_can_be_disabled(monkeypatch) -> None:
     w._last_activity["group:1"] = now - 9999  # 静默很久，但开关关了
 
     assert not _should_flush(w, "group:1", now)
+
+
+def test_location_self_report_is_high_not_low_chitchat() -> None:
+    """「我在广州噢」曾因 <10 字且无 6 字实体特征被打 LOW，闲聊进行中又要等 3 分钟才落库。"""
+    from gsuid_core.ai_core.memory.observer import (
+        _classify_value_tier,
+        detect_location_self_report,
+    )
+
+    assert detect_location_self_report("我在广州噢")
+    assert detect_location_self_report("我住在杭州")
+    assert detect_location_self_report("我在广州")
+    assert not detect_location_self_report("我在忙")
+    assert not detect_location_self_report("我在开会啊")
+    assert not detect_location_self_report("我在上班啊")
+    assert not detect_location_self_report("唔…不知道")
+    assert _classify_value_tier("我在广州噢") == "HIGH"
+
+
+def test_unflushed_queue_is_visible_to_retrieval() -> None:
+    """检索必须看见尚未 idle-flush 的原文，否则 coreclear 后「刚说的城市」会丢。"""
+    import queue as sync_queue
+    from datetime import datetime, timezone
+
+    from gsuid_core.ai_core.memory.observer import (
+        ObservationRecord,
+        get_observation_queue,
+        pending_episodes_for_scopes,
+    )
+
+    scope = "user_global:user_web_pending_test"
+    rec = ObservationRecord(
+        raw_content="我在广州噢",
+        speaker_id="user_web_pending_test",
+        group_id=None,
+        scope_key=scope,
+        timestamp=datetime.now(timezone.utc),
+        message_type="private_msg",
+        value_tier="HIGH",
+    )
+    q = get_observation_queue()
+    q.put_nowait(rec)
+    restored: list[ObservationRecord] = []
+    try:
+        eps = pending_episodes_for_scopes([scope])
+        assert any("广州" in ep["content"] for ep in eps)
+    finally:
+        while True:
+            try:
+                item = q.get_nowait()
+            except sync_queue.Empty:
+                break
+            if item is not rec and isinstance(item, ObservationRecord):
+                restored.append(item)
+        for item in restored:
+            q.put_nowait(item)
+
+
+def test_pending_skips_low_chitchat() -> None:
+    """LOW 闲聊不得挤掉未落库的 HIGH 地点。"""
+    import queue as sync_queue
+    from datetime import datetime, timezone
+
+    from gsuid_core.ai_core.memory.observer import (
+        ObservationRecord,
+        get_observation_queue,
+        pending_episodes_for_scopes,
+    )
+
+    scope = "user_global:user_web_pending_low"
+    ts = datetime.now(timezone.utc)
+    low = ObservationRecord(
+        raw_content="哈哈",
+        speaker_id="user_web_pending_low",
+        group_id=None,
+        scope_key=scope,
+        timestamp=ts,
+        message_type="private_msg",
+        value_tier="LOW",
+    )
+    high = ObservationRecord(
+        raw_content="我在广州噢",
+        speaker_id="user_web_pending_low",
+        group_id=None,
+        scope_key=scope,
+        timestamp=ts,
+        message_type="private_msg",
+        value_tier="HIGH",
+    )
+    q = get_observation_queue()
+    q.put_nowait(low)
+    q.put_nowait(high)
+    restored: list[ObservationRecord] = []
+    try:
+        eps = pending_episodes_for_scopes([scope])
+        texts = [ep["content"] for ep in eps]
+        assert any("广州" in t for t in texts)
+        assert not any(t.strip() == "哈哈" for t in texts)
+    finally:
+        while True:
+            try:
+                item = q.get_nowait()
+            except sync_queue.Empty:
+                break
+            if item is not low and item is not high and isinstance(item, ObservationRecord):
+                restored.append(item)
+        for item in restored:
+            q.put_nowait(item)
+
+
+def test_voice_anchor_budget_fits_anchor_plus_voice() -> None:
+    """口吻截断包装后常约 102 字；旧预算 100 导致每轮 warning 两次。"""
+    from gsuid_core.ai_core.kits.base import BLOCK_CHAR_BUDGET, _apply_block_budget
+
+    typical = "x" * 102
+    assert typical == _apply_block_budget("voice_anchor", typical)
+    assert BLOCK_CHAR_BUDGET["voice_anchor"] >= 180

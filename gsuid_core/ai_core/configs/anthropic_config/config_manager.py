@@ -93,6 +93,16 @@ ANTHROPIC_CONFIG_TEMPLATE: Dict[str, GSC] = {
         max_value=10,
         options=[1, 2, 3, 4, 5, 6, 8, 10],
     ),
+    "remote_web_search": GsStrConfig(
+        title="远端 Web Search",
+        desc=(
+            "默认开启。Anthropic Messages API 直接用上游内置 web_search，"
+            "不再把本地 web_search_tool 发给模型；关闭则走本地 Tavily/Jina/Exa/AnySearch。"
+            "中转若不支持 hosted 工具会 400，那时再关掉即可"
+        ),
+        data="on",
+        options=["off", "on"],
+    ),
 }
 
 
@@ -178,12 +188,10 @@ class AnthropicConfigManager(ConfigSetManager):
             for key, value in config_data.items():
                 new_config.set_config(key, value)
 
-            logger.info(
-                t("已将 Anthropic 配置文件从 '{old_name}' 重命名为 '{new_name}'", old_name=old_name, new_name=new_name)
-            )
+            logger.info(t("log.ai.anthropic_old_name_new", old_name=old_name, new_name=new_name))
             return True, "ok"
         except Exception as e:
-            logger.error(t("重命名 Anthropic 配置失败: {e}", e=e))
+            logger.error(t("log.ai.anthropic_fail", e=e))
             return False, str(e)
 
 

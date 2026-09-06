@@ -110,7 +110,7 @@ def submit_image_observation(
             _multimodal_queue.put_nowait(record)
             submitted += 1
         except asyncio.QueueFull:
-            logger.debug(t("🧠 [Multimodal] 队列已满，丢弃图片观察记录"))
+            logger.debug(t("log.memory.multimodal_queue_full_discarding"))
             break
     return submitted
 
@@ -132,7 +132,7 @@ class ImageUnderstandWorker:
             return
         self._running = True
         self._task = asyncio.create_task(self._loop())
-        logger.info(t("🧠 [Multimodal] ImageUnderstandWorker 已启动"))
+        logger.info(t("log.memory.multimodal_imageunderstandworker_started"))
 
     async def stop(self) -> None:
         self._running = False
@@ -165,7 +165,7 @@ class ImageUnderstandWorker:
                     prompt="简要描述这张图片的核心内容，若含文字/数字请一并转述。",
                 )
             except Exception as e:
-                logger.debug(t("🧠 [Multimodal] 图片理解失败（已忽略）: {e}", e=e))
+                logger.debug(t("log.memory.multimodal_image_understanding_ignore", e=e))
                 return
 
             desc = (desc or "").strip()
@@ -186,10 +186,27 @@ class ImageUnderstandWorker:
                     message_type=record.message_type,
                 )
             except Exception as e:
-                logger.debug(t("🧠 [Multimodal] 转述记录入队失败: {e}", e=e))
+                logger.debug(t("log.memory.multimodal_enqueue_paraphrase_record", e=e))
 
 
 _worker: Optional[ImageUnderstandWorker] = None
+
+
+def get_multimodal_health() -> dict:
+    """多模态摄入健康度快照（控制台只读）。"""
+    worker = get_multimodal_worker()
+    return {
+        "queue_size": _multimodal_queue.qsize(),
+        "queue_max": _MM_QUEUE_MAX,
+        "queue_utilization": round(_multimodal_queue.qsize() / max(1, _MM_QUEUE_MAX), 4),
+        "worker_running": bool(worker and worker._running),
+        "understand_concurrency": _UNDERSTAND_CONCURRENCY,
+        "rate_window_seconds": _RATE_WINDOW_SECONDS,
+        "rate_max_per_window": _RATE_MAX_PER_WINDOW,
+        "tracked_scopes": len(_scope_image_times),
+        "recent_url_scopes": len(_recent_urls),
+        "min_desc_len": _MIN_DESC_LEN,
+    }
 
 
 def get_multimodal_worker() -> Optional[ImageUnderstandWorker]:

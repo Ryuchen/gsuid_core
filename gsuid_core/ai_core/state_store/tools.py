@@ -70,7 +70,7 @@ async def state_set(
     这些数据在会话结束后依然存在，可在后续对话或定时任务中读回。
 
     Args:
-        key: 键名，建议格式 "插件名:业务名"，如 "stock:portfolio"
+        key: 键名，建议格式 "插件名:业务名"，如 "myplugin:progress"
         value: 要保存的值，传入 JSON 字符串（对象/数组/数字/字符串均可）
         scope: 数据隔离范围。"auto"=按当前会话自动判断（群聊/私聊）；
                也可显式传入 "user:用户ID"、"group:群ID"、"global"
@@ -85,7 +85,7 @@ async def state_set(
         version = await state_set_value(real_scope, key, parsed, ttl_days=ttl_days)
         return f"已保存状态 [{key}] (scope={real_scope}, 版本v{version})"
     except Exception as e:
-        logger.exception(t("🗄️ [StateStore] state_set 失败: {e}", e=e))
+        logger.exception(t("log.ai.state_set", e=e))
         return f"保存失败: {e}"
 
 
@@ -114,7 +114,7 @@ async def state_get(
             return f"状态 [{key}] 不存在 (scope={real_scope})"
         return json.dumps(value, ensure_ascii=False)
     except Exception as e:
-        logger.exception(t("🗄️ [StateStore] state_get 失败: {e}", e=e))
+        logger.exception(t("log.ai.state_get", e=e))
         return f"读取失败: {e}"
 
 
@@ -141,7 +141,7 @@ async def state_delete(
             return f"已删除状态 [{key}] (scope={real_scope})"
         return f"状态 [{key}] 不存在，无需删除"
     except Exception as e:
-        logger.exception(t("🗄️ [StateStore] state_delete 失败: {e}", e=e))
+        logger.exception(t("log.ai.state_delete", e=e))
         return f"删除失败: {e}"
 
 
@@ -154,7 +154,7 @@ async def state_list(
     """
     列出某个范围下的所有持久化状态键。
 
-    用于确认某项任务是否已初始化（如检查 "stock:" 下是否已有账户）。
+    用于确认某项任务是否已初始化（如检查某插件前缀下是否已有键）。
 
     Args:
         prefix: 可选，只返回以此前缀开头的键
@@ -170,7 +170,7 @@ async def state_list(
             return f"范围 {real_scope} 下没有匹配的状态键"
         return f"范围 {real_scope} 下的状态键: {', '.join(keys)}"
     except Exception as e:
-        logger.exception(t("🗄️ [StateStore] state_list 失败: {e}", e=e))
+        logger.exception(t("log.ai.state_list", e=e))
         return f"列出失败: {e}"
 
 
@@ -205,5 +205,5 @@ async def state_append(
         length = await state_append_item(real_scope, key, parsed, max_length=max_length, ttl_days=ttl_days)
         return f"已追加到 [{key}] (scope={real_scope}, 当前长度={length})"
     except Exception as e:
-        logger.exception(t("🗄️ [StateStore] state_append 失败: {e}", e=e))
+        logger.exception(t("log.ai.state_append", e=e))
         return f"追加失败: {e}"

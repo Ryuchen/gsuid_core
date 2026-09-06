@@ -18,6 +18,10 @@ import time
 import asyncio
 from typing import Optional
 
+# 关系温度表的去重 + 唯一约束迁移。必须在这里 import：它注册的是
+# @on_core_start_before（阻塞阶段），而 core.py 在启动钩子触发前就 import 本模块。
+# 该模块只依赖 server/logger/sqlalchemy.text，不引入重依赖。
+import gsuid_core.ai_core.relationship.migration  # noqa: F401
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.server import on_core_start, on_core_shutdown
@@ -95,18 +99,28 @@ async def _init_mcp_server():
 
 
 async def _init_favor_decay():
-    """注册好感度每日衰减 job（§F.3-3）：每日 04:20 让好感度向中性回归一步。"""
+    """注册关系温度**闲置**衰减 job：每日 04:20 只衰减久未正向互动的用户。
+
+    语义变更：旧实现每天打全表，活跃用户被「每轮 +1」立刻补回，等于只惩罚
+    「聊完就走」的人。现在活跃用户不衰减，也不会因水群而升档。
+    """
+    import time as _time
+
     from gsuid_core.aps import scheduler
     from gsuid_core.ai_core.database import UserFavorability
     from gsuid_core.ai_core.configs.ai_config import ai_config
 
     async def _job() -> None:
-        step = ai_config.get_config("favor_daily_decay").data
+        if not ai_config.get_config("enable").data:
+            return
+        step = int(ai_config.get_config("favor_daily_decay").data)
         if step <= 0:
             return
-        n = await UserFavorability.decay_all_toward_neutral(step)
+        idle_days = int(ai_config.get_config("favor_idle_days").data)
+        idle_before = int(_time.time()) - idle_days * 86400
+        n = await UserFavorability.decay_idle_toward_neutral(step, idle_before)
         if n:
-            logger.info(t("🧠 [UserFavorability] 每日好感度衰减：{n} 行向中性回归 {step} 点", n=n, step=step))
+            logger.info(t("log.ai.userfavorability_daily_favorability_decay", n=n, step=step))
 
     scheduler.add_job(
         func=_job,
@@ -114,10 +128,23 @@ async def _init_favor_decay():
         hour=4,
         minute=20,
         id="ai_favorability_daily_decay",
-        name="好感度每日衰减（向中性回归）",
+        name="关系温度闲置衰减",
         replace_existing=True,
     )
-    logger.info(t("🧠 [UserFavorability] 好感度每日衰减 job 已注册（每日 04:20）"))
+    logger.info(t("log.ai.userfavorability_daily_favorability_decay_regist"))
+
+
+async def _init_agent_kits():
+    """按 ``kit_slots.*`` 配置装载 Agent 套件。
+
+    排在**最前**：``AgentKit.register`` 只是挂 hook（纯函数注册，重依赖都在 hook 体内
+    懒导入），却决定了整条 agent loop 有没有情绪 / 关系 / 记忆 / 工具装配。放在末尾时，
+    任何一个前置步骤卡住就会让 hook 总线在整个启动窗口内保持空转——实测 Meme 的一次性
+    向量迁移占用 337 秒，期间基准 24 例全部零工具、零记忆注入。
+    """
+    from gsuid_core.ai_core.kits import load_enabled_kits
+
+    await load_enabled_kits()
 
 
 async def _init_command_exec():
@@ -165,6 +192,8 @@ async def wait_ai_core_ready(timeout: float = 300.0) -> bool:
 # RAG 先初始化 Embedding 模型，Memory / Meme 依赖其结果；
 # MCP Server 依赖 MCP 工具先完成注册。
 _INIT_STEPS = [
+    # 套件最先装：只挂 hook，却决定整条 loop 有没有情绪/关系/记忆/工具装配
+    ("Agent 套件", _init_agent_kits),
     ("RAG", _init_rag),
     ("Persona", _init_persona),
     ("审批中心", _init_approval),
@@ -176,7 +205,6 @@ _INIT_STEPS = [
     ("统计", _init_statistics),
     ("MCP Server", _init_mcp_server),
     ("命令执行", _init_command_exec),
-    ("好感度衰减", _init_favor_decay),
 ]
 
 
@@ -191,7 +219,7 @@ async def init_ai_core():
     # 下面的状态判断与 _AI_CORE_INITIALIZING 置位之间不存在 await，asyncio 协作式调度下
     # 是原子的；后到的协程会在首个 await 让出后看到标记并直接退出，从而保证整条初始化串行。
     if _AI_CORE_READY or _AI_CORE_INITIALIZING:
-        logger.debug(t("🧠 [AI Core] 初始化已在进行或已完成，跳过本次重复触发"))
+        logger.debug(t("log.ai.ai_core_init_running_skipping_ok"))
         return
 
     from gsuid_core.ai_core.configs.ai_config import ai_config
@@ -201,14 +229,14 @@ async def init_ai_core():
         _AI_CORE_READY = True
         _AI_CORE_INITIALIZING = False
         _get_ready_event().set()
-        logger.info(t("🧠 [AI Core] AI总开关已关闭，跳过 AI 重依赖导入与子系统初始化"))
+        logger.info(t("log.ai.core_init_skip_import_ai_master"))
         return
 
     _AI_CORE_READY = False
     _AI_CORE_INITIALIZING = True
     _get_ready_event().clear()
     start = time.time()
-    logger.info(t("🧠 [AI Core] 开始后台初始化 AI 核心..."))
+    logger.info(t("log.ai.ai_core_background_initialization_start"))
 
     # 触发 AI 重依赖导入（sklearn / sentence-transformers / buildin_tools 等）。
     # 放到独立线程执行，避免同步 import 冻住事件循环、阻塞 WS 服务启动。
@@ -216,20 +244,22 @@ async def init_ai_core():
     try:
         await asyncio.to_thread(_import_ai_heavy_deps)
     except Exception as e:
-        logger.exception(t("🧠 [AI Core] AI 重依赖导入失败, 初始化中止: {e}", e=e))
+        logger.exception(t("log.ai.core_init_fail_import_ai_heavy", e=e))
         _AI_CORE_INITIALIZING = False
         _get_ready_event().set()
         return
 
-    logger.debug(t("🧠 [AI Core] AI 重依赖导入完成, 耗时: {p0:.2f}秒", p0=time.time() - import_start))
+    logger.debug(t("log.ai.ai_core_heavy_dependency_import", p0=time.time() - import_start))
 
-    # 按依赖顺序依次初始化各子系统，单个失败不影响后续步骤；但 AI Core 只有全部步骤成功才标记 ready。
+    # 按依赖顺序依次初始化；单步失败不阻断后续。
+    # ready 语义：初始化流水线已结束即可接聊（buildin 工具/人设不依赖 RAG 全量同步）。
+    # 若 RAG/Memory 等失败仅降级能力，禁止整站 AI 永久 not-ready（否则 wait_ai_core_ready 恒失败）。
     init_failed = False
     try:
         for name, step in _INIT_STEPS:
             step_start = time.time()
             try:
-                logger.info(t("🧠 [AI Core] 开始初始化 {name}...", name=name))
+                logger.info(t("log.ai.ai_core_name_start_initializing", name=name))
                 step_task = asyncio.create_task(step())
                 while not step_task.done():
                     try:
@@ -237,32 +267,37 @@ async def init_ai_core():
                     except asyncio.TimeoutError:
                         logger.warning(
                             t(
-                                "🧠 [AI Core] {name} 初始化仍在执行中，已耗时: {p0:.2f}秒",
+                                "log.ai.ai_core_name_initializing_elapsed",
                                 name=name,
                                 p0=time.time() - step_start,
                             )
                         )
                 await step_task
-                logger.info(
-                    t("🧠 [AI Core] {name} 初始化完成, 耗时: {p0:.2f}秒", name=name, p0=time.time() - step_start)
-                )
+                logger.info(t("log.ai.core_init_done_name_took", name=name, p0=time.time() - step_start))
             except Exception as e:
                 init_failed = True
-                logger.exception(t("🧠 [AI Core] {name} 初始化失败: {e}", name=name, e=e))
+                logger.exception(t("log.ai.ai_core_name_fail_init_failed", name=name, e=e))
 
         if init_failed:
             logger.warning(
                 t(
-                    "🧠 [AI Core] AI 核心初始化存在失败步骤，总耗时: {p0:.2f}秒，暂不接收 AI 会话",
+                    "log.ai.core_init_fail_session_ai",
                     p0=time.time() - start,
                 )
             )
         else:
-            logger.success(t("🧠 [AI Core] AI 核心初始化全部完成, 总耗时: {p0:.2f}秒", p0=time.time() - start))
+            logger.success(t("log.ai.ai_core_initialization_total_ok", p0=time.time() - start))
     finally:
-        _AI_CORE_READY = not init_failed
+        _AI_CORE_READY = True
         _AI_CORE_INITIALIZING = False
         _get_ready_event().set()
+        # 挂载不进 _INIT_STEPS：READY 之后后台跑，失败不得把就绪改回 false。
+        try:
+            from gsuid_core.ai_core.cognition.hub import spawn_cognition_mount
+
+            spawn_cognition_mount()
+        except Exception as e:
+            logger.warning(t("log.ai.cognition_mount_fail", e=e))
 
 
 @on_core_shutdown(priority=100)
@@ -282,9 +317,9 @@ async def close_qdrant_client_on_shutdown() -> None:
             return
         await client.close()
         rag_base.client = None
-        logger.info(t("🧠 [AI Core] 已关闭 Qdrant client，释放本地向量库文件锁"))
+        logger.info(t("log.ai.ai_core_closed_qdrant_client"))
     except Exception as e:
-        logger.debug(t("🧠 [AI Core] 关闭 Qdrant client 失败(可忽略): {e}", e=e))
+        logger.debug(t("log.ai.ai_core_close_qdrant_client_fail", e=e))
 
 
 @on_core_shutdown
@@ -301,6 +336,6 @@ async def flush_ai_sessions_on_shutdown() -> None:
         await registry.stop_cleanup_loop()
         closed = registry.shutdown_all()
         if closed:
-            logger.info(t("📝 [AISessionLogger] 关闭流程已持久化 {closed} 个活跃会话", closed=closed))
+            logger.info(t("log.ai.aisessionlogger_shutdown_persisted_closed", closed=closed))
     except Exception as e:  # noqa: BLE001
-        logger.exception(t("📝 [AISessionLogger] 关闭流程持久化失败: {e}", e=e))
+        logger.exception(t("log.ai.aisessionlogger_shutdown_persistence", e=e))

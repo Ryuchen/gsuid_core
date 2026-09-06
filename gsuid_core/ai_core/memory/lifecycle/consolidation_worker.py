@@ -53,9 +53,10 @@ async def _consolidate() -> int:
 
     from gsuid_core.utils.database.base_models import async_maker
     from gsuid_core.ai_core.memory.database.models import AIMemEdge
+    from gsuid_core.ai_core.memory.ingestion.eval_write_lock import db_write_guard
 
     count = 0
-    async with async_maker() as session:
+    async with db_write_guard(), async_maker() as session:
         result = await session.execute(
             select(AIMemEdge.id).where(
                 col(AIMemEdge.mention_count) >= PROTECT_MENTION_COUNT,
@@ -96,7 +97,7 @@ async def _forget() -> int:
                 points_selector=PointIdsList(points=qdrant_point_ids),
             )
     except Exception as e:
-        logger.warning(i18n_t("🧠 [Lifecycle] Qdrant Edge 向量删除失败（SQL 已删）: {e}", e=e))
+        logger.warning(i18n_t("log.memory.lifecycle_delete_qdrant_edge_fail", e=e))
     return len(forgotten_ids)
 
 
@@ -143,7 +144,7 @@ async def _purge_entities(victims: list[tuple[str, str, str]]) -> int:
                     points_selector=PointIdsList(points=point_ids),
                 )
         except Exception as e:
-            logger.warning(i18n_t("🧠 [Lifecycle] Qdrant Entity 向量删除失败（SQL 已删）: {e}", e=e))
+            logger.warning(i18n_t("log.memory.lifecycle_delete_qdrant_entity_fail", e=e))
 
         total += len(entity_ids)
 
@@ -154,8 +155,9 @@ async def _purge_entities(victims: list[tuple[str, str, str]]) -> int:
 
         from gsuid_core.utils.database.base_models import async_maker
         from gsuid_core.ai_core.memory.ingestion.hiergraph import AIMemHierarchicalGraphMeta
+        from gsuid_core.ai_core.memory.ingestion.eval_write_lock import db_write_guard
 
-        async with async_maker() as session:
+        async with db_write_guard(), async_maker() as session:
             for scope_key, cnt in scope_counts.items():
                 await session.execute(
                     _update(AIMemHierarchicalGraphMeta)
@@ -164,7 +166,7 @@ async def _purge_entities(victims: list[tuple[str, str, str]]) -> int:
                 )
             await session.commit()
     except Exception as e:
-        logger.warning(i18n_t("🧠 [Lifecycle] 递减分层图实体计数失败（不影响下次重建自愈）: {e}", e=e))
+        logger.warning(i18n_t("log.memory.lifecycle_decrement_hierarchical_graph_fail", e=e))
 
     return total
 
@@ -304,7 +306,7 @@ async def _reconcile_dangling_vectors() -> int:
                 existing = await _filter_existing_qdrant_ids(model, page_ids)
                 dangling.extend(pid for pid in page_ids if pid not in existing)
         except Exception as e:
-            logger.warning(i18n_t("🧠 [Lifecycle] 对账扫描 {collection} 失败: {e}", collection=collection, e=e))
+            logger.warning(i18n_t("log.memory.lifecycle_reconciliation_scan_collection", collection=collection, e=e))
             continue
 
         # scroll 完成后再删，避免删除影响游标
@@ -325,16 +327,28 @@ async def _maintain_preferences() -> int:
     return await AIMemPreference.prune_per_context(max_per_context=memory_config.preference_max_per_context)
 
 
+# 最近一次生命周期维护报告（进程内存，供控制台读取）
+_LAST_LIFECYCLE_REPORT: dict | None = None
+
+
+def get_last_lifecycle_report() -> dict | None:
+    """返回最近一次 run_lifecycle_maintenance 的汇总（可能为 None）。"""
+    return _LAST_LIFECYCLE_REPORT
+
+
 async def run_lifecycle_maintenance() -> None:
     """记忆生命周期维护主入口（被 APScheduler 周期性调用）。"""
+    global _LAST_LIFECYCLE_REPORT
     from gsuid_core.ai_core.configs.ai_config import ai_config
 
     if not ai_config.get_config("enable").data:
         return
 
+    import time as _time
+
     from gsuid_core.ai_core.memory.database.models import AIMemEdge
 
-    logger.info(i18n_t("🧠 [Lifecycle] 开始记忆生命周期维护..."))
+    logger.info(i18n_t("log.memory.lifecycle_maintenance_2"))
     try:
         consolidated = await _consolidate()
         decayed = await AIMemEdge.apply_decay(
@@ -355,13 +369,23 @@ async def run_lifecycle_maintenance() -> None:
         dangling = await _reconcile_dangling_vectors()
         # 程序性/偏好记忆裁剪（默认开；关闭时为 no-op）
         pref_pruned = await _maintain_preferences()
+        _LAST_LIFECYCLE_REPORT = {
+            "finished_at": _time.time(),
+            "consolidated": consolidated,
+            "decayed": decayed,
+            "forgotten": forgotten,
+            "edge_trimmed": edge_trimmed,
+            "orphan_entities": orphan_entities,
+            "entity_trimmed": entity_trimmed,
+            "episodes_demoted": ep_demoted,
+            "episodes_purged": ep_purged,
+            "dangling_vectors": dangling,
+            "preferences_pruned": pref_pruned,
+            "ok": True,
+        }
         logger.success(
             i18n_t(
-                "🧠 [Lifecycle] 维护完成：巩固 {consolidated} 条、衰减 {decayed} 条、"
-                "遗忘 {forgotten} 条、Edge 裁剪 {edge_trimmed} 条、回收孤儿实体 {orphan_entities} 个、"
-                "Entity 裁剪 {entity_trimmed} 个、Episode 降级 {ep_demoted} 条 /"
-                " 物理删除 {ep_purged} 条、对账清理悬空向量 {dangling} 个、"
-                "偏好规则裁剪 {pref_pruned} 条",
+                "log.memory.lifecycle_consolidated_decayed_forgotten_ok",
                 consolidated=consolidated,
                 decayed=decayed,
                 forgotten=forgotten,
@@ -375,4 +399,9 @@ async def run_lifecycle_maintenance() -> None:
             )
         )
     except Exception as e:
-        logger.exception(i18n_t("🧠 [Lifecycle] 记忆生命周期维护失败: {e}", e=e))
+        _LAST_LIFECYCLE_REPORT = {
+            "finished_at": _time.time(),
+            "ok": False,
+            "error": str(e),
+        }
+        logger.exception(i18n_t("log.memory.lifecycle_maintenance", e=e))

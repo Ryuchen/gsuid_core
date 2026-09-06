@@ -49,8 +49,6 @@ _SKILL_PATH: Path = Path(__file__).resolve().parents[3] / "docs" / "skills" / "g
 
 # SKILL 已重构为「主入口 SKILL.md（索引）+ references/ 子文档（正文）」结构：触发器 /
 # 数据库 / 配置 / 完整示例 等**正文都在 references/*.md 里**，SKILL.md 本身只剩目录索引。
-# read_plugin_dev_guide 必须把 references/ 一并纳入检索语料，否则按章节关键词查正文会全部
-# MISS（只能看到索引页的几个元标题），开发代理就拿不到权威写法、只能凭 prompt 内联知识硬写。
 _REFERENCES_DIR: Path = _SKILL_PATH.parent / "references"
 
 
@@ -174,7 +172,7 @@ def _skeleton_files(
 ) -> Dict[str, str]:
     """生成嵌套加载模式插件骨架的 ``{相对路径: 文件内容}`` 映射。
 
-    参照 ZZZeroUID / SayuStock：外层插件包 + 内层同名 Python 包。
+    参照成熟插件（如 ZZZeroUID）：外层插件包 + 内层同名 Python 包。
     """
     show_name = display_name or plugin_name
     desc = description or f"{show_name} —— 由插件开发代理生成的 GsCore 插件"
@@ -289,7 +287,6 @@ async def scaffold_plugin(
 
     # 已安装同名插件拦截：plugins/ 里已有同名插件、但工作区还没有它时，**绝不**用空骨架
     # 覆盖式重写——那会把主人现有的实现整个丢掉（实测会话 2df150：主人让"改"，代理却
-    # 在全新空工作区里 scaffold 重写了一遍）。改成引导先 pull 进工作区在原代码上修改。
     installed_name = _existing_plugin_dirname(plugin_name)
     installed_dir = (_plugin_root() / installed_name).resolve()
     if installed_dir.exists() and _is_plugin_child(installed_dir):
@@ -311,12 +308,10 @@ async def scaffold_plugin(
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
     except OSError as e:
-        logger.exception(t("🧩 [PluginDev] 脚手架插件 {plugin_name} 失败: {e}", plugin_name=plugin_name, e=e))
+        logger.exception(t("log.ai.plugindev_scaffolding_plugin_name", plugin_name=plugin_name, e=e))
         return f"错误：脚手架失败：{e}"
 
-    logger.info(
-        t("🧩 [PluginDev] 已在工作区脚手架插件 {plugin_name}（{p0} 个文件）", plugin_name=plugin_name, p0=len(files))
-    )
+    logger.info(t("log.ai.plugindev_scaffolded_plugin_name", plugin_name=plugin_name, p0=len(files)))
     listing = "\n".join(f"  - {plugin_name}/{p}" for p in files)
     biz = f"{plugin_name}/{plugin_name}/main/__init__.py"
     return (
@@ -371,13 +366,11 @@ async def pull_installed_plugin(ctx: RunContext[ToolContext], plugin_name: str) 
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(src, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     except OSError as e:
-        logger.exception(t("🧩 [PluginDev] 拉取已安装插件 {real_name} 失败: {e}", real_name=real_name, e=e))
+        logger.exception(t("log.ai.plugindev_pulling_installed_plugin_fail", real_name=real_name, e=e))
         return f"错误：拉取已安装插件失败：{e}"
 
     files = sorted(str(p.relative_to(root)).replace("\\", "/") for p in dest.rglob("*") if p.is_file())
-    logger.info(
-        t("🧩 [PluginDev] 已把已安装插件 {real_name} 拉进工作区（{p0} 个文件）", real_name=real_name, p0=len(files))
-    )
+    logger.info(t("log.ai.plugindev_pulled_installed_plugin", real_name=real_name, p0=len(files)))
     listing = "\n".join(f"  - {p}" for p in files[:40])
     more = f"\n  …还有 {len(files) - 40} 个文件未列出" if len(files) > 40 else ""
     return (
@@ -395,7 +388,7 @@ async def validate_plugin(
     plugin_name: str,
 ) -> str:
     """
-    语法自检：对**工作区**里该插件所有 .py 文件做 py_compile，报告语法错误。
+    查询工作区里该插件所有 .py 的语法错误（py_compile）。
 
     在 copy_to_plugin_dir 安装之前调用，提前发现语法错误。注意它只查语法，发现不了
     import 错误或运行时错误——那些要靠 load_plugin_into_core 的返回信息发现。
@@ -442,14 +435,14 @@ def _physical_install(src: Path, dest: Path) -> Optional[str]:
     开发期不代为搬运 / 备份用户数据。
     """
     if not _is_plugin_child(dest):
-        logger.error(t("🧩 [PluginDev] 安装目标越界，拒绝写入: {dest}", dest=dest))
+        logger.error(t("log.ai.plugindev_install_target_bounds", dest=dest))
         return f"错误：安装目标非法（必须是 plugins/ 的直接子目录）：{dest}"
     try:
         if dest.exists():
             shutil.rmtree(dest)
         shutil.copytree(src, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     except OSError as e:
-        logger.exception(t("🧩 [PluginDev] 安装插件 {p0} 失败: {e}", p0=dest.name, e=e))
+        logger.exception(t("log.ai.plugindev_installing_plugin", p0=dest.name, e=e))
         return f"错误：复制到 plugins/ 失败：{e}"
     return None
 
@@ -461,14 +454,14 @@ def _finalize_update(dest: Path, staged: Path) -> Optional[str]:
     在案**的旧目录，绝不波及其它插件；改名是同盘 rename，无额外副本。
     """
     if not _is_plugin_child(dest) or not _is_plugin_child(staged):
-        logger.error(t("🧩 [PluginDev] 收尾路径越界，拒绝: dest={dest} staged={staged}", dest=dest, staged=staged))
+        logger.error(t("log.ai.plugindev_finalize_path_bounds", dest=dest, staged=staged))
         return "错误：收尾路径非法（dest / 暂存目录都必须是 plugins/ 的直接子目录）。"
     try:
         if dest.exists():
             shutil.rmtree(dest)
         shutil.move(str(staged), str(dest))
     except OSError as e:
-        logger.exception(t("🧩 [PluginDev] 收尾更新 {p0} 失败: {e}", p0=dest.name, e=e))
+        logger.exception(t("log.ai.plugindev_finalize_update", p0=dest.name, e=e))
         return f"错误：删除旧目录 / 改名失败：{e}"
     return None
 
@@ -493,11 +486,8 @@ def _pick_staging_name(plugin_name: str) -> Optional[str]:
     return None
 
 
-# ── 安装状态账本 ────────────────────────────────────────────────────────────
+# 安装状态账本
 # 安装是非阻塞的多步审批流程，跨"任务挂起 waiting_approval → 主人批准 → 重新调度"会
-# 多次重入 copy_to_plugin_dir。状态必须持久化才能在重入时恢复——落在 Kanban 任务日志
-# (event_type="decision") 里当作机器账本：发起每步审批前先写一条 req-* 标记，安装/暂存
-# 成功后写 staged|/installed 标记。这些标记**不进**审批播报（审批文案另走 failure_reason）。
 _LEDGER = "🧩dev|"
 
 
@@ -662,7 +652,7 @@ async def _request_overwrite_stage(task, plugin_name: str) -> str:
     )
     logger.info(
         t(
-            "🧩 [PluginDev] 插件 {plugin_name}（覆盖更新）发起第一步安装审批，临时名 {staging_name}",
+            "log.ai.plugindev_plugin_name_overwrite_update",
             plugin_name=plugin_name,
             staging_name=staging_name,
         )
@@ -721,7 +711,7 @@ async def copy_to_plugin_dir(ctx: RunContext[ToolContext], plugin_name: str) -> 
         sync_err = _physical_install(src, dest)
         if sync_err:
             return sync_err
-        logger.info(t("🧩 [PluginDev] 重新同步已安装插件 {plugin_name} → plugins/", plugin_name=plugin_name))
+        logger.info(t("log.ai.plugindev_syncing_installed_plugin", plugin_name=plugin_name))
         return (
             f"✅ 「{plugin_name}」最新代码已重新同步进 plugins/{plugin_name}/（本会话已审批过，无需再审批）。\n"
             "下一步：load_plugin_into_core 重载，再 test_plugin_command 自测。"
@@ -740,7 +730,7 @@ async def copy_to_plugin_dir(ctx: RunContext[ToolContext], plugin_name: str) -> 
         await _record(_mark(plugin_name, "installed"))
         logger.info(
             t(
-                "🧩 [PluginDev] 覆盖更新收尾完成：删旧目录并把 {staged_name} 改回 {plugin_name}",
+                "log.ai.plugindev_overwrite_update_finalize_ok",
                 staged_name=staged_name,
                 plugin_name=plugin_name,
             )
@@ -765,7 +755,7 @@ async def copy_to_plugin_dir(ctx: RunContext[ToolContext], plugin_name: str) -> 
         await request_subtask_approval(task, _delete_approval_prompt(plugin_name, staging_name))
         logger.info(
             t(
-                "🧩 [PluginDev] 插件 {plugin_name} 以临时名 {staging_name} 暂存完成，发起删除旧目录审批",
+                "log.ai.plugindev_plugin_name_staged_ok",
                 plugin_name=plugin_name,
                 staging_name=staging_name,
             )
@@ -778,7 +768,7 @@ async def copy_to_plugin_dir(ctx: RunContext[ToolContext], plugin_name: str) -> 
             # 审批窗口内冒出了同名目录：为避免 rmtree 误删，改走"覆盖更新"安全流程并重新审批
             logger.info(
                 t(
-                    "🧩 [PluginDev] 插件 {plugin_name} 新建审批期间出现同名目录，转覆盖更新安全流程",
+                    "log.ai.plugindev_name_directory_plugin_update",
                     plugin_name=plugin_name,
                 )
             )
@@ -787,7 +777,7 @@ async def copy_to_plugin_dir(ctx: RunContext[ToolContext], plugin_name: str) -> 
         if install_err:
             return install_err
         await _record(_mark(plugin_name, "installed"))
-        logger.info(t("🧩 [PluginDev] 已新建安装插件 {plugin_name} 到 plugins/", plugin_name=plugin_name))
+        logger.info(t("log.ai.plugindev_newly_installed_plugin", plugin_name=plugin_name))
         return (
             f"✅ 「{plugin_name}」已安装到 plugins/{plugin_name}/。\n"
             "下一步：load_plugin_into_core 加载，再 test_plugin_command 自测。"
@@ -803,9 +793,7 @@ async def copy_to_plugin_dir(ctx: RunContext[ToolContext], plugin_name: str) -> 
     if not dest.exists():
         await _record(_mark(plugin_name, "req-install"))
         await request_subtask_approval(task, f"插件「{plugin_name}」（新建插件）已在工作区开发完成，请求安装到框架。")
-        logger.info(
-            t("🧩 [PluginDev] 插件 {plugin_name}（新建）发起安装审批，挂起任务等待主人", plugin_name=plugin_name)
-        )
+        logger.info(t("log.ai.plugindev_plugin_name_initiated", plugin_name=plugin_name))
         return (
             f"已发起安装审批：插件「{plugin_name}」（新建插件）正在等待主人同意，请立即停止后续操作；"
             "主人同意后框架会自动重新调度你完成安装与自测。"
@@ -838,9 +826,8 @@ async def load_plugin_into_core(
     """
     plugin_name = _existing_plugin_dirname(plugin_name)
 
-    # 工作区有该插件代码时：仅在"本会话已完成安装"后才同步工作区→plugins/ 再重载（消除"改工作区
-    # 却重载旧 plugins/"的死循环）。未安装就直接 load 会被拦下——避免绕开 copy_to_plugin_dir 的
-    # 审批与"覆盖更新不直接删旧目录"流程去 rmtree 同名旧目录。
+    # 工作区有该插件代码时：仅在"本会话已完成安装"后才同步工作区→plugins/ 再重载（消除"改工作区 却重载旧
+    # 未安装就直接 load 会被拦下——避免绕开 copy_to_plugin_dir 的
     ws, _ = _resolve_in_workspace(plugin_name, "")
     if ws is not None and ws.exists() and any(ws.rglob("*.py")):
         if not _is_installed(await _task_logs(), plugin_name):
@@ -857,9 +844,9 @@ async def load_plugin_into_core(
 
     from gsuid_core.utils.plugins_update.reload_plugin import reload_plugin
 
-    logger.info(t("🧩 [PluginDev] 请求热加载插件 {plugin_name}", plugin_name=plugin_name))
-    # reload_plugin 内部用 get_running_loop().create_task 重跑启动 Hook，必须在
-    # 事件循环线程内同步调用（与 core重载插件 命令同链路），不可丢进 to_thread。
+    logger.info(t("log.ai.plugindev_requesting_hot_reload_load", plugin_name=plugin_name))
+    # reload_plugin 内部用 get_running_loop().create_task 重跑启动 Hook
+    # 必须在 事件循环线程内同步调用（与 core重载插件 命令同链路），不可丢进 to_thread。
     return reload_plugin(plugin_name)
 
 
@@ -916,7 +903,7 @@ async def test_plugin_command(
     if command in plugin_ai_tools:
         logger.info(
             t(
-                "🧩 [PluginDev] 自测 to_ai 命令 {plugin_name}.{command}(text={text})",
+                "log.ai.plugindev_self_test_command",
                 plugin_name=plugin_name,
                 command=command,
                 text=repr(text),
@@ -925,7 +912,7 @@ async def test_plugin_command(
         try:
             result = await plugin_ai_tools[command].tool.function(ctx, text=text)
         except Exception as e:
-            logger.exception(t("🧩 [PluginDev] 自测命令 {command} 抛异常: {e}", command=command, e=e))
+            logger.exception(t("log.ai.plugindev_self_test_command_fail", command=command, e=e))
             return f"❌ 自测命令 [{command}] 抛出异常：{type(e).__name__}: {e}（请据此改代码后重新加载再测）"
         return f"【命令 {command}(text={text!r}) 实跑结果】\n{result}"
 
@@ -954,12 +941,10 @@ async def test_plugin_command(
             fake_ev.raw_text = f"{trig.prefix}{trig.keyword}{text}".strip()
         # 关键：实跑**未包装**的原处理函数（__wrapped__），而非 SV 的 modify_func 包装。
         # 后者用 try/except 吞掉一切异常只打日志、返回 None——会让本自测把"处理函数内
-        # 真实崩溃"（如 ev.original_message 不存在）误报成"命令已执行但无产出"，导致带病
-        # 交付。直接跑原函数，异常会冒泡到下面的 except、如实回报给开发代理。
         raw_func = getattr(trig.func, "__wrapped__", trig.func)
         logger.info(
             t(
-                "🧩 [PluginDev] 自测纯命令 {plugin_name}.{command}(text={text})",
+                "log.ai.plugindev_self_test_pure_command",
                 plugin_name=plugin_name,
                 command=command,
                 text=repr(text),
@@ -968,7 +953,7 @@ async def test_plugin_command(
         try:
             result = await run_trigger_via_mockbot(ctx.deps.bot, fake_ev, raw_func)
         except Exception as e:
-            logger.exception(t("🧩 [PluginDev] 自测命令 {command} 抛异常: {e}", command=command, e=e))
+            logger.exception(t("log.ai.plugindev_self_test_command_fail", command=command, e=e))
             return (
                 f"❌ 自测命令 [{command}] 抛出异常：{type(e).__name__}: {e}"
                 "（这是处理函数内的真实 bug，请据此改代码后重新加载再测，别当成功交付）"
@@ -1158,7 +1143,7 @@ async def search_skill_docs(
     """
     语义检索 GsCore 开发文档知识库（**查文档的首选**，混合 dense+BM25 检索，精度高于关键词匹配）。
 
-    docs/skills 下全部开发文档已在框架启动时挂载进知识库。用**自然语言**描述你要查的写法 / 概念即可，
+    .agents/skills 下全部开发文档已在框架启动时挂载进知识库。用**自然语言**描述你要查的写法 / 概念即可，
     例如："怎么发图片并转成字节"、"数据库表怎么注册到网页控制台"、"on_regex 怎么取捕获组"、
     "to_ai 和 ai_return 怎么配合"、"插件怎么挂 FastAPI 接口"。返回最相关的若干文档片段。
 

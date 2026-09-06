@@ -1,7 +1,7 @@
 import json
 import random
 import asyncio
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 from gsuid_core.sv import SV
 from gsuid_core.bot import Bot
@@ -29,14 +29,14 @@ sv_data_manger = SV("用户数据管理", pm=0)
 
 @sv_core_user_config.on_fullmatch(("刷新全部CK", "刷新全部ck"), block=True)
 async def send_refresh_all_ck_msg(bot: Bot, ev: Event):
-    logger.info(i18n_t("开始执行[刷新全部CK]"))
+    logger.info(i18n_t("log.core.ck_start_refresh_2"))
     im = await get_ck_by_all_stoken(ev.bot_id)
     await bot.send(im)
 
 
 @sv_core_user_add.on_fullmatch(("刷新CK", "刷新ck"), block=True)
 async def send_refresh_ck_msg(bot: Bot, ev: Event):
-    logger.info(i18n_t("开始执行[刷新CK]"))
+    logger.info(i18n_t("log.core.ck_start_refresh"))
     im = await get_ck_by_stoken(ev.bot_id, ev.user_id)
     await bot.send(im)
 
@@ -90,11 +90,21 @@ async def send_check_cookie(bot: Bot, ev: Event):
 
 @sv_data_manger.on_fullmatch(("校验全部Stoken"), block=True)
 async def send_check_stoken(bot: Bot, ev: Event):
-    user_list = await GsUser.get_all_user()
+    user_list: Sequence[GsUser] = await GsUser.get_all_user()
     invalid_user: List[GsUser] = []
     for user in user_list:
         if user.stoken and user.mys_id:
-            mys_data = await mys_api.get_cookie_token_by_stoken("", user.mys_id, user.stoken)
+            is_os = bool(
+                (user.uid and mys_api.check_os(user.uid, "gs"))
+                or (user.sr_uid and mys_api.check_os(user.sr_uid, "sr"))
+                or (user.zzz_uid and mys_api.check_os(user.zzz_uid, "zzz"))
+            )
+            mys_data = await mys_api.get_cookie_token_by_stoken(
+                "",
+                user.mys_id,
+                user.stoken,
+                is_os=is_os,
+            )
             if isinstance(mys_data, int) and user.uid:
                 await GsUser.update_data_by_uid(user.uid, ev.bot_id, stoken=None)
                 invalid_user.append(user)
@@ -151,7 +161,7 @@ async def _send_help(bot: Bot, im):
 @sv_core_user_qrcode_login.on_fullmatch(("扫码登陆", "扫码登录"), block=True, prefix=False)
 @sv_core_user_qrcode_login.on_fullmatch(("扫码登陆", "扫码登录"), block=True)
 async def send_qrcode_login(bot: Bot, ev: Event):
-    logger.info(i18n_t("开始执行[扫码登陆]"))
+    logger.info(i18n_t("log.core.qr_code_login_start"))
     uid_list = await get_all_bind_uid(ev.bot_id, ev.user_id)
     if any(uid_list):
         im = await qrcode_login(bot, ev, ev.user_id)

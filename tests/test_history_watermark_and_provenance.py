@@ -9,7 +9,7 @@
 对应修复：
 - ``extract_history``：超过 max_history 才裁、一次裁到低水位（0.6x），裁剪间隔内前缀稳定；
 - ``_compact_report_blocks_in_history``：持久历史中 <report> 正文换占位符（省 token + 切断漂移固化）；
-- ``list_scheduled_tasks`` / ``query_scheduled_task``：群聊按群列出、展示发起用户，同群成员可读。
+- ``list_scheduled_tasks`` 只列提问者自己的任务；``query_scheduled_task`` 同群成员可凭 ID 只读。
 """
 
 from typing import Any, Optional
@@ -23,87 +23,104 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from gsuid_core.ai_core.utils import _compact_report_blocks_in_history
+from gsuid_core.ai_core.utils import (
+    compact_session_history,
+    _compact_report_blocks_in_history,
+)
+
+# 与 gs_agent._HISTORY_TRIM_RATIO 保持一致（单测不 import 重依赖 gs_agent）
+_HISTORY_TRIM_RATIO = 0.6
 
 # ─────────────────────────────────────────────
-# extract_history 高低水位
+# compact_session_history / 保头裁中段
 # ─────────────────────────────────────────────
-
-
-def _make_agent(max_history: int) -> Any:
-    from gsuid_core.ai_core.gs_agent import GsCoreAIAgent
-
-    # 只构造到能测 extract_history 的程度：绕过 __init__（避免模型/工具装配）
-    agent = object.__new__(GsCoreAIAgent)
-    agent.max_history = max_history
-
-    class _NullLogger:
-        def log_history_reset(self, reason: str, detail: str) -> None:
-            self.last = (reason, detail)
-
-    agent._session_logger = _NullLogger()
-    return agent
 
 
 def _turn(i: int) -> list:
     return [
-        ModelRequest(parts=[UserPromptPart(content=f"【用户发言】\n消息{i}")]),
+        ModelRequest(parts=[UserPromptPart(content=f"[用户发言]\n消息{i}")]),
         ModelResponse(parts=[TextPart(content=f"回复{i}")]),
     ]
 
 
 def test_no_trim_below_watermark() -> None:
     """未超 max_history 时一条都不动——头部稳定是缓存命中的前提。"""
-    agent = _make_agent(max_history=15)
     history = []
     for i in range(7):
         history.extend(_turn(i))  # 14 条
-    agent.history = list(history)
-    agent.extract_history()
-    assert agent.history == history
+    out, did = compact_session_history(list(history), max_history=15, trim_ratio=_HISTORY_TRIM_RATIO)
+    assert did is False
+    assert out == history
 
 
 def test_trim_goes_to_low_watermark_not_max() -> None:
-    """超过 max_history 时一次裁到低水位（0.6x），而非"超 1 裁 1"。"""
-    agent = _make_agent(max_history=15)
+    """超过 max_history 时一次裁到低水位；保头裁中段，尾部仍是最新消息。"""
     history = []
     for i in range(9):
         history.extend(_turn(i))  # 18 条 > 15
-    agent.history = list(history)
-    agent.extract_history()
-    # 低水位 = int(15*0.6) = 9；工具配对安全截断可能再少 1 条，但绝不该停在 15
-    assert len(agent.history) <= 9
-    assert len(agent.history) >= 7
-    # 保留的是最新消息
-    last = agent.history[-1]
+    out, did = compact_session_history(list(history), max_history=15, trim_ratio=_HISTORY_TRIM_RATIO)
+    low = int(15 * _HISTORY_TRIM_RATIO)
+    assert did is True
+    assert len(out) <= low + 2  # 工具配对可能略超
+    assert len(out) < 18
+    # 头部仍是会话最早消息（前缀缓存红线）
+    first = out[0]
+    assert isinstance(first, ModelRequest)
+    assert isinstance(first.parts[0], UserPromptPart)
+    assert first.parts[0].content == "[用户发言]\n消息0"
+    # 尾部仍是最新
+    last = out[-1]
     assert isinstance(last, ModelResponse)
     first_part = last.parts[0]
     assert isinstance(first_part, TextPart) and first_part.content == "回复8"
 
 
+def test_trim_keeps_original_prefix_forever() -> None:
+    """多次 compact 后 history[0] 仍是原始首条——绝不砍头/插锚点。"""
+    max_history = 20
+    low = int(max_history * _HISTORY_TRIM_RATIO)
+    history: list = []
+    for i in range(20):
+        history.extend(_turn(i))
+    original_head = history[0]
+    out, _ = compact_session_history(list(history), max_history=max_history, trim_ratio=_HISTORY_TRIM_RATIO)
+    assert out[0] is original_head
+    assert len(out) <= low + 2
+
+    # 再撑爆水位 compact 一次，头部对象仍不变
+    grown = list(out)
+    for j in range(15):
+        grown.extend(_turn(200 + j))
+    out2, _ = compact_session_history(grown, max_history=max_history, trim_ratio=_HISTORY_TRIM_RATIO)
+    assert out2[0] is original_head
+
+
 def test_trim_interval_gives_stable_prefix() -> None:
     """裁剪后继续追加若干轮都不再触发裁剪——这段窗口内历史头部字节稳定。"""
-    agent = _make_agent(max_history=15)
+    max_history = 20
     history = []
-    for i in range(9):
+    # 严格超过 max_history（=20 时 10 轮刚好 20 条不触发，需 11 轮）
+    for i in range(11):
         history.extend(_turn(i))
-    agent.history = list(history)
-    agent.extract_history()
-    stable_head = list(agent.history)
+    out, did = compact_session_history(list(history), max_history=max_history, trim_ratio=_HISTORY_TRIM_RATIO)
+    assert did is True
+    assert len(out) < len(history)
+    stable_head = list(out)
 
-    # 追加 2 轮（+4 条 ≤ 15）：不触发裁剪，头部对象序列不变
-    agent.history.extend(_turn(100))
-    agent.extract_history()
-    agent.history.extend(_turn(101))
-    agent.extract_history()
-    assert agent.history[: len(stable_head)] == stable_head
+    # headroom 内追加不再触发裁剪，头部对象序列不变
+    headroom_pairs = max(1, (max_history - len(out)) // 2)
+    cur = list(out)
+    for j in range(headroom_pairs):
+        cur.extend(_turn(100 + j))
+        cur, did2 = compact_session_history(cur, max_history=max_history, trim_ratio=_HISTORY_TRIM_RATIO)
+        assert did2 is False
+    assert cur[: len(stable_head)] == stable_head
 
 
 def test_zero_max_history_clears() -> None:
-    agent = _make_agent(max_history=0)
-    agent.history = _turn(1)
-    agent.extract_history()
-    assert agent.history == []
+    out, did = compact_session_history(_turn(1), max_history=0, trim_ratio=_HISTORY_TRIM_RATIO)
+    assert out == []
+    assert did is True
 
 
 # ─────────────────────────────────────────────
@@ -111,7 +128,8 @@ def test_zero_max_history_clears() -> None:
 # ─────────────────────────────────────────────
 
 
-def test_report_body_replaced_with_placeholder() -> None:
+def test_report_body_stripped_title_in_metadata() -> None:
+    """历史只留台词；标题进 sent_reports metadata（非占位正文）。"""
     md = "| 指标 | 数值 |\n|---|---|\n| 营收 | +12% |"
     msg = ModelResponse(parts=[TextPart(content=f'唔…看这张…\n<report title="XX速览">{md}</report>')])
     replaced = _compact_report_blocks_in_history([msg])
@@ -119,17 +137,19 @@ def test_report_body_replaced_with_placeholder() -> None:
     part = msg.parts[0]
     assert isinstance(part, TextPart)
     assert "营收" not in part.content
-    assert "XX速览" in part.content  # 标题保留，后续轮可引用
-    assert "唔…看这张…" in part.content  # 台词保留
+    assert "唔…看这张…" in part.content
+    assert msg.metadata is not None
+    assert "XX速览" in (msg.metadata.get("sent_reports") or [])
 
 
-def test_untitled_report_gets_generic_placeholder() -> None:
+def test_untitled_report_gets_generic_title_in_metadata() -> None:
     msg = ModelResponse(parts=[TextPart(content="<report>长内容</report>")])
     _compact_report_blocks_in_history([msg])
     part = msg.parts[0]
     assert isinstance(part, TextPart)
-    assert "分析资料" in part.content
     assert "长内容" not in part.content
+    assert msg.metadata is not None
+    assert "分析资料" in (msg.metadata.get("sent_reports") or [])
 
 
 def test_user_requests_untouched() -> None:
@@ -172,8 +192,8 @@ def _group_task(**overrides) -> Any:
     fields = {
         "task_id": "scheduled_task_5cad21ace9f5",
         "task_type": "interval",
-        "user_id": "514971204",  # Synchro 创建
-        "group_id": "914411529",
+        "user_id": "100000002",  # 化名：小北
+        "group_id": "200000001",
         "bot_id": "onebot",
         "task_prompt": "检查巨化股份（600160）当前价格",
         "status": "pending",
@@ -194,26 +214,44 @@ def sched_env(monkeypatch: pytest.MonkeyPatch) -> dict:
 
     async def fake_select_rows(**kwargs) -> list:
         env["select_kwargs"].append(kwargs)
-        return env["tasks"]
+        rows = env["tasks"]
+        if "user_id" in kwargs:
+            uid = kwargs["user_id"]
+            return [t for t in rows if t.user_id == uid]
+        if "task_id" in kwargs:
+            tid = kwargs["task_id"]
+            return [t for t in rows if t.task_id == tid]
+        if "group_id" in kwargs:
+            gid = kwargs["group_id"]
+            return [t for t in rows if t.group_id == gid]
+        return rows
 
     monkeypatch.setattr(sched_mod.AIScheduledTask, "select_rows", fake_select_rows)
     return env
 
 
 @pytest.mark.anyio
-async def test_group_member_sees_others_tasks_with_creator(sched_env: dict) -> None:
-    """§5 事故复现：居木（994534742）问"谁要的提醒"，必须能看到 Synchro 建的群任务。"""
+async def test_group_list_does_not_include_others_tasks(sched_env: dict) -> None:
+    """列表不外泄他人任务；凭 ID 的只读走 query_scheduled_task。"""
     from gsuid_core.ai_core.buildin_tools.scheduler import list_scheduled_tasks
 
     sched_env["tasks"] = [_group_task()]
-    ctx = _make_ctx(user_id="994534742", group_id="914411529")
+    ctx = _make_ctx(user_id="100000003", group_id="200000001")
     result = await list_scheduled_tasks(ctx)
 
-    # 群聊 = 本群任务 ∪ 提问者自己的任务（自己私聊/它群设的提醒也要能查到，评审修复 F11）
-    assert {"group_id": "914411529"} in sched_env["select_kwargs"]
-    assert {"user_id": "994534742"} in sched_env["select_kwargs"]
+    assert {"user_id": "100000003"} in sched_env["select_kwargs"]
+    assert not any("group_id" in kw for kw in sched_env["select_kwargs"])
+    assert "scheduled_task_5cad21ace9f5" not in result
+
+
+@pytest.mark.anyio
+async def test_group_list_includes_own_task(sched_env: dict) -> None:
+    from gsuid_core.ai_core.buildin_tools.scheduler import list_scheduled_tasks
+
+    sched_env["tasks"] = [_group_task(user_id="100000003")]
+    ctx = _make_ctx(user_id="100000003", group_id="200000001")
+    result = await list_scheduled_tasks(ctx)
     assert "scheduled_task_5cad21ace9f5" in result
-    assert "@514971204" in result  # 发起用户以 @ 形态展示（走 at 转换，不裸出 QQ 号）
 
 
 @pytest.mark.anyio
@@ -221,9 +259,9 @@ async def test_private_chat_still_filters_by_user(sched_env: dict) -> None:
     from gsuid_core.ai_core.buildin_tools.scheduler import list_scheduled_tasks
 
     sched_env["tasks"] = []
-    ctx = _make_ctx(user_id="994534742", group_id=None)
+    ctx = _make_ctx(user_id="100000003", group_id=None)
     await list_scheduled_tasks(ctx)
-    assert sched_env["select_kwargs"] == [{"user_id": "994534742"}]
+    assert sched_env["select_kwargs"] == [{"user_id": "100000003"}]
 
 
 @pytest.mark.anyio
@@ -232,10 +270,10 @@ async def test_query_task_readable_by_same_group_member(sched_env: dict) -> None
     from gsuid_core.ai_core.buildin_tools.scheduler import query_scheduled_task
 
     sched_env["tasks"] = [_group_task()]
-    ctx = _make_ctx(user_id="994534742", group_id="914411529")
+    ctx = _make_ctx(user_id="100000003", group_id="200000001")
     result = await query_scheduled_task(ctx, task_id="scheduled_task_5cad21ace9f5")
     assert "无权" not in result
-    assert "514971204" in result
+    assert "100000002" in result
 
 
 @pytest.mark.anyio

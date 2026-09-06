@@ -78,6 +78,30 @@ def _names(tools) -> List[str]:
     return [t.name for t in tools]
 
 
+def test_ignore_surfaces_does_not_route_wake_word(_fake_world) -> None:
+    """点名/唤醒词即使也是某插件实体，不当路由信号。"""
+    register_entity_surface("sayu", "早柚", "XutheringWavesUID")
+    plain = asyncio.run(
+        rag_tools.search_tools_with_entity_routing(
+            query="sayu今天天气如何",
+            route_text="sayu今天天气如何",
+            limit=4,
+            non_category=["self", "buildin"],
+            ignore_surfaces=("sayu", "早柚"),
+        )
+    )
+    assert _names(plain) == WIDE[:4]
+    routed = asyncio.run(
+        rag_tools.search_tools_with_entity_routing(
+            query="sayu今天天气如何",
+            route_text="sayu今天天气如何",
+            limit=4,
+            non_category=["self", "buildin"],
+        )
+    )
+    assert routed[0].name == "get_user_wuwa_char_detail"
+
+
 def test_no_entity_hit_behaves_exactly_like_plain_search(_fake_world) -> None:
     """底线：没有实体命中 → 与普通 search_tools 逐字节一致（含 limit / threshold 透传）。"""
     out = asyncio.run(
@@ -123,18 +147,66 @@ def test_entity_routing_leaves_one_slot_for_general_match(_fake_world) -> None:
 
 
 def test_ambiguous_entity_does_not_route(_fake_world) -> None:
-    """归属歧义（如"深渊"）→ 不路由，退回普通检索。"""
-    register_entity_surface("深渊", "深境螺旋", "GenshinUID")
-    register_entity_surface("深渊", "逆境深塔", "XutheringWavesUID")
+    """归属歧义且无本群证据 → 不路由，退回普通检索。"""
+    register_entity_surface("AbyssPeak", "PeakA", "NTEUID")
+    register_entity_surface("AbyssPeak", "PeakB", "XutheringWavesUID")
 
     out = asyncio.run(
         rag_tools.search_tools_with_entity_routing(
-            query="这期深渊怎么打", route_text="这期深渊怎么打", limit=4, non_category=["self", "buildin"]
+            query="AbyssPeak notes", route_text="AbyssPeak notes", limit=4, non_category=["self", "buildin"]
         )
     )
 
     assert _names(out) == WIDE[:4]
     assert len(_fake_world) == 1
+
+
+def test_ambiguous_entity_routes_when_scope_has_one_plugin(_fake_world, monkeypatch: pytest.MonkeyPatch) -> None:
+    register_entity_surface("AbyssPeak", "PeakA", "NTEUID")
+    register_entity_surface("AbyssPeak", "PeakB", "XutheringWavesUID")
+
+    async def _canons(scope_key: str) -> List[str]:
+        assert scope_key == "group:GA"
+        return ["world:XutheringWavesUID:PeakB"]
+
+    monkeypatch.setattr(
+        "gsuid_core.ai_core.cognition.nodes.AICogNode.list_world_canons_in_scope",
+        _canons,
+    )
+    out = asyncio.run(
+        rag_tools.search_tools_with_entity_routing(
+            query="AbyssPeak notes",
+            route_text="AbyssPeak notes",
+            limit=4,
+            non_category=["self", "buildin"],
+            scope_key="group:GA",
+        )
+    )
+    assert out[0].name == "get_user_wuwa_char_detail"
+
+
+def test_ambiguous_entity_stays_plain_when_scope_has_two_plugins(_fake_world, monkeypatch: pytest.MonkeyPatch) -> None:
+    register_entity_surface("AbyssPeak", "PeakA", "NTEUID")
+    register_entity_surface("AbyssPeak", "PeakB", "XutheringWavesUID")
+
+    async def _canons(scope_key: str) -> List[str]:
+        _ = scope_key
+        return ["world:NTEUID:PeakA", "world:XutheringWavesUID:PeakB"]
+
+    monkeypatch.setattr(
+        "gsuid_core.ai_core.cognition.nodes.AICogNode.list_world_canons_in_scope",
+        _canons,
+    )
+    out = asyncio.run(
+        rag_tools.search_tools_with_entity_routing(
+            query="AbyssPeak notes",
+            route_text="AbyssPeak notes",
+            limit=4,
+            non_category=["self", "buildin"],
+            scope_key="group:GA",
+        )
+    )
+    assert _names(out) == WIDE[:4]
 
 
 def test_threshold_dropped_only_when_plugin_pruned_away(_fake_world, monkeypatch) -> None:

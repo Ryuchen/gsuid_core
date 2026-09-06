@@ -69,7 +69,7 @@ def image_to_base64(image: ImageInput) -> str:
                                 elif img.format == "PNG":
                                     mime_type = "image/png"
                         except Exception as e:
-                            logger.error(f"[img2b64] Error guessing image format: {e}")
+                            logger.error(t("log.image.base64_guess_format_fail", error=e))
                             pass
                     else:
                         raise FileNotFoundError(f"[img2b64] Image not found: {path}")
@@ -88,7 +88,7 @@ def image_to_base64(image: ImageInput) -> str:
                     elif img.format == "PNG":
                         mime_type = "image/png"
             except Exception as e:
-                logger.error(f"[img2b64] Error guessing image format: {e}")
+                logger.error(t("log.image.base64_guess_format_fail", error=e))
                 pass
 
         else:
@@ -98,7 +98,7 @@ def image_to_base64(image: ImageInput) -> str:
         return f"data:{mime_type};base64,{base64_data}"
 
     except Exception as e:
-        logger.error(f"[img2b64] Error processing image: {e}")
+        logger.error(t("log.image.base64_process_fail", error=e))
         return ""
 
 
@@ -153,7 +153,7 @@ async def change_ev_image_to_bytes(
                     base64_str = item.replace("data:image/jpeg;base64,", "")
                     result_list.append(base64.b64decode(base64_str))
                 else:
-                    logger.warning(t("图片格式可能错误: {item}", item=item))
+                    logger.warning(t("log.image.item_error", item=item))
                     result_list.append(item.encode())
     else:
         return None
@@ -499,7 +499,7 @@ async def get_qq_avatar(
         char_pic = Image.open(BytesIO(resp.content)).convert("RGBA")
         return char_pic
     except (httpx.HTTPError, OSError, TimeoutError) as e:
-        logger.warning(t("[头像下载失败] 使用默认头像: {url}, 错误: {error}", url=avatar_url, error=e))
+        logger.warning(t("log.image.url_error_download_fail", url=avatar_url, error=e))
         return None
 
 
@@ -516,7 +516,7 @@ async def get_qqgroup_avatar(
         char_pic = Image.open(BytesIO(resp.content)).convert("RGBA")
         return char_pic
     except (httpx.HTTPError, OSError, TimeoutError) as e:
-        logger.warning(t("[群头像下载失败] 使用默认头像: {url}, 错误: {error}", url=avatar_url, error=e))
+        logger.warning(t("log.image.url_error_download_fail_2", url=avatar_url, error=e))
         return None
 
 

@@ -22,15 +22,50 @@ def test_both_entries_consume_shared_assembly() -> None:
     endpoint = _src("gsuid_core/webconsole/chat_with_history_api.py")
     router = _src("gsuid_core/ai_core/ai_router.py")
 
-    for name, src in [("handle_ai", handle_ai), ("chat_with_history_api", endpoint)]:
-        assert "assemble_dynamic_context(" in src, f"{name} 不再消费共享动态装配（漂移回手工复刻）"
+    assert "async def run_interactive_turn(" in handle_ai, "一轮编排必须收在 run_interactive_turn"
+    assert "run_interactive_turn(" in endpoint, "评测入口必须走 run_interactive_turn，不许另开一口"
+    assert 'else "Chat"' in endpoint, "非判分评测须 create_by=Chat，才能装配 search_cognition"
+    assert "memory_eval=_memory_eval" in endpoint, "LongMem 转储只认 memory_eval，不许走 TEST"
+    guide_at = endpoint.index("_MEMORY_EVAL_GUIDE")
+    guide = endpoint[guide_at : guide_at + 4200]
+    assert "【核心事实】" in guide
+    assert "【相关对话片段】" in guide
+    assert "【本题证据会话】" not in guide
+    assert "UPDATES" in guide
+    assert "ALL injected facts" in guide
+    assert "Garden herbs" not in guide
+    assembly = _src("gsuid_core/ai_core/context_assembly.py")
+    assert "parse_injected_clock" not in assembly
+    assert "parse_injected_clock" not in endpoint
+    assert "parse_clock_at" in endpoint
+    assert "req.clock_at" in endpoint
+    loop = _src("gsuid_core/ai_core/agent_run/loop.py")
+    assert 'create_by in _MAIN_PERSONA_CREATE_BY and st.return_mode != "return"' in loop
+    assert "http_dynamic_tools(" in endpoint
+    assert "dynamic_tools=http_dynamic_tools(" in endpoint
+    assert "dual_route_retrieve(" not in endpoint, "评测不得自己检索"
+    assert "classifier_service" not in endpoint, "评测不得自己分类"
+    assert "settle_turn(" not in endpoint, "评测不得自己结算"
+    assert "assemble_dynamic_context(" in handle_ai
     for name, src in [("ai_router", router), ("chat_with_history_api", endpoint)]:
         assert "build_session_system_prompt(" in src, f"{name} 不再消费共享 system prompt 装配"
-    # 手工复刻的标志物：装配段特有的**拼接代码**不允许出现在入口文件里（注释提及不算）
     for name, src in [("handle_ai", handle_ai), ("chat_with_history_api", endpoint)]:
         assert 'f"【长期记忆】' not in src and "【长期记忆】\\n" not in src, f"{name} 手工拼接记忆块=装配漂移"
         assert "（口吻锚点：" not in src, f"{name} 手工拼接口吻锚点=装配漂移"
     print("[OK] 双入口消费共享装配（源码级）")
+
+
+def _load_kits_once() -> None:
+    """装载第一方套件（跳过 init_step：本进程没有 DB/RAG）。
+
+    顺序契约是**默认全开**下的行为契约，所以必须真的把套件挂上——只测内核兜底
+    等于把「有装配没套件」的第三套语义当成正确行为。
+    """
+    from gsuid_core.ai_core.kits import occupants_of, load_enabled_kits
+
+    if occupants_of("mood"):
+        return
+    asyncio.run(load_enabled_kits(run_init_steps=False))
 
 
 def test_dynamic_context_ordering_contract() -> None:
@@ -41,6 +76,7 @@ def test_dynamic_context_ordering_contract() -> None:
     """
     from gsuid_core.ai_core.context_assembly import SOFT_TRIGGER_NOTE, assemble_dynamic_context
 
+    _load_kits_once()
     full, has_actionable = asyncio.run(
         assemble_dynamic_context(
             query="那深圳呢",
@@ -48,25 +84,118 @@ def test_dynamic_context_ordering_contract() -> None:
             bot_id="TEST",
             persona_name=None,
             mood_key="test_u",
-            favorability=None,
-            history_context="【历史对话】\n小明: 你好",
+            rel=None,
+            history_context="[历史对话] 旧→新\n小明: 你好",
             memory_context_text="用户喜欢喝美式",
             memory_guide="[guide]\n",
             soft_triggered=True,
         )
     )
     assert has_actionable in (False, True)
-    i_hist = full.find("【历史对话】")
-    i_mem = full.find("【长期记忆】")
+    i_hist = full.find("[历史对话]")
+    i_mem = full.find("[长期记忆")
     i_soft = full.find(SOFT_TRIGGER_NOTE)
-    assert i_hist == 0, "历史必须最前"
-    assert 0 < i_mem < i_soft, "长期记忆须在历史之后、软触发提示之前"
-    assert "[guide]" in full and full.find("[guide]") < i_mem + len("【长期记忆】")
+    # 短状态（关系行等）可在历史前；历史 → 记忆 → 软触发 的相对顺序锁死
+    assert i_hist >= 0 and i_mem > i_hist, "长期记忆须在历史之后"
+    assert i_soft > i_mem, "软触发提示须在记忆之后"
+    i_guide = full.find("[guide]")
+    assert i_guide > i_mem, "评测指南须跟在记忆正文后，避免 800 字预算把目录卡截掉"
+    assert i_soft > i_guide
     assert full.endswith(SOFT_TRIGGER_NOTE), "软触发提示必须最后"
     print("[OK] 动态上下文顺序契约")
+
+
+def test_block_order_is_single_source() -> None:
+    """块名与顺序的唯一定义在 ``kits.base.CONTEXT_BLOCK_ORDER``，装配层只做拼装。
+
+    A 线的记忆块写 ``memory``、C 线的关系行写 ``relationship`` —— 名字不许各自造，
+    否则跨越数月的三条线会把同一个装配函数改三次、每次都对不上前一次。
+    """
+    from gsuid_core.ai_core.kits.base import CONTEXT_BLOCK_ORDER
+    from gsuid_core.ai_core.context_assembly import join_context_blocks
+
+    assert CONTEXT_BLOCK_ORDER == (
+        "mood",
+        "relationship",
+        "voice_anchor",
+        "identity",
+        "history",
+        "group_context",
+        "memory",
+        "task",
+        "plan_hint",
+        "chitchat_style",
+        "transaction_priority",
+        "report_titles",
+        "soft_trigger",
+        "plugin_hints",
+    )
+    # 乱序写入也按表拼；空块被丢弃；未在表内的块名进不来（写入侧白名单校验）
+    out = join_context_blocks({"memory": "M", "mood": "D", "plugin_hints": "P", "task": ""})
+    assert out == "D\n\nM\n\nP", out
+    cues = join_context_blocks(
+        {
+            "voice_anchor": "（口吻：迷糊）（对这个人的口气：亲昵）",
+            "identity": "（身份：你是「早柚」。）",
+            "history": "[历史对话]",
+        }
+    )
+    assert cues == "（口吻：迷糊）（对这个人的口气：亲昵）（身份：你是「早柚」。）\n\n[历史对话]", cues
+    voice_src = _src("gsuid_core/ai_core/kits/self_cognition/kit.py")
+    assert '"".join(parts)' in voice_src
+    assert '"\\n\\n".join(parts)' not in voice_src
+    print("[OK] 块顺序单源")
+
+
+def test_addressed_suffix_keeps_voice_anchor_outside_product_cap() -> None:
+    from gsuid_core.ai_core.hooks.models import AgentHookContext
+    from gsuid_core.ai_core.hooks.points import AgentHookPoint
+    from gsuid_core.ai_core.context_assembly import (
+        _SUFFIX_PRODUCT_CAP,
+        suffix_allowed_blocks,
+        _apply_suffix_block_policy,
+    )
+    from gsuid_core.ai_core.interaction_scaffold import TurnGraph
+
+    tg = TurnGraph(
+        user_type="group",
+        message_text="hi",
+        persona_name="p",
+        is_tome=True,
+        primary_speaker="u1",
+        call_to_self=True,
+    )
+    ctx = AgentHookContext(point=AgentHookPoint.COMPOSE_CONTEXT, turn_graph=tg, cheap_gate="full")
+    allowed = suffix_allowed_blocks(ctx)
+    assert allowed is not None
+    assert "voice_anchor" in allowed
+    voice = "（口吻：短）"
+    ctx.blocks = {
+        "voice_anchor": voice,
+        "task": "任务块",
+        "relationship": "R" * 80,
+        "memory": "M" * 80,
+        "history": "H" * 500,
+    }
+    _apply_suffix_block_policy(ctx)
+    assert ctx.blocks["voice_anchor"] == voice
+    assert ctx.blocks["task"] == "任务块"
+    product = sum(len(v) for k, v in ctx.blocks.items() if k != "voice_anchor")
+    assert product <= _SUFFIX_PRODUCT_CAP
+    idle = TurnGraph(
+        user_type="group",
+        message_text="hi",
+        persona_name="p",
+        is_tome=False,
+        primary_speaker="u1",
+        call_to_self=False,
+    )
+    idle_ctx = AgentHookContext(point=AgentHookPoint.COMPOSE_CONTEXT, turn_graph=idle, cheap_gate="full")
+    assert suffix_allowed_blocks(idle_ctx) == frozenset()
 
 
 if __name__ == "__main__":
     test_both_entries_consume_shared_assembly()
     test_dynamic_context_ordering_contract()
+    test_block_order_is_single_source()
     print("\n装配统一防漂移锁全部通过 ✅")

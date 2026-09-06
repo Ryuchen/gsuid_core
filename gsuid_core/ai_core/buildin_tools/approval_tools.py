@@ -90,7 +90,7 @@ async def respond_approval(
     request_ref: str = "",
     note: str = "",
 ) -> str:
-    """转达用户 / 主人对某条待审批请求的同意 / 拒绝（全框架唯一审批转达入口）。
+    """写入用户 / 主人对某条待审批请求的同意 / 拒绝（全框架唯一审批转达入口）。
 
     覆盖所有待审批类型：命令执行、Kanban 子任务（含插件安装）、工具调用授权、
     Agent 主动请求。多条待决时用 request_ref 指明编号（如 "#ab12"）。
@@ -162,7 +162,7 @@ async def _log_question_safe(ev: Event, question: str, answer: str, answered: bo
     try:
         await approval_center.log_question(ev, question, answer, answered=answered)
     except Exception as e:
-        logger.warning(t("✅ [Approval] 问答留档失败（不影响回答返回）: {e}", e=e))
+        logger.warning(t("log.ai.approval_archival_affect_answer_fail", e=e))
 
 
 def _ask_user_lock_key(ev: Event) -> str:
@@ -221,7 +221,7 @@ def _coerce_option_strings(options: Any) -> List[str]:
 
 
 # timeout=None:排队等待(前序问题各自 ≤300s)+ 自身等待(≤300s)可能超过默认
-# 300s 的工具包装超时;ask_user 的每一段等待都有自己的上界,不会永久挂起。
+# 60s 的工具包装超时;ask_user 的每一段等待都有自己的上界,不会永久挂起。
 @ai_tools(category="common", capability_domain="审批交互", timeout=None)
 async def ask_user(
     ctx: RunContext[ToolContext],
@@ -230,7 +230,7 @@ async def ask_user(
     timeout_seconds: int = 60,
     default_choice: str = "",
 ) -> str:
-    """向当前用户提出一个澄清问题并等待回复（question × user，无权限语义）。
+    """向当前用户发出一个澄清问题并等待回复（question × user，无权限语义）。
 
     交互式会话下发送问题（有 options 时以按钮呈现）并等待；超时返回
     default_choice（无默认值则告知超时）。仅在需要用户决定且无法从上下文推断时
@@ -262,7 +262,7 @@ async def ask_user(
             else:
                 resp = await bot.receive_resp(question, timeout=timeout)
     except Exception as e:
-        logger.debug(t("✅ [Approval] ask_user 等待回复失败: {e}", e=e))
+        logger.debug(t("log.ai.approval_ask_user_waiting", e=e))
         resp = None
     answer = "" if resp is None else (resp.raw_text if resp.raw_text else resp.text)
     await _log_question_safe(ev, question, answer or default_choice, answered=resp is not None)
@@ -389,7 +389,7 @@ async def ask_user_form(
 
 @ai_tools(category="common", capability_domain="审批交互")
 async def request_user_approval(ctx: RunContext[ToolContext], summary: str) -> str:
-    """请求**当前用户**授权一项会消耗其资源 / 积分的操作（approval × user）。
+    """向当前用户发出授权请求，询问一项会消耗其资源 / 积分的操作（approval × user）。
 
     用户配置了「完全访问」时自动放行（照常留审计记录）；否则提交审批请求，
     用户回复同意后经 respond_approval 裁决。
@@ -414,7 +414,7 @@ async def request_user_approval(ctx: RunContext[ToolContext], summary: str) -> s
 
 @ai_tools(category="common", capability_domain="审批交互")
 async def request_master_approval(ctx: RunContext[ToolContext], summary: str) -> str:
-    """请求**主人**授权一项敏感操作（approval × master，永不可被完全访问豁免）。
+    """向主人发出授权请求，询问一项敏感操作（approval × master，永不可被完全访问豁免）。
 
     Args:
         summary: 要授权的操作说明（做什么、为什么需要主人点头，一句话）。

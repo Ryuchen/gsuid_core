@@ -18,21 +18,33 @@ pic_path = Path(__file__).parent / "pic"
 id_list = [
     "login_uid",
     "login_uid_v2",
-    "account_mid_v2",
-    "account_mid",
     "account_id",
+    "account_id_v2",
     "stuid",
-    "ltuid",
-    "ltmid",
-    "stmid",
-    "stmid_v2",
-    "ltmid_v2",
     "stuid_v2",
+    "ltuid",
     "ltuid_v2",
 ]
 sk_list = ["stoken", "stoken_v2"]
 ck_list = ["cookie_token", "cookie_token_v2"]
 lt_list = ["login_ticket", "login_ticket_v2"]
+mid_list = [
+    "mid",
+    "account_mid",
+    "account_mid_v2",
+    "ltmid",
+    "ltmid_v2",
+    "stmid",
+    "stmid_v2",
+]
+persist_cookie_keys = {
+    *id_list,
+    *sk_list,
+    *ck_list,
+    "ltoken",
+    "ltoken_v2",
+    *mid_list,
+}
 
 
 async def get_ck_by_all_stoken(bot_id: str):
@@ -120,7 +132,7 @@ async def refresh_ck_by_uid_list(
 
 async def deal_ck(bot_id: str, mes: str, user_id: str, mode: str = "PIC"):
     im = await _deal_ck(bot_id, mes, user_id)
-    logger.debug(t("[添加CK] {im}", im=im))
+    logger.debug(t("log.cookie.add_ck_im_create", im=im))
     img, status = await _deal_ck_to_pic(im)
     if mode == "PIC":
         return img, status
@@ -186,6 +198,35 @@ async def get_account_id(simp_dict: SimpleCookie) -> str:
     return account_id
 
 
+def get_cookie_value(simp_dict: SimpleCookie, keys: List[str]) -> str:
+    for key in keys:
+        if key in simp_dict:
+            return simp_dict[key].value
+    return ""
+
+
+def serialize_cookie(cookie_data: Dict[str, str]) -> str:
+    return ";".join(f"{key}={value}" for key, value in cookie_data.items() if value)
+
+
+def get_persist_cookie_data(simp_dict: SimpleCookie) -> Dict[str, str]:
+    return {key: morsel.value for key, morsel in simp_dict.items() if key in persist_cookie_keys and morsel.value}
+
+
+def is_overseas_account(
+    uid: Optional[str],
+    sr_uid: Optional[str],
+    zzz_uid: Optional[str],
+) -> bool:
+    if uid:
+        return int(uid[0]) >= 6
+    if sr_uid:
+        return int(sr_uid[0]) >= 6
+    if zzz_uid:
+        return len(zzz_uid) >= 10
+    return False
+
+
 async def get_all_bind_uid(bot_id: str, user_id: str) -> Tuple[Union[str, None], ...]:
     uid = await GsBind.get_uid_by_game(user_id, bot_id)
     sr_uid = await GsBind.get_uid_by_game(user_id, bot_id, "sr")
@@ -197,6 +238,8 @@ async def get_all_bind_uid(bot_id: str, user_id: str) -> Tuple[Union[str, None],
 async def _deal_ck(bot_id: str, mes: str, user_id: str) -> str:
     simp_dict = SimpleCookie(mes)
     uid, sr_uid, zzz_uid, bbb_uid = await get_all_bind_uid(bot_id, user_id)
+    is_os = is_overseas_account(uid, sr_uid, zzz_uid)
+    cookie_data = get_persist_cookie_data(simp_dict)
 
     uid_bind = sr_uid_bind = zzz_uid_bind = None
     wd_uid_bind = bb_uid_bind = bbb_uid_bind = None
@@ -224,16 +267,27 @@ async def _deal_ck(bot_id: str, mes: str, user_id: str) -> str:
                     return "该CK字段出错, 缺少login_uid或stuid或ltuid字段!"
                 stoken = simp_dict[sk].value
                 if stoken.startswith("v2_"):
-                    if "mid" in simp_dict:
-                        mid = simp_dict["mid"].value
+                    mid = get_cookie_value(simp_dict, mid_list)
+                    if mid:
                         app_cookie = f"stuid={account_id};stoken={stoken};mid={mid}"
                     else:
                         return "v2类型SK必须携带mid..."
                 else:
                     app_cookie = f"stuid={account_id};stoken={stoken}"
-                cookie_token_data = await mys_api.get_cookie_token_by_stoken(stoken, account_id, app_cookie)
+                cookie_token_data = await mys_api.get_cookie_token_by_stoken(
+                    stoken,
+                    account_id,
+                    app_cookie,
+                    is_os=is_os,
+                )
                 if isinstance(cookie_token_data, Dict):
                     cookie_token = cookie_token_data["cookie_token"]
+                    cookie_data.update(cookie_token_data.get("cookies", {}))
+                    if is_os:
+                        stoken = cookie_data.get("stoken", stoken)
+                        app_cookie = f"stuid={account_id};stoken={stoken}"
+                        if mid := cookie_data.get("mid"):
+                            app_cookie += f";mid={mid}"
                     is_add_stoken = True
                     status = False
                     break
@@ -247,13 +301,33 @@ async def _deal_ck(bot_id: str, mes: str, user_id: str) -> str:
                 account_id = await get_account_id(simp_dict)
                 if not account_id:
                     return "该CK字段出错, 缺少login_uid或stuid或ltuid字段!"
-                stoken_data = await mys_api.get_stoken_by_login_ticket(login_ticket, account_id)
+                stoken_data = await mys_api.get_stoken_by_login_ticket(
+                    login_ticket,
+                    account_id,
+                    is_os=is_os,
+                )
                 if isinstance(stoken_data, Dict):
                     stoken = stoken_data["list"][0]["token"]
+                    mid = get_cookie_value(simp_dict, mid_list)
+                    if stoken.startswith("v2_") and not mid:
+                        return "国际服v2类型SK必须携带mid..."
                     app_cookie = f"stuid={account_id};stoken={stoken}"
-                    cookie_token_data = await mys_api.get_cookie_token_by_stoken(stoken, account_id)
+                    if mid:
+                        app_cookie += f";mid={mid}"
+                    cookie_token_data = await mys_api.get_cookie_token_by_stoken(
+                        stoken,
+                        account_id,
+                        app_cookie,
+                        is_os=is_os,
+                    )
                     if isinstance(cookie_token_data, Dict):
                         cookie_token = cookie_token_data["cookie_token"]
+                        cookie_data.update(cookie_token_data.get("cookies", {}))
+                        if is_os:
+                            stoken = cookie_data.get("stoken", stoken)
+                            app_cookie = f"stuid={account_id};stoken={stoken}"
+                            if mid := cookie_data.get("mid"):
+                                app_cookie += f";mid={mid}"
                         is_add_stoken = True
                         status = False
                         break
@@ -265,75 +339,86 @@ async def _deal_ck(bot_id: str, mes: str, user_id: str) -> str:
                 if not account_id:
                     return "该CK字段出错, 缺少login_uid或stuid或ltuid字段!"
                 cookie_token = simp_dict[ck].value
+                if is_os:
+                    if ck == "cookie_token_v2":
+                        cookie_data["cookie_token_v2"] = cookie_token
+                        cookie_data.setdefault("account_id_v2", account_id)
+                        mid = get_cookie_value(simp_dict, mid_list)
+                        if mid:
+                            cookie_data.setdefault("account_mid_v2", mid)
+                    else:
+                        cookie_data["cookie_token"] = cookie_token
+                        cookie_data.setdefault("account_id", account_id)
                 status = False
                 break
     if status:
         return "添加Cookies失败!\ncookies中应该包含cookie_token或者login_ticket相关信息!"
 
-    account_cookie = f"account_id={account_id};cookie_token={cookie_token}"
+    if is_os:
+        account_cookie = serialize_cookie(cookie_data)
+    else:
+        account_cookie = f"account_id={account_id};cookie_token={cookie_token}"
 
-    try:
-        if sr_uid or (uid and int(uid[0]) < 6) or (zzz_uid and len(zzz_uid) < 10):
-            mys_data = await mys_api.get_mihoyo_bbs_info(account_id, account_cookie)
+    mys_data = await mys_api.get_mihoyo_bbs_info(
+        account_id,
+        account_cookie,
+        is_os,
+    )
+    # 剔除除了原神之外的其他游戏
+    gs_uid_list: List[str] = []
+    sr_uid_list: List[str] = []
+    zzz_uid_list: List[str] = []
+    wd_uid_list: List[str] = []
+    bb_uid_list: List[str] = []
+    bbb_uid_list: List[str] = []
+    if isinstance(mys_data, List):
+        for i in mys_data:
+            if i["game_id"] == 2:
+                uid_bind = i["game_role_id"]
+                gs_uid_list.append(uid_bind)
+            elif i["game_id"] == 6:
+                sr_uid_bind = i["game_role_id"]
+                sr_uid_list.append(sr_uid_bind)
+            elif i["game_id"] == 8:
+                zzz_uid_bind = i["game_role_id"]
+                zzz_uid_list.append(zzz_uid_bind)
+            elif i["game_id"] == 4:
+                wd_uid_bind = i["game_role_id"]
+                wd_uid_list.append(wd_uid_bind)
+            elif i["game_id"] == 3:
+                bb_uid_bind = i["game_role_id"]
+                bb_uid_list.append(bb_uid_bind)
+            elif i["game_id"] == 1:
+                bbb_uid_bind = i["game_role_id"]
+                bbb_uid_list.append(bbb_uid_bind)
+
+        bind_dict = {
+            "gs": (uid_bind, gs_uid_list),
+            "sr": (sr_uid_bind, sr_uid_list),
+            "zzz": (zzz_uid_bind, zzz_uid_list),
+            "wd": (wd_uid_bind, wd_uid_list),
+            "bb": (bb_uid_bind, bb_uid_list),
+            "bbb": (bbb_uid_bind, bbb_uid_list),
+        }
+        for game_name in bind_dict:
+            _uid = bind_dict[game_name][0]
+            if _uid:
+                bind_dict[game_name][1].pop()
+                _uid_list = bind_dict[game_name][1][:4]
+
+                insert_dict = {}
+                for _i, _luid in enumerate(_uid_list):
+                    insert_dict[f"uid_{_i}"] = _luid
+
+                _uid_exist = await GsUID.uid_exist(_uid, game_name)
+                if _uid_exist and insert_dict:
+                    await GsUID.update_data(_uid_exist, game_name, **insert_dict)
+                else:
+                    await GsUID.full_insert_data(main_uid=_uid, game_name=game_name, **insert_dict)
+
         else:
-            mys_data = await mys_api.get_mihoyo_bbs_info(account_id, account_cookie, True)
-        # 剔除除了原神之外的其他游戏
-        gs_uid_list: List[str] = []
-        sr_uid_list: List[str] = []
-        zzz_uid_list: List[str] = []
-        wd_uid_list: List[str] = []
-        bb_uid_list: List[str] = []
-        bbb_uid_list: List[str] = []
-        if isinstance(mys_data, List):
-            for i in mys_data:
-                if i["game_id"] == 2:
-                    uid_bind = i["game_role_id"]
-                    gs_uid_list.append(uid_bind)
-                elif i["game_id"] == 6:
-                    sr_uid_bind = i["game_role_id"]
-                    sr_uid_list.append(sr_uid_bind)
-                elif i["game_id"] == 8:
-                    zzz_uid_bind = i["game_role_id"]
-                    zzz_uid_list.append(zzz_uid_bind)
-                elif i["game_id"] == 4:
-                    wd_uid_bind = i["game_role_id"]
-                    wd_uid_list.append(wd_uid_bind)
-                elif i["game_id"] == 3:
-                    bb_uid_bind = i["game_role_id"]
-                    bb_uid_list.append(bb_uid_bind)
-                elif i["game_id"] == 1:
-                    bbb_uid_bind = i["game_role_id"]
-                    bbb_uid_list.append(bbb_uid_bind)
-
-            bind_dict = {
-                "gs": (uid_bind, gs_uid_list),
-                "sr": (sr_uid_bind, sr_uid_list),
-                "zzz": (zzz_uid_bind, zzz_uid_list),
-                "wd": (wd_uid_bind, wd_uid_list),
-                "bb": (bb_uid_bind, bb_uid_list),
-                "bbb": (bbb_uid_bind, bbb_uid_list),
-            }
-            for game_name in bind_dict:
-                _uid = bind_dict[game_name][0]
-                if _uid:
-                    bind_dict[game_name][1].pop()
-                    _uid_list = bind_dict[game_name][1][:4]
-
-                    insert_dict = {}
-                    for _i, _luid in enumerate(_uid_list):
-                        insert_dict[f"uid_{_i}"] = _luid
-
-                    _uid_exist = await GsUID.uid_exist(_uid, game_name)
-                    if _uid_exist and insert_dict:
-                        await GsUID.update_data(_uid_exist, game_name, **insert_dict)
-                    else:
-                        await GsUID.full_insert_data(main_uid=_uid, game_name=game_name, **insert_dict)
-
-            else:
-                if not (uid_bind or sr_uid_bind or zzz_uid_bind or wd_uid_bind or bb_uid_bind or bbb_uid_bind):
-                    return f"你的米游社账号{account_id}尚未绑定游戏账号,请前往米游社操作！"
-    except Exception:
-        pass
+            if not (uid_bind or sr_uid_bind or zzz_uid_bind or wd_uid_bind or bb_uid_bind or bbb_uid_bind):
+                return f"你的米游社账号{account_id}尚未绑定游戏账号,请前往米游社操作！"
 
     if uid_bind:
         await GsCache.refresh_cache(uid_bind)
@@ -346,7 +431,15 @@ async def _deal_ck(bot_id: str, mes: str, user_id: str) -> str:
     if uid is None:
         uid = "0"
 
-    nd = await mys_api.ck_in_new_device(uid, app_cookie)
+    if is_os:
+        nd = (
+            mys_api.get_overseas_device_fp(account_id),
+            mys_api.get_overseas_device_id(account_id),
+            "",
+            "",
+        )
+    else:
+        nd = await mys_api.ck_in_new_device(uid, app_cookie)
 
     zzz_region = None
     if zzz_uid_bind:

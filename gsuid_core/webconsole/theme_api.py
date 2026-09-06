@@ -444,8 +444,9 @@ async def get_theme_presets(
         "status": 0,
         "msg": "ok",
         "data": {
-            "user_presets_path": str(THEME_CONFIGS_PATH),
-            "builtin_presets_path": str(BUILTIN_THEMES_PATH),
+            # 只回目录名，避免登录页接口泄露本机绝对路径
+            "user_presets_path": THEME_CONFIGS_PATH.name,
+            "builtin_presets_path": BUILTIN_THEMES_DIR_NAME,
             "presets": presets,
         },
     }
@@ -497,7 +498,7 @@ async def save_theme_preset(
         with open(target, "w", encoding="utf-8") as f:
             json.dump(config_dict, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        logger.exception(t("[Theme] 保存主题预设失败: {e}", e=e))
+        logger.exception(t("log.webconsole.theme_save_preset", e=e))
         return {"status": 1, "msg": f"保存失败: {e}"}
 
     return {
@@ -566,7 +567,7 @@ async def delete_theme_preset(
     try:
         target.unlink()
     except Exception as e:
-        logger.exception(t("[Theme] 删除主题预设失败: {e}", e=e))
+        logger.exception(t("log.webconsole.theme_delete_preset", e=e))
         return {"status": 1, "msg": f"删除失败: {e}"}
     return {
         "status": 0,

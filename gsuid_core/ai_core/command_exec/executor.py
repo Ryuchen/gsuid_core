@@ -140,7 +140,16 @@ def clip(text: str, head: int = 500, tail: int = 2000) -> str:
 
 
 def _posix_preexec(timeout: int) -> None:
-    """POSIX 资源限制：CPU 时间 / 地址空间 / 文件大小 / 子进程数。"""
+    """POSIX 资源限制：CPU 时间 / 地址空间 / 文件大小 / 子进程数。
+
+    resource 模块的 RLIMIT_* 常量在 Windows 不存在（POSIX-only）。用 sys 平台
+    分支包裹, 让 Windows 路径在静态类型层完全不出现 resource.* 名（pyright
+    不会再标红 LL 08）；运行时早退。
+    """
+    import sys
+
+    if sys.platform == "win32":
+        return
     import resource
 
     resource.setrlimit(resource.RLIMIT_CPU, (timeout + 5, timeout + 10))
@@ -214,9 +223,7 @@ async def run_argv(
     timeout = max(1, min(timeout, cfg_get("max_timeout")))
     env = build_safe_env(extra_path)
     resolved_argv, is_batch = resolve_argv0(argv, env)
-    logger.info(
-        t("🧰 [CommandExec] 执行: {p0} (cwd={cwd}, batch={is_batch})", p0=resolved_argv[0], cwd=cwd, is_batch=is_batch)
-    )
+    logger.info(t("log.ai.commandexec_cwd_batch_is", p0=resolved_argv[0], cwd=cwd, is_batch=is_batch))
     if _IS_WINDOWS:
         raw, code = await _run_in_thread(resolved_argv, cwd, env, timeout, max_output)
     else:

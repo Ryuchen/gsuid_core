@@ -25,6 +25,7 @@ from gsuid_core.ai_core.memory.ingestion.edge import _DANGLING_FACT_RE
 from .types import Edge, Entity, Episode, Category, RetrievalMeta
 from .system1 import System1Result, system1_search
 from .system2 import System2Result, system2_global_selection
+from .event_time import event_times_in_text
 
 # untrusted 栅栏自身的字符开销：episodes 预算与终装配截断都要预留它，
 # 否则 </untrusted> 闭合标签会被尾截断切掉（评审修复 F9）
@@ -110,15 +111,27 @@ def _fact_mentions_speaker(edge: "Edge", speaker_ids: set) -> bool:
     return False
 
 
+_TS_MAX = 4_102_444_800.0
+
+
+def _ts_to_dt(ts: float | int | None) -> datetime | None:
+    if not isinstance(ts, (int, float)) or ts <= 0 or ts > _TS_MAX:
+        return None
+    return datetime.fromtimestamp(float(ts))
+
+
 def _edge_date_prefix(e: "Edge") -> str:
-    """edge 的 [YYYY-MM-DD] 日期前缀；无 valid_at_ts（旧数据/迁移缺失）返回空串。"""
-    ts = e["valid_at_ts"] if "valid_at_ts" in e else None
-    if not ts:
+    """陈述日必带；原文相对语另标发生日。无 valid_at_ts 返回空串。"""
+    said = _ts_to_dt(e["valid_at_ts"] if "valid_at_ts" in e else None)
+    if said is None:
         return ""
-    try:
-        return f"[{datetime.fromtimestamp(ts).strftime('%Y-%m-%d')}] "
-    except Exception:
-        return ""
+    stamp = f"[{said.strftime('%Y-%m-%d')}] "
+    events = event_times_in_text(e["fact"] or "", said)
+    if events:
+        ev = min(events)
+        if ev.date() != said.date():
+            stamp += f"[发生 {ev.strftime('%Y-%m-%d')}] "
+    return stamp
 
 
 # 时间范围检索：query 中显式出现的日期（ISO / 中文 / 斜杠格式）。命中≥1 个日期视为
@@ -188,7 +201,7 @@ async def _fetch_temporal_episodes(
                 top_k=per_bucket,
             )
         except Exception as e:
-            logger.debug(i18n_t("🧠 [Memory] 时间分桶检索 bucket={i} 失败: {e}", i=i, e=e))
+            logger.debug(i18n_t("log.memory.time_bucket_retrieval", i=i, e=e))
             return []
 
     results = await asyncio.gather(*[_one_bucket(i) for i in range(buckets)])
@@ -207,7 +220,7 @@ def _on_pref_task_done(t: "asyncio.Task") -> None:
         return
     exc = t.exception()
     if exc is not None:
-        logger.warning(i18n_t("🧠 [Memory] 刷新 preference last_applied 后台任务异常: {exc}", exc=exc))
+        logger.warning(i18n_t("log.memory.background_task_refreshing_preference", exc=exc))
 
 
 async def _run_sync_rerank(
@@ -287,12 +300,18 @@ class MemoryContext:
     # 时间范围检索命中标记：query 含显式日期范围时置 True。此时问题是枚举/时序型，
     # 时间线证据在 episodes 里，注入预算向片段倾斜（事实占比 55% → 30%）。
     temporal_mode: bool = False
+    # 评测：dual_route 向量序的前若干条 id，会话排序时压过泛词 LIKE。
+    seed_ids: list[str] = field(default_factory=list)
+    # 评测：会话级向量分（episode id → cosine），主证据会话用这个排，不靠 seed 条数。
+    session_scores: dict[str, float] = field(default_factory=dict)
 
     def to_prompt_text(
         self,
         max_chars: int = 2000,
         priority_speakers: Optional[set] = None,
         current_speaker_ids: Optional[set] = None,
+        query: str = "",
+        wrap_recall: bool = True,
     ) -> str:
         """格式化为可注入 System Prompt 的记忆上下文文本。
 
@@ -430,12 +449,16 @@ class MemoryContext:
 
         # 语义类目摘要（话题大纲）
         if self.categories:
-            cat_budget = int(max_chars * 0.15)
-            sorted_cats = sorted(self.categories, key=lambda c: c["layer"], reverse=True)
-            cat_lines = [f"• [L{c['layer']}] {c['name']}: {(c['summary'] or '')[:100]}" for c in sorted_cats[:6]]
-            taken = _take(cat_lines, cat_budget)
-            if taken:
-                parts.append("【语义类目摘要】\n" + "\n".join(taken))
+            cats = self.categories
+            if query:
+                cats = [c for c in cats if c["name"] and c["name"] in query]
+            if cats:
+                cat_budget = int(max_chars * 0.15)
+                sorted_cats = sorted(cats, key=lambda c: c["layer"], reverse=True)
+                cat_lines = [f"• [L{c['layer']}] {c['name']}: {(c['summary'] or '')[:100]}" for c in sorted_cats[:6]]
+                taken = _take(cat_lines, cat_budget)
+                if taken:
+                    parts.append("【语义类目摘要】\n" + "\n".join(taken))
 
         # 相关对话片段：吃掉前面区块（偏好/事实/类目）用剩的全部预算——纯 episode-RAG
         # （无图谱时，如大语料回灌 / 评测）episodes 是唯一召回源，必须给足空间，否则被
@@ -448,11 +471,59 @@ class MemoryContext:
             ep_budget = max_chars - used
             if ep_budget > 120:
                 eps = self.episodes
-                # temporal_mode（时间范围/时序问题）：单条内容上限压到 600 字，
-                # 让更多不同时段的片段进入预算（列表序=语义相关性优先，时间补位在尾）。
+                self_eps = [e for e in eps if (e["scope_key"] or "").startswith("self:")]
+                other_eps = [e for e in eps if not (e["scope_key"] or "").startswith("self:")]
+                # SELF 配额 ≤10%；近 2h 的 SELF/出站豁免（续聊消解）。
+                now = datetime.now()
+                recent_self: list[Episode] = []
+                old_self: list[Episode] = []
+                for ep in self_eps:
+                    ts_raw = (ep["valid_at"] or "").strip()[:19].replace("T", " ")
+                    recent = False
+                    if ts_raw:
+                        try:
+                            ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            try:
+                                ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M")
+                            except ValueError:
+                                ts = None
+                        if ts is not None and (now - ts).total_seconds() <= 2 * 3600:
+                            recent = True
+                    if recent:
+                        recent_self.append(ep)
+                    else:
+                        old_self.append(ep)
+                self_budget = min(int(max_chars * 0.10), max(0, ep_budget // 5))
+                recent_budget = min(int(ep_budget * 0.25), 400)
+                other_budget = max(0, ep_budget - self_budget - recent_budget)
+                # temporal_mode：单条上限压到 600，让更多时段进入预算
                 ep_cap = 600 if self.temporal_mode else 1000
-                ep_lines = [f"[{ep['valid_at'][:16].replace('T', ' ')}] {ep['content'][:ep_cap]}" for ep in eps]
-                taken = _take(ep_lines, ep_budget)
+
+                def _ep_lines(items: list[Episode], *, self_mark: bool) -> list[str]:
+                    dated: list[str] = []
+                    undated: list[str] = []
+                    seen_content: set[str] = set()
+                    for ep in items:
+                        raw = (ep["content"] or "").strip()
+                        if len(raw) < 4:
+                            continue
+                        key = raw[:80]
+                        if key in seen_content:
+                            continue
+                        seen_content.add(key)
+                        prefix = "[我此前说过] " if self_mark else ""
+                        ts = (ep["valid_at"] or "").strip()[:19].replace("T", " ")
+                        if ts:
+                            dated.append(f"[{ts}] {prefix}{raw[:ep_cap]}")
+                        else:
+                            undated.append(f"{prefix}{raw[:ep_cap]}")
+                    return dated + undated
+
+                taken_other = _take(_ep_lines(other_eps, self_mark=False), other_budget)
+                taken_recent = _take(_ep_lines(recent_self, self_mark=True), recent_budget)
+                taken_self = _take(_ep_lines(old_self, self_mark=True), self_budget)
+                taken = taken_other + taken_recent + taken_self
                 if taken:
                     parts.append("【相关对话片段】\n" + "\n".join(taken))
 
@@ -470,7 +541,10 @@ class MemoryContext:
             elif len(recall_text) > _budget:
                 recall_text = recall_text[: _budget - len(_marker)] + _marker
             if recall_text:
-                blocks.append(wrap_untrusted("memory_recall", recall_text))
+                if wrap_recall:
+                    blocks.append(wrap_untrusted("memory_recall", recall_text))
+                else:
+                    blocks.append(recall_text)
         return "\n\n".join(blocks)
 
     def to_memory_text(self, max_chars: int = 24000) -> str:
@@ -550,7 +624,7 @@ async def _rerank_episodes(query: str, items: list[Episode], top_k: int) -> list
     texts = [item["content"] for item in items]
     scores = list(await _run_sync_rerank(reranker, query, texts))
     if len(scores) != len(items):
-        logger.warning(i18n_t("🧠 [Memory] Reranker scores 长度不一致，跳过 Rerank"))
+        logger.warning(i18n_t("log.memory.reranker_scores_length_mismatch"))
         return items[:top_k]
     ranked = sorted(zip(scores, items), key=lambda x: x[0], reverse=True)
     return [item for _, item in ranked[:top_k]]
@@ -562,12 +636,12 @@ async def _rerank_entities(query: str, items: list[Entity], top_k: int) -> list[
         return []
     reranker = get_reranker()
     if reranker is None:
-        logger.warning("Reranker not available, falling back to top-k truncation")
+        logger.warning(i18n_t("log.memory.reranker_unavailable"))
         return items[:top_k]
     texts = [item["summary"] for item in items]
     scores = list(await _run_sync_rerank(reranker, query, texts))
     if len(scores) != len(items):
-        logger.warning(i18n_t("🧠 [Memory] Reranker scores 长度不一致，跳过 Rerank"))
+        logger.warning(i18n_t("log.memory.reranker_scores_length_mismatch"))
         return items[:top_k]
     ranked = sorted(zip(scores, items), key=lambda x: x[0], reverse=True)
     return [item for _, item in ranked[:top_k]]
@@ -588,7 +662,7 @@ async def _rerank_edges(query: str, items: list[Edge], top_k: int) -> list[Edge]
     texts = [item["fact"] for item in items]
     scores = list(await _run_sync_rerank(reranker, query, texts))
     if len(scores) != len(items):
-        logger.warning(i18n_t("🧠 [Memory] Reranker scores 长度不一致，跳过 Rerank"))
+        logger.warning(i18n_t("log.memory.reranker_scores_length_mismatch"))
         return items[:top_k]
     ranked = sorted(zip(scores, items), key=lambda x: x[0], reverse=True)
     kept: list[Edge] = []
@@ -603,22 +677,29 @@ async def _rerank_edges(query: str, items: list[Edge], top_k: int) -> list[Edge]
 async def dual_route_retrieve(
     query: str,
     user_id: str,
+    *,
+    enable_system2: bool,
     group_id: Optional[str] = None,
     top_k: int = 20,
-    enable_system2: bool = True,
     enable_user_global: bool = True,
     inject_preferences: bool = True,
     preference_contexts: Optional[list[str]] = None,
+    bot_id: str = "",
+    bot_self_id: str = "",
+    include_self: bool = True,
 ) -> MemoryContext:
     """双路检索主入口。在 handle_ai.py 中，AI 准备回复前调用此函数。
 
     Args:
         query:              用户的原始查询文本
-        group_id:           原始群组 ID（如 "789012"）
+        group_id:           原始群组 ID（如 "789012"）；**私聊必须传 None**，回退成
+            user_id 只会去查一个空的幻影 ``group:{user_id}``，召回恒为 0
         user_id:            触发用户的 ID（可选，用于联合用户全局记忆）
-        session:            SQLAlchemy AsyncSession
         top_k:              最终返回的 Episode 数量上限
-        enable_system2:     是否启用 System-2 全局选择（成本较高）
+        enable_system2:     是否启用 System-2 全局选择（成本较高）。**必填、无默认值**：
+            这里曾是 ``True`` 而生产配置默认关，不传的调用点（工具路径）一直在偷跑一条
+            更贵的图遍历。跨模块边界的语义性参数不许在函数签名里给默认值——
+            需要默认就在唯一的配置层给。
         enable_user_global: 是否联合查询用户跨群画像
         inject_preferences: 是否注入程序性/偏好规则（意图门：纯闲聊轮可传 False 整轮跳过）
         preference_contexts: 选择性注入——本轮相关的能力域/工具名集合。``None`` = 不过滤
@@ -646,13 +727,11 @@ async def dual_route_retrieve(
             expanded = expand_query_with_aliases(query, mappings)
             if expanded != query:
                 logger.debug(
-                    i18n_t(
-                        "🧠 [Memory] query 别名展开: {query} -> {expanded}", query=repr(query), expanded=repr(expanded)
-                    )
+                    i18n_t("log.memory.query_alias_expansion_expanded", query=repr(query), expanded=repr(expanded))
                 )
                 query = expanded
         except Exception as e:
-            logger.debug(i18n_t("🧠 [Memory] 别名展开失败: {e}", e=e))
+            logger.debug(i18n_t("log.memory.alias_expansion", e=e))
 
     # 私聊 / 无群上下文（group_id 为空）：user_global 是该用户记忆的**主** scope（observer 对
     # 私聊消息即写此处），必须检索，否则私聊与评测（group_id=None）召回恒空。群聊时则仅当
@@ -665,6 +744,13 @@ async def dual_route_retrieve(
         scope_keys.append(user_scope)
     else:
         user_scope = None
+
+    # SELF 只开读：key 必须是账号 ID（observer C6 写 self:{bot_self_id}）。
+    self_key = bot_self_id.strip()
+    if include_self and self_key:
+        self_scope = make_scope_key(ScopeType.SELF, self_key)
+        if self_scope not in scope_keys:
+            scope_keys.append(self_scope)
 
     # RF-Mem 熟悉度路由（默认关，零影响）：用一次零 LLM 的向量探针的 s̄/熵 逐查询决定
     # "检索多深"，把 System-2 从全局静态开关降为"按不确定性触发"。路由只在"低熟悉/高
@@ -720,7 +806,7 @@ async def dual_route_retrieve(
     # 处理 System-1 结果
     s1_raw = all_results[0]
     if isinstance(s1_raw, Exception):
-        logger.error(i18n_t("🧠 [Memory] System-1 检索失败: {s1_raw}", s1_raw=s1_raw))
+        logger.error(i18n_t("log.memory.system_retrieval_s1_raw", s1_raw=s1_raw))
         s1: System1Result = System1Result()
     else:
         s1 = s1_raw  # type: ignore[assignment]
@@ -730,7 +816,7 @@ async def dual_route_retrieve(
         if isinstance(raw_result, Exception):
             logger.error(
                 i18n_t(
-                    "🧠 [Memory] System-2 检索失败 (scope={p0}): {raw_result}",
+                    "log.memory.system_retrieval_scope_raw",
                     p0=s2_scope_keys[i - 1],
                     raw_result=raw_result,
                 )
@@ -739,7 +825,7 @@ async def dual_route_retrieve(
             s2_results.append(raw_result)
             logger.debug(
                 i18n_t(
-                    "🧠 [Memory] System-2 检索完成 (scope={p0})，共 {p1} 条 Episode, {p2} 个 Entity, {p3} 条 Edge",
+                    "log.memory.system_retrieval_scope_episode",
                     p0=s2_scope_keys[i - 1],
                     p1=len(raw_result.episodes),
                     p2=len(raw_result.selected_entities),
@@ -749,7 +835,7 @@ async def dual_route_retrieve(
 
     logger.debug(
         i18n_t(
-            "🧠 [Memory] System-1 检索完成，共 {p0} 条 Episode, {p1} 个 Entity, {p2} 条 Edge",
+            "log.memory.system_retrieval_episode_records",
             p0=len(s1.episodes),
             p1=len(s1.entities),
             p2=len(s1.edges),
@@ -809,7 +895,7 @@ async def dual_route_retrieve(
                 if projected:
                     all_edges = _merge_edges(all_edges, projected)
         except Exception as e:
-            logger.warning(i18n_t("🧠 [RF-Mem] 回忆环检索失败: {e}", e=e))
+            logger.warning(i18n_t("log.memory.rf_mem_recall_loop_retrieval", e=e))
 
     # 类型隔离 Rerank（Type Isolation）：
     # Category 节点完全跳过 Reranker，给予固定最高优先级。
@@ -841,20 +927,26 @@ async def dual_route_retrieve(
                     _step = len(temporal_eps) / 24
                     temporal_eps = [temporal_eps[int(i * _step)] for i in range(24)]
                 ranked_episodes = _merge_episodes(ranked_episodes[:20], temporal_eps)
+                # temporal_task 与 time_range 同生命周期; 局部展开帮助 pyright
+                # 把 time_range 收窄到非 None tuple[datetime, datetime]。
+                if time_range is not None:
+                    _t_start, _t_end = time_range
+                else:
+                    _t_start, _t_end = None, None
                 logger.info(
                     i18n_t(
-                        "🧠 [Memory] 时间范围补召回 {p0} 条 Episode ({p1:%Y-%m-%d} ~ {p2:%Y-%m-%d})",
+                        "log.memory.time_range_supplemental_retrieval_2",
                         p0=len(temporal_eps),
-                        p1=time_range[0],
-                        p2=time_range[1],
+                        p1=_t_start,
+                        p2=_t_end,
                     )
                 )
         except Exception as e:
-            logger.warning(i18n_t("🧠 [Memory] 时间范围补召回失败: {e}", e=e))
+            logger.warning(i18n_t("log.memory.time_range_supplemental_retrieval", e=e))
 
     logger.info(
         i18n_t(
-            "🧠 [Memory] 共计 {p0} 条 Episode, {p1} 个 Entity, {p2} 条 Edge, {p3} 个 Category",
+            "log.memory.total_episode_records_entity",
             p0=len(all_episodes),
             p1=len(all_entities),
             p2=len(all_edges),
@@ -883,14 +975,14 @@ async def dual_route_retrieve(
             try:
                 await AIMemEdge.touch_accessed(edge_ids)
             except Exception as _e:
-                logger.debug(i18n_t("🧠 [Memory] 刷新 edge last_accessed 失败: {_e}", _e=_e))
+                logger.debug(i18n_t("log.memory.refresh_edge_last_accessed", _e=_e))
 
         def _on_task_done(t):
             if t.cancelled():
                 return
             exc = t.exception()
             if exc is not None:
-                logger.warning(i18n_t("🧠 [Memory] 刷新 edge last_accessed 后台任务异常: {exc}", exc=exc))
+                logger.warning(i18n_t("log.memory.background_task_refreshing_edge", exc=exc))
 
         task = asyncio.create_task(_touch_edges_accessed())
         task.add_done_callback(_on_task_done)
@@ -911,9 +1003,9 @@ async def dual_route_retrieve(
             )
             conflict_summaries = await AIMemConflict.get_by_signatures(scope_keys, sigs)
             if conflict_summaries:
-                logger.info(i18n_t("🧠 [Memory] 矛盾提示命中 {p0} 条 Conflict 摘要", p0=len(conflict_summaries)))
+                logger.info(i18n_t("log.memory.contradiction_prompt_matched_conflict", p0=len(conflict_summaries)))
         except Exception as e:
-            logger.debug(i18n_t("🧠 [Memory] 矛盾提示查询失败: {e}", e=e))
+            logger.debug(i18n_t("log.memory.contradiction_prompt_query", e=e))
 
     # 程序性/偏好记忆（默认开）：SQL-only 取本 user/scope 下的活跃规则，置顶强约束注入。
     # 选择性注入（意图门 + 能力域过滤）由 inject_preferences / preference_contexts 控制，避免
@@ -959,12 +1051,19 @@ async def dual_route_retrieve(
                     try:
                         await AIMemPreference.touch_applied(pref_ids)
                     except Exception as _e:
-                        logger.debug(i18n_t("🧠 [Memory] 刷新 preference last_applied 失败: {_e}", _e=_e))
+                        logger.debug(i18n_t("log.memory.refresh_preference_last_applied", _e=_e))
 
                 pref_task = asyncio.create_task(_touch_prefs())
                 pref_task.add_done_callback(_on_pref_task_done)
         except Exception as e:
-            logger.warning(i18n_t("🧠 [Memory] 偏好检索失败: {e}", e=e))
+            logger.warning(i18n_t("log.memory.preference_retrieval", e=e))
+
+    # 未落库原文：闲聊进行中要等 idle 才写 SQL，检索必须先看见缓冲。
+    from gsuid_core.ai_core.memory.observer import pending_episodes_for_scopes
+
+    pending = pending_episodes_for_scopes(scope_keys)
+    if pending:
+        ranked_episodes = _merge_episodes(pending, ranked_episodes)
 
     return MemoryContext(
         episodes=ranked_episodes,

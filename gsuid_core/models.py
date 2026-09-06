@@ -1,6 +1,17 @@
 import time
 import asyncio
-from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Literal, Optional, Awaitable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Tuple,
+    Literal,
+    Optional,
+    Awaitable,
+    TypedDict,
+    NotRequired,
+)
 from dataclasses import dataclass
 
 from msgspec import Struct
@@ -24,6 +35,80 @@ class TraceContext:
     start_ts: float  # 命令开始的墙钟时间戳（time.time()，Unix 秒）——对外展示/排序用
 
 
+HttpTraceLife = Literal["running", "completed"]
+
+
+@dataclass
+class HttpTraceContext:
+    """追踪上下文，以单次 HTTP `/api` 请求为维度记录日志。"""
+
+    trace_id: str
+    short_id: str
+    method: str
+    path: str
+    client_ip: str
+    user_id: Optional[str]
+    user_name: Optional[str]
+    start_time: float
+    start_ts: float
+    content_length: Optional[int]
+    query_redacted: str
+    client_request_id: Optional[str]
+    response_content_type: Optional[str] = None
+    response_preview: Optional[str] = None
+
+
+class HttpTraceListItem(TypedDict):
+    trace_id: str
+    method: str
+    path: str
+    query_redacted: str
+    client_ip: str
+    user_id: Optional[str]
+    user_name: Optional[str]
+    start_time: float
+    duration_ms: Optional[int]
+    log_count: int
+    error_count: int
+    status_code: Optional[int]
+    status: HttpTraceLife
+
+
+class HttpTraceLogLine(TypedDict):
+    timestamp: str
+    level: str
+    event: str
+    plugin: str
+
+
+class HttpTraceDetail(HttpTraceListItem):
+    client_request_id: Optional[str]
+    content_length: Optional[int]
+    response_content_type: Optional[str]
+    response_preview: Optional[str]
+    logs: List[HttpTraceLogLine]
+
+
+class HttpTraceJsonlRecord(TypedDict):
+    trace_id: str
+    method: str
+    path: str
+    query_redacted: str
+    client_ip: str
+    user_id: Optional[str]
+    user_name: Optional[str]
+    client_request_id: Optional[str]
+    content_length: Optional[int]
+    start_time: float
+    status: HttpTraceLife
+    log_count: int
+    duration_ms: NotRequired[int]
+    status_code: NotRequired[int]
+    error_count: NotRequired[int]
+    response_content_type: NotRequired[str]
+    response_preview: NotRequired[str]
+
+
 @dataclass
 class TaskContext:
     coro: Awaitable[Any]
@@ -42,6 +127,68 @@ class TaskContext:
 class Message(Struct):
     type: Optional[str] = None
     data: Optional[Any] = None
+
+
+NODE_MARK = "[合并转发]"
+NODE_MAX_DEPTH = 3
+
+
+def _one_node_item(item: object) -> Optional[Message]:
+    if isinstance(item, Message):
+        return item
+    if isinstance(item, dict):
+        msg_type = item["type"] if "type" in item else None
+        msg_data = item["data"] if "data" in item else None
+        return Message(
+            type=str(msg_type) if msg_type is not None else None,
+            data=msg_data,
+        )
+    return None
+
+
+def normalize_node_items(data: object, depth: int = 0) -> List[Message]:
+    """把 node.data 归一成扁平 List[Message]；内层 node 展开，超过深度只留标记."""
+    if not isinstance(data, list):
+        return []
+    items: List[Message] = []
+    for raw in data:
+        item = _one_node_item(raw)
+        if item is None:
+            continue
+        if item.type == "node":
+            items.append(Message("text", NODE_MARK))
+            if depth + 1 < NODE_MAX_DEPTH:
+                items.extend(normalize_node_items(item.data, depth + 1))
+            continue
+        items.append(item)
+    return items
+
+
+def format_node_preview(items: List[Message], depth: int = 0) -> str:
+    """引用/展示用的合并转发摘要，内层 node 继续展开到深度上限."""
+    lines: List[str] = [NODE_MARK]
+    _append_node_preview(lines, items, depth)
+    return "\n".join(lines)
+
+
+def _append_node_preview(lines: List[str], items: List[Message], depth: int) -> None:
+    for item in items:
+        if item.type == "text" and item.data is not None:
+            text = str(item.data).strip()
+            if text:
+                lines.append(text)
+        elif item.type == "image":
+            lines.append("[图片]")
+        elif item.type == "record":
+            lines.append("[语音]")
+        elif item.type == "video":
+            lines.append("[视频]")
+        elif item.type == "file":
+            lines.append("[文件]")
+        elif item.type == "node":
+            lines.append(NODE_MARK)
+            if depth + 1 < NODE_MAX_DEPTH:
+                _append_node_preview(lines, normalize_node_items(item.data), depth + 1)
 
 
 class MessageReceive(Struct):
@@ -70,10 +217,14 @@ class Event(MessageReceive):
     image_id_list: List[str] = []
     audio_id: Optional[str] = None
     audio_id_list: List[str] = []
+    video_id: Optional[str] = None
+    video_id_list: List[str] = []
     at: Optional[str] = None
     at_list: List[Any] = []
     is_tome: bool = False
     reply: Optional[str] = None
+    reply_id: Optional[str] = None
+    node: Optional[List[Message]] = None
     file_name: Optional[str] = None
     file: Optional[str] = None
     file_type: Optional[Literal["url", "base64"]] = None
